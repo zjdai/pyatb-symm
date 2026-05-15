@@ -1,0 +1,22 @@
+# 2026-04-25 PyATB Runtime Analysis Log
+
+- Traced the CLI runtime entry from `pyatb.main:main`.
+- Traced `Input` parsing, option expansion, validation, and `Out/input.json` generation.
+- Identified the reusable initialization APIs:
+  - `init_tb(...)`
+  - `set_solver_HSR(...)`
+  - `set_solver_HSR_spin2(...)`
+  - `set_solver_rR(...)`
+- Identified the reusable k-point APIs:
+  - `mp_generator`
+  - `line_generator`
+  - `array_generater`
+  - `kpoints_in_different_process`
+- Identified the reusable diagonalization and wavefunction APIs:
+  - `diago_H(...)`
+  - `diago_H_range(...)`
+  - `diago_H_eigenvaluesOnly(...)`
+  - `diago_H_eigenvaluesOnly_range(...)`
+  - `get_Hk(...)`
+  - `get_Sk(...)`
+- Recorded the analysis in `project_records/code_plans/2026-04-25-pyatb-runtime-analysis.md`.

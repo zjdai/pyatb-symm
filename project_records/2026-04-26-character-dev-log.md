@@ -1,0 +1,335 @@
+# CHARACTER 开发日志（2026-04-26）
+
+## [更新 1] 建立RED测试基线
+- 代码更新:
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - `test_character_creates_output_dir_and_runs_symmetry_stage`：期望 CHARACTER 非磁分支可运行完成（不再抛 `NotImplementedError`）。
+    - 新增 `test_dk_matrix_identity`：要求存在 `pyatb.symmetry.Dk_matrix` 且单位旋转对应单位自旋表示矩阵。
+- 测试命令:
+  - `cd pyatb-main && pytest -q tests/test_character_module.py -q`
+- 测试结果:
+  - 失败（符合RED阶段预期）
+  - 失败点1：`Character.calculate_character` 仍抛 `NotImplementedError`
+  - 失败点2：`pyatb.symmetry.Dk_matrix` 模块不存在
+
+## [更新 2] 实现小群特征标流程主干
+- 代码更新:
+  - 新增 `pyatb-main/src/pyatb/symmetry/Dk_matrix.py`
+    - 实现 `spin_half_matrix_from_cartesian_rotation` 与轴角转换。
+  - 新增 `pyatb-main/src/pyatb/symmetry/k_little_groups.py`
+    - 实现 IRVSP `kLG_*.data` Fortran 二进制解析（空间群符号、对称操作、k点与irrep特征标）。
+  - 重写 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - 非磁结构标准化 + 原子/R映射输出。
+    - 读取并重排 `kLittleGroups` 对称操作顺序。
+    - 输出 IRVSP 风格 `Transformations`、`SYMMETRY OPERATIONS`、k点小群特征标表到 `symmetry_character_report.txt`。
+  - 修改 `pyatb-main/src/pyatb/symmetry/character.py`
+    - 收集全部输入 k 点并传入 `analyze_nonmagnetic`。
+    - 去除非磁分支末尾 `NotImplementedError`。
+  - 数据库同步:
+    - 复制 `IRVSP-master/src_irvsp_v2_release/kLittleGroups/*` 到 `pyatb-main/src/pyatb/kLittleGroups/`。
+- 测试命令:
+  - `cd pyatb-main && pytest -q tests/test_character_module.py -q`
+  - `cd pyatb-main && pytest -q tests/test_character_input.py -q`
+- 测试结果:
+  - `test_character_module.py`: 全部通过（4/4）
+  - `test_character_input.py`: 全部通过（3/3）
+
+## [更新 3] 参考输出对比测试（test-vasp/outdir）
+- 测试准备:
+  - 建立目录：`test_workspace/test-vasp-check`
+  - 使用 `POSCAR` 通过 ASE 生成 `STRU`。
+  - 通过注入假 `pyatb.interface_python` 运行 `SymmStructureAnalyzer.analyze_nonmagnetic`。
+  - 输入k点：`[0,0,0]`, `[0.5,0.5,0.5]`, `[0.5,0.5,0]`。
+- 测试命令:
+  - `conda run -n symm python /tmp/run_symm_check.py`
+  - 对比脚本生成：`test_workspace/test-vasp-check/Out/CHARACTER/compare_with_irvsp.log`
+- 测试结果:
+  - 空间群识别：`resolved_group = 166`（与参考一致）
+  - `SPGFILE` 输出：`.../pyatb-main/src/pyatb/kLittleGroups/kLG_166.data`
+  - `Transformations` / `SYMMETRY OPERATIONS` 关键段存在且操作符数量为 12（与参考一致）
+  - k点命名匹配：`GM`、`T` 已匹配
+  - 当前残留差异：第三个测试k点未匹配到参考中的 `F`（日志中显示 `No kLittleGroups database match`）
+- 产物文件:
+  - `test_workspace/test-vasp-check/Out/CHARACTER/symmetry_character_report.txt`
+  - `test_workspace/test-vasp-check/Out/CHARACTER/compare_with_irvsp.log`
+
+## [更新 4] IRVSP 风格 k 点表格式、星群匹配与操作排序修正
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/symmetry/k_little_groups.py`
+    - `KPointResolution` 新增 `entry_index`，保留数据库 k 点编号，供 `kname` 行按 IRVSP 风格输出。
+    - `resolve_kpoint_from_star()` 现在在成功匹配与 fallback 路径中都返回数据库 k 点编号。
+  - 修改 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - `Transformations` 改为按 IRVSP 的列向量方式输出 `BR2/BR4`。
+    - 新增 `_canonicalize_axis()`、`_signed_rotation_angle()`、`_operation_sort_key()`、`_sort_operations_irvsp_like()`，将空间群操作排序改为 IRVSP 风格顺序（如 SG166 中 `E, C3, C3, C2, C2, C2, I, IC3, IC3, IC2, IC2, IC2`）。
+    - `k` 点小群表改为调用 `resolve_kpoint_from_star()`，不再走旧的粗略 `match_kpoint()`。
+    - `knum/kname/Reality/irrep/elemt` 段格式按 IRVSP 风格重新对齐。
+    - 在 `SYMMETRY OPERATIONS` 中补充 `clockwise/counterclockwise` 描述文本。
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 RED/GREEN 测试覆盖：
+      - `Transformations` 列向量输出格式。
+      - `resolve_kpoint_from_star()` 接口在 `symm_stru.py` 中的实际调用。
+      - `F` 点 k 表头与 irrep 输出格式。
+      - IRVSP 风格操作排序。
+- 测试命令:
+  - `cd pyatb-main && pytest -q tests/test_character_module.py -q`
+  - `cd pyatb-main && pytest -q tests/test_character_module.py tests/test_character_input.py -q`
+- 测试结果:
+  - `test_character_module.py`: 全部通过（9/9）
+  - `test_character_module.py + test_character_input.py`: 全部通过（12/12）
+
+## [更新 5] test-vasp 实样例二次对照
+- 测试准备:
+  - 生成脚本：`/tmp/run_symm_check_stage2.py`
+  - 输出目录：`test_workspace/test-vasp-check/Out/CHARACTER/`
+  - 输入 k 点：`[0,0,0]`, `[0.5,0.5,0.5]`, `[0.5,0.5,0]`, `[0,0.5,0]`
+- 测试命令:
+  - `conda run -n symm python /tmp/run_symm_check_stage2.py`
+- 测试结果:
+  - 空间群识别：`resolved_group = 166`（与 IRVSP 参考一致）
+  - `Transformations` / `SYMMETRY OPERATIONS` 段成功生成。
+  - k 点数据库命名匹配：`GM`、`T`、`F`、`L` 全部找到。
+  - 关键参考行已匹配：
+    - `    1    GM : kname      0.00 0.00 0.00 :  given in the conventional basis`
+    - `    4    F  : kname      0.00 0.50 1.00 :  given in the conventional basis`
+    - `    5    L  : kname     -0.50 0.50 0.50 :  given in the conventional basis`
+    - ` Reality           1           5           7          11`
+  - 当前残留差异:
+    - `SYMMETRY OPERATIONS` 中的 Euler 角与部分数值空格仍未做到逐字符完全一致；但操作顺序、k 点命名和 irrep 表关键内容已对齐。
+- 产物文件:
+  - `test_workspace/test-vasp-check/Out/CHARACTER/symmetry_character_report.txt`
+  - `test_workspace/test-vasp-check/Out/CHARACTER/compare_with_irvsp_stage2.log`
+
+## [更新 6] `symm` 环境安装更新
+- 代码更新:
+  - 修改 `pyatb-main/setup.py`
+    - 自动补充 conda 环境中的 `include/eigen3` 头文件搜索路径。
+    - 自动补充 conda 环境中的 `lib` 搜索路径。
+    - 当环境中不存在 `libopenblas.so` 但存在 `libblas.so` 时，自动回退链接 `blas + lapacke`，避免 `-lopenblas` 链接失败。
+- 测试命令:
+  - `conda run -n symm python -m pip install -e /home/zjdai/file-test/pyatb_symm/pyatb-main`
+- 测试结果:
+  - 首次失败原因：缺少 `Eigen/Eigen` 头文件。
+  - 第二次失败原因：链接阶段缺少 `-lopenblas`。
+  - 修正 `setup.py` 后安装成功。
+  - 安装版本从 `pyatb 1.1.2.dev0+3633170` 更新为 `pyatb 1.1.2.dev0+fdef288`。
+
+## [更新 7] 方案A第一阶段：去除相位列、修正Euler warning、接入ABACUS CHARACTER主链
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - 删除 `elemt` 区块中的 `exp(-i*k*taui)` 输出列，仅保留操作编号和主轴。
+    - 新增内部 `ZYZ` Euler 角解析 `_matrix_to_euler_zyz()`，替换 `scipy.spatial.transform.Rotation.as_euler()`，消除 `Gimbal lock detected` warning。
+    - 新增 `_get_symmetry_data()`、`_align_operations_to_reference()`、`_resolve_kpoint_records()`。
+    - `analyze_nonmagnetic()` 现在返回标准化操作序列、原始 `STRU` 操作序列、逐k点解析记录，供 CHARACTER 主流程直接调用。
+  - 新增 `pyatb-main/src/pyatb/symmetry/character_core.py`
+    - 实现 `group_degenerate_bands()`。
+    - 实现 `calculate_subspace_characters()`，在退简并子空间内计算 `Tr[U^\dagger S D(k,g) U]`。
+    - 实现 `assign_irrep_from_characters()` 与 `assign_irrep_combination()`，按 IRVSP 的单/多irrep组合思路做标签匹配。
+  - 重写 `pyatb-main/src/pyatb/symmetry/Dk_matrix.py`
+    - 新增 ABACUS 基组元数据提取：`extract_abacus_basis_metadata()`。
+    - 新增实球谐/ABACUS 顺序角动量矩阵构造：`angular_momentum_matrices_abacus()`。
+    - 新增原子映射与壳层旋转：`find_atom_mapping()`、`shell_rotation()`、`atom_orbital_rotation()`。
+    - 新增 `build_dk_matrix()`，支持 `nspin=1` 与 `nspin=4`（SOC, orbital-spin interleaved basis）两种非磁分支。
+  - 修改 `pyatb-main/src/pyatb/symmetry/character.py`
+    - CHARACTER 主流程现在先读取原始 `STRU` 与轨道：`tb.read_stru(..., need_orb=True)`。
+    - 调用 TB solver 对所有k点做对角化，并读取 `S(k)`。
+    - 使用 `build_dk_matrix()` 与 `character_core` 计算逐退简并子空间特征标。
+    - 新增输出文件：`Out/CHARACTER/trace.txt`、`Out/CHARACTER/band_irrep.txt`。
+    - 将计算出的 irrep 标签追加写入 `symmetry_character_report.txt`。
+- 测试更新:
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 `test_k_little_group_table_omits_phase_factor_column`
+    - 新增 `test_build_symmetry_operations_suppresses_gimbal_lock_warning`
+    - 新增 `test_build_dk_matrix_returns_identity_for_single_s_orbital`
+    - 新增 `test_build_dk_matrix_supports_soc_interleaved_spin_basis`
+    - 新增 `test_character_reads_original_stru_and_writes_trace_outputs`
+  - 新增 `pyatb-main/tests/test_character_core.py`
+    - 覆盖退简并分组、单irrep匹配、子空间迹计算。
+- 测试命令:
+  - `cd pyatb-main && pytest -q tests/test_character_module.py tests/test_character_core.py -q`
+  - `cd pyatb-main && pytest -q tests/test_character_module.py tests/test_character_core.py tests/test_character_input.py -q`
+- 测试结果:
+  - `test_character_module.py + test_character_core.py`: 全部通过（17/17）
+  - `test_character_module.py + test_character_core.py + test_character_input.py`: 全部通过（20/20）
+
+## [更新 8] 原始STRU轨道相对路径修正与ABACUS样例实跑
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/io/abacus_read_stru.py`
+    - `NUMERICAL_ORBITAL` 现在相对于 `STRU` 文件所在目录解析，而不是相对于当前工作目录解析。
+  - 新增 `pyatb-main/tests/test_abacus_read_stru.py`
+    - 覆盖 `read_stru()` 对相对 `.orb` 路径的解析行为。
+- 测试命令:
+  - `cd pyatb-main && pytest -q tests/test_abacus_read_stru.py -q`
+  - `cd pyatb-main && pytest -q tests/test_abacus_read_stru.py tests/test_character_module.py tests/test_character_core.py tests/test_character_input.py -q`
+  - `conda run -n symm python -m pip install -e /home/zjdai/file-test/pyatb_symm/pyatb-main`
+  - `cd test_workspace/test-abacus-2/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- 测试结果:
+  - `test_abacus_read_stru.py`: 通过（1/1）
+  - 全部相关测试：通过（21/21）
+  - `symm` 环境可编辑安装成功，版本保持 `pyatb 1.1.2.dev0+6090d76`。
+  - `test_workspace/test-abacus-2/pyatb` 实跑成功，生成:
+    - `Out/CHARACTER/trace.txt`
+    - `Out/CHARACTER/band_irrep.txt`
+    - `Out/CHARACTER/symmetry_character_report.txt`
+  - 快速对照结果:
+    - `GM/T/F/L` 的小群命名与参考 `trace.txt` / `test-vasp/outdir` 一致。
+    - 生成的 `band_irrep.txt` 已输出 `GM8`, `GM4 + GM5`, `T8`, `F1+ + F2+`, `L1+ + L2+` 等 IRVSP 风格标签。
+- 样例验证附注:
+  - `test_workspace/test-abacus-2/pyatb/STRU` 引用的 `.orb` 文件原本不在样例目录中；为完成本地验证，补充了两个符号链接:
+    - `Bi/Orbital_Bi_DZP/Bi_gga_10au_100Ry_2s2p2d1f.orb`
+    - `Se/Orbital_Se_DZP/Se_gga_10au_100Ry_2s2p2d1f.orb`
+
+## [更新 9] CHARACTER 输出重排：k点内联特征标表与 IRVSP 风格 trace
+- 代码更新:
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 扩展 `test_character_reads_original_stru_and_writes_trace_outputs`，先做 RED：
+      - 要求 `trace.txt` 采用 IRVSP 风格数字头部，而不是旧的 `knum =` 文本格式。
+      - 要求 `symmetry_character_report.txt` 在各自 `k` 点块内部插入 `bnd ndg eigval ... =irrep` 表，且不能再把结果统一追加到文件末尾。
+  - 修改 `pyatb-main/src/pyatb/symmetry/character.py`
+    - 新增 IRVSP 风格 `trace.txt` 写出逻辑：
+      - 首行输出 `occ_band`
+      - 输出全部对称操作的 `R / tau / spin_matrix`
+      - 输出全部 `k` 点坐标、小群操作索引和逐简并子空间特征标矩阵
+    - 新增逐 `k` 点分组的 `report` 注入逻辑，将 band character 表插入到每个 `k` 点块末尾、分隔线之前。
+    - 对 `source_operations` / `operations` 的 `dict` 和 `SymmetryOperation` 两种来源统一兼容。
+    - 清理近零数值格式，去除 `0.000000`/`0.00i` 位置上的负零显示。
+- 测试命令:
+  - `pytest -q pyatb-main/tests/test_character_module.py -k 'reads_original_stru_and_writes_trace_outputs'`
+  - `pytest -q pyatb-main/tests/test_character_module.py pyatb-main/tests/test_character_core.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_character_input.py -q`
+- 测试结果:
+  - RED 阶段：
+    - 失败（符合预期）
+    - 失败点：`trace.txt` 首行仍为 `knum = ...`，说明旧格式尚未替换
+  - GREEN 阶段：
+    - 新增用例通过（1/1）
+    - 相关回归测试全部通过（21/21）
+
+## [更新 10] `symm` 环境重装与样例输出复核
+- 环境更新:
+  - 首次尝试命令：
+    - `conda run -n symm python -m pip install -e /home/zjdai/file-test/pyatb_symm/pyatb-main`
+  - 结果：
+    - 成功完成 editable 安装。
+  - 二次串联安装与样例运行时，`pip` build isolation 触发联网拉取 `setuptools>=42`，在当前沙箱网络限制下失败。
+  - 修正命令：
+    - `conda run -n symm python -m pip install --no-build-isolation -e /home/zjdai/file-test/pyatb_symm/pyatb-main`
+  - 结果：
+    - 安装成功，无需联网补依赖。
+- 样例测试命令:
+  - `cd test_workspace/test-abacus-2/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- 样例测试结果:
+  - `Out/CHARACTER/trace.txt`
+    - 前三行已变为 IRVSP 风格数字头：
+      - ` 78`
+      - `  1`
+      - ` 12`
+    - 后续操作矩阵、k点坐标、小群操作编号和逐带特征标均成功写出。
+  - `Out/CHARACTER/symmetry_character_report.txt`
+    - `GM/T/F/L/...` 各 `k` 点块内部都出现了 `bnd ndg  eigval ... =IRREP` 表。
+    - `GM` 块内样例行已变为：
+      - `  1  2-38.680805 ... =GM8`
+      - `  3  2-38.652294 ... =GM4 + GM5`
+    - band character 表不再统一堆到文件末尾。
+
+## [更新 11] F/L 点与 IRVSP 不一致的根因排查与修复
+- 问题复现:
+  - 当前 `test_workspace/test-abacus-2/pyatb/Out/CHARACTER/band_irrep.txt` 中：
+    - `F` 点被标成 `F1+ + F2+ / F1- + F2-`
+    - `L` 点被标成 `L1+ + L2+ / L1- + L2-`
+  - 但参考 `test_workspace/test-vasp/outdir` 中：
+    - `F` 点应为 `F3 + F4 / F5 + F6`
+    - `L` 点应为 `L3 + L4 / L5 + L6`
+- 根因分析:
+  - 逐步核对后确认：
+    - `F/L` 的 `k` 点命名、little-group 操作编号、小群大小都没有错。
+    - `kLittleGroups/kLG_166.data` 对 `F/L` 同时包含单值表示与双值表示两套 irrep。
+    - 在仅使用前半组空间操作字符（如 `F: 1,5,7,11`；`L: 1,4,7,10`）时：
+      - `F1+ + F2+` 与 `F3 + F4`
+      - `F1- + F2-` 与 `F5 + F6`
+      - `L1+ + L2+` 与 `L3 + L4`
+      - `L1- + L2-` 与 `L5 + L6`
+      的特征标和式完全相同。
+    - 现有 `assign_irrep_combination()` 没有区分 `nspin=4` 的 SOC 场景，直接按数据库顺序遍历，先命中了前面的单值表示，因此得到错误标签。
+- 代码更新:
+  - 修改 `pyatb-main/tests/test_character_core.py`
+    - 新增 `test_assign_irrep_combination_prefers_double_valued_irreps_for_soc`
+    - RED 目标：SOC 场景下，对歧义特征标 `[2, 0, 2, 0]` 必须返回 `F3 + F4`，不能返回 `F1+ + F2+`
+  - 修改 `pyatb-main/src/pyatb/symmetry/character_core.py`
+    - 新增按自旋场景过滤 irrep 的逻辑：
+      - `spinful=True` 时仅使用 `raw_name` 以 `-` 开头的双值表示
+      - `spinful=False` 时仅使用单值表示
+      - 无法筛出时再 fallback 到全部 irrep
+    - `assign_irrep_from_characters()` 与 `assign_irrep_combination()` 均新增 `spinful` 参数
+  - 修改 `pyatb-main/src/pyatb/symmetry/character.py`
+    - 在 CHARACTER 主流程中根据 `tb.nspin == 4` 传入 `spinful=True`
+- 测试命令:
+  - `pytest -q pyatb-main/tests/test_character_core.py -k 'prefers_double_valued_irreps_for_soc'`
+  - `pytest -q pyatb-main/tests/test_character_core.py pyatb-main/tests/test_character_module.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_character_input.py -q`
+  - `cd test_workspace/test-abacus-2/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- 测试结果:
+  - RED 阶段：
+    - 失败（符合预期）
+    - 失败点：`assign_irrep_combination()` 还不支持 `spinful` 分支
+  - GREEN 阶段：
+    - 新增用例通过（1/1）
+    - 相关回归测试全部通过（22/22）
+  - 样例重算结果：
+    - `F` 点标签已改为：
+      - `band 1 -> F3 + F4`
+      - `band 5 -> F5 + F6`
+      - 后续序列与 IRVSP 参考的 `F3/F4`、`F5/F6` 交替模式一致
+    - `L` 点标签已改为：
+      - `band 1 -> L3 + L4`
+      - `band 7 -> L5 + L6`
+      - 后续序列与 IRVSP 参考的 `L3/L4`、`L5/L6` 模式一致
+
+## [更新 11] 结构标准化判定与 HS 统一规范重建（方案A第一步）
+- 代码更新:
+  - 新增 `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - 实现 `map_target_r_vector()`，按 `R_new = B * R_old + shift_b - shift_a` 计算目标晶格向量。
+    - 实现 `accumulate_block()` 与 `standardize_sparse_blocks()`，用于块级累加和最小映射单元测试。
+    - 实现 `compute_xyz_axis_transform()`，从旧/新晶格构造正交化的笛卡尔坐标轴变换矩阵。
+    - 实现 `canonicalize_abacus_hs()`，读取原始 ABACUS `HR/SR`，按原子映射、晶格变换和轨道旋转重建 `-symm` 版本，并写出新的稀疏 `.csr` 文件。
+  - 修改 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - 新增 `StandardizationResult` 数据结构。
+    - 新增晶格变化判定、仅原子置换判定、k 点到标准化晶格的坐标变换、以及 `_finalize_standardization_result()`。
+    - `analyze_nonmagnetic()` 现在同时输出：
+      - `standardization_summary.txt`
+      - `standardization_summary.json`
+      - `lattice_old.txt`
+      - `lattice_new.txt`
+      - `lattice_transform_matrix.txt`
+      - `xyz_axis_transform_matrix.txt`
+      - `atom_mapping.txt`
+      - `R_block_mapping.txt`
+    - 当判定需要重建时，写出 `STRU-symm` 并将后续 CHARACTER 分析所用 k 点切换到标准化晶格规范。
+  - 修改 `pyatb-main/src/pyatb/symmetry/character.py`
+    - 在 CHARACTER 主流程中保留原始 `STRU` 读取以获取基组元数据。
+    - 当 `analyze_nonmagnetic()` 返回 `need_rebuild_hs=True` 时：
+      - 调用 `canonicalize_abacus_hs()` 生成 `data-HR-sparse_SPIN0-symm.csr` 与 `data-SR-sparse_SPIN0-symm.csr`
+      - 以标准化晶格重新建立 TB 模型
+      - 重新读取 `STRU-symm`
+      - 后续特征标计算使用标准化后的 `k` 点与 `HS`
+  - 修改 `pyatb-main/src/pyatb/main.py`
+    - CHARACTER 调用额外透传 `SR_route` 与 `HR_unit`，供 HS 标准化重建与重载使用。
+- 测试更新:
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 `test_standardization_reuses_original_files_when_only_permutation`
+    - 新增 `test_standardization_requires_rebuild_when_atoms_move_beyond_permutation`
+    - 新增 `test_character_reads_canonicalized_stru_when_rebuild_is_required`
+  - 新增 `pyatb-main/tests/test_hs_standardize.py`
+    - 覆盖 `R_new` 映射、重复块累加、块键重写三类行为。
+- 测试命令:
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_hs_standardize.py -q`
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_character_core.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_hs_standardize.py -q`
+- 测试结果:
+  - RED 阶段:
+    - 失败（符合预期）
+    - 失败点：
+      - `SymmStructureAnalyzer` 尚无 `_finalize_standardization_result()`
+      - `pyatb.symmetry.hs_standardize` 模块不存在
+      - CHARACTER 尚未切换到 `STRU-symm`
+  - GREEN 阶段:
+    - `test_character_module.py + test_hs_standardize.py`: 全部通过（20/20）
+    - 相关回归测试：全部通过（25/25）
+- 补充说明:
+  - 尝试执行 `PYTHONPATH=src conda run -n symm python -c "import pyatb ..."` 时失败，原因是当前 `symm` 环境缺少已编译的 `pyatb.interface_python` 扩展模块；这属于现有运行环境前置条件，不是本次 Python 层改动引入的新错误。

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.o
+*.mod
+.pytest_cache/
+Out/
+eigen/
+*.log
+*.zip
+*.tar.gz

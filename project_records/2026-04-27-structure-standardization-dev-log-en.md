@@ -1,0 +1,953 @@
+# Structure Standardization And HS Canonicalization Log (2026-04-27)
+
+## Update 1: Plan A implementation for non-magnetic structure canonicalization
+- Code changes:
+  - Added `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - Implemented `map_target_r_vector()` using `R_new = B * R_old + shift_b - shift_a`.
+    - Implemented `accumulate_block()` and `standardize_sparse_blocks()` for block-level remapping tests.
+    - Implemented `compute_xyz_axis_transform()` to derive an orthogonalized Cartesian axis transform from the old and new lattices.
+    - Implemented `canonicalize_abacus_hs()` to read ABACUS `HR/SR`, rebuild canonical `-symm` matrices from atom/lattice/orbital mappings, and write sparse `.csr` outputs.
+  - Updated `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - Added `StandardizationResult`.
+    - Added lattice-change detection, permutation-only detection, k-point basis conversion, and `_finalize_standardization_result()`.
+    - `analyze_nonmagnetic()` now writes:
+      - `standardization_summary.txt`
+      - `standardization_summary.json`
+      - `lattice_old.txt`
+      - `lattice_new.txt`
+      - `lattice_transform_matrix.txt`
+      - `xyz_axis_transform_matrix.txt`
+      - `atom_mapping.txt`
+      - `R_block_mapping.txt`
+    - When rebuild is required, it writes `STRU-symm` and switches later CHARACTER analysis to the canonicalized k-point convention.
+  - Updated `pyatb-main/src/pyatb/symmetry/character.py`
+    - Keeps the original `STRU` read to obtain source orbital basis metadata.
+    - When `need_rebuild_hs=True`, it rebuilds canonical `HR/SR`, reconstructs a TB model in the standardized lattice, reloads `STRU-symm`, and uses canonicalized k-points and matrices for the character workflow.
+  - Updated `pyatb-main/src/pyatb/main.py`
+    - CHARACTER now also receives `SR_route` and `HR_unit` so canonical HS rebuilding can preserve the expected read/write convention.
+- Tests added/updated:
+  - Updated `pyatb-main/tests/test_character_module.py`
+    - `test_standardization_reuses_original_files_when_only_permutation`
+    - `test_standardization_requires_rebuild_when_atoms_move_beyond_permutation`
+    - `test_character_reads_canonicalized_stru_when_rebuild_is_required`
+  - Added `pyatb-main/tests/test_hs_standardize.py`
+    - Covers `R_new` remapping, duplicate block accumulation, and target-key rewriting.
+- Test commands:
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_hs_standardize.py -q`
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_character_core.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_hs_standardize.py -q`
+- Test results:
+  - RED stage:
+    - failed as expected because `_finalize_standardization_result()` and `hs_standardize.py` did not exist yet, and CHARACTER still used the original `STRU` path only.
+  - GREEN stage:
+    - `test_character_module.py + test_hs_standardize.py`: PASS (20/20)
+    - relevant regression set: PASS (25/25)
+- Environment note:
+  - A direct source import smoke check failed because the current `symm` environment does not provide the compiled `pyatb.interface_python` extension. This is an existing environment prerequisite, not a new Python-level regression introduced by this change.
+
+## Update 2: Real sample verification and JSON serialization fix
+- Issue found during real run:
+  - Running `conda run -n symm pyatb` in `test_workspace/test-abacus-2/pyatb` failed while writing `standardization_summary.json`.
+  - Root cause: `_finalize_standardization_result()` converted only top-level `ndarray` objects, but `atom_mapping[*]["shift"]` still contained nested `numpy.ndarray` values.
+- Code changes:
+  - Updated `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - Added `_jsonable()` to recursively serialize nested `dict/list/tuple/ndarray` structures.
+    - Switched `_finalize_standardization_result()` to use recursive serialization for the returned result payload.
+- Tests added:
+  - Updated `pyatb-main/tests/test_character_module.py`
+    - Added `test_standardization_result_is_json_serializable_with_atom_shift_arrays`
+- Verification commands:
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py -k 'json_serializable_with_atom_shift_arrays' -q`
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_character_core.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_hs_standardize.py -q`
+  - `conda run -n symm python -m pip install --no-build-isolation -e /home/zjdai/file-test/pyatb_symm/.worktrees/structure-hs-canonicalization/pyatb-main`
+  - `cd /home/zjdai/file-test/pyatb_symm/test_workspace/test-abacus-2/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- Verification results:
+  - JSON regression test: PASS (1/1)
+  - Relevant regression suite: PASS (26/26)
+  - Real sample run: PASS
+- Real sample outputs confirmed:
+  - `Out/CHARACTER/standardization_summary.txt`
+  - `Out/CHARACTER/standardization_summary.json`
+  - `Out/CHARACTER/lattice_old.txt`
+  - `Out/CHARACTER/lattice_new.txt`
+  - `Out/CHARACTER/lattice_transform_matrix.txt`
+  - `Out/CHARACTER/xyz_axis_transform_matrix.txt`
+  - `Out/CHARACTER/atom_mapping.txt`
+  - `Out/CHARACTER/R_block_mapping.txt`
+  - `Out/CHARACTER/trace.txt`
+  - `Out/CHARACTER/symmetry_character_report.txt`
+- Sample-specific conclusion:
+  - For `test-abacus-2`, the standardization decision is:
+    - `lattice_changed: False`
+    - `atom_permutation_only: True`
+    - `need_rebuild_hs: False`
+  - Therefore the absence of `data-HR-sparse_SPIN0-symm.csr` and `data-SR-sparse_SPIN0-symm.csr` in this sample is correct behavior, not a generation failure.
+
+## Update 3: Post-Rotation HS Numeric Validation (Common-R Only)
+- Goal:
+  - Validate numeric consistency between rotated `HS-symm` and reference `soc` by comparing only shared `R` keys.
+- Inputs:
+  - Reference: `test_workspace/test-abacus-2/soc/OUT.ABACUS/data-HR-sparse_SPIN0.csr`, `data-SR-sparse_SPIN0.csr`
+  - Candidate: `test_workspace/test-abacus-3/pyatb/data-HR-sparse_SPIN0-symm.csr`, `data-SR-sparse_SPIN0-symm.csr`
+- Method:
+  - Read ABACUS sparse triangular vectors with `nspin=4`.
+  - Compute `R` intersection by `R_direct_coor`.
+  - Compare triangular rows on common `R` keys only.
+  - Report `max_abs_diff`, `rel_fro_diff`, top mismatch keys, and `only_ref/only_new` key lists.
+- Key Results:
+  - HR:
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=4.131827266703e+01`
+    - `rel_fro_diff_on_common_R=1.016064491225e+00`
+  - SR:
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=1.000000000000e+00`
+    - `rel_fro_diff_on_common_R=1.115319460174e+00`
+- Conclusion:
+  - Rotated matrices are currently not numerically consistent with the reference.
+  - Detailed report saved at:
+    - `test_workspace/test-abacus-3/pyatb/Out/CHARACTER/hs_rotation_validation_report.txt`
+
+## Update 4: Passive-Transform Trial (Use Inverse D-Matrix Input)
+- Purpose:
+  - Validate whether local orbital/spin rotation should use the inverse Cartesian axis transform under passive-basis convention.
+- Code changes:
+  - Updated `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - In `_local_rotation()`, switched `cart_rotation` to `inv(xyz_axis_transform_cartesian)`.
+    - SOC spin rotation now uses the same inverse matrix.
+  - Updated `pyatb-main/tests/test_character_module.py`
+    - Added `test_local_rotation_uses_inverse_cartesian_transform`
+    - Kept `test_local_rotation_includes_spin_rotation_for_soc`
+- Commands:
+  - `cd pyatb-main && pytest -q tests/test_character_module.py -k "local_rotation_uses_inverse_cartesian_transform or local_rotation_includes_spin_rotation_for_soc"`
+  - `cd test_workspace/test-abacus-3/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- Results:
+  - Unit tests: PASS (2/2)
+  - Real sample run: PASS (no runtime error)
+- Numeric validation (common-R only):
+  - HR:
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=4.196264037856e+01`
+    - `rel_fro_diff_on_common_R=1.028613730451e+00`
+  - SR:
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=1.000000000000e+00`
+    - `rel_fro_diff_on_common_R=1.191444992659e+00`
+- Conclusion:
+  - Switching to inverse matrix does not improve the mismatch; errors slightly increase.
+  - The dominant root cause is not this active/passive inverse choice.
+
+## Update 5: `R`-Mapping Root Cause Traced to ASE Wrapped Fractional Coordinates
+- Purpose:
+  - Re-check the current `R'` mapping using the user-specified geometric criterion `d = M * R' + d'`.
+  - First verify that `test-abacus-3/pyatb/STRU-symm` matches `test-abacus-2/soc/STRU`, then isolate the `R`-index failure source.
+- Key findings:
+  - Structure consistency is valid:
+    - `natom=5 vs 5`
+    - `species_equal=True`
+    - `max_abs_lattice_diff=5.081943307061465e-05`
+    - `max_abs_fracpos_diff=3.3306690738754696e-16`
+  - When `R'` is reconstructed directly from the geometric equation, the decomposition residual is negligible:
+    - `max_geom_residual=4.107825191113079e-15`
+  - The first actual bug is in `_build_atom_mapping()`:
+    - ASE `get_scaled_positions()` wraps tiny negative fractional coordinates near `0` back to `1.0`
+    - This incorrectly turns a valid `shift=[0,0,0]` case into `shift=[0,-1,0]`
+    - That bad shift then corrupts `R' = R * B + shift_b - shift_a`
+- Code changes:
+  - Updated `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - `_build_atom_mapping()` now uses `get_scaled_positions(wrap=False)` for both source and primitive structures
+  - Updated `pyatb-main/tests/test_character_module.py`
+    - Added `test_build_atom_mapping_uses_unwrapped_scaled_positions`
+- Commands:
+  - `cd pyatb-main && pytest tests/test_character_module.py -k unwrapped_scaled_positions`
+  - `cd pyatb-main && pytest tests/test_character_module.py -k 'unwrapped_scaled_positions or supercell_to_primitive_basis_change or standardize_nonmagnetic_cell_separates_mapping'`
+  - `cd pyatb-main && pytest tests/test_character_module.py`
+  - `cd test_workspace/test-abacus-3/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache PYTHONPATH=/home/zjdai/file-test/pyatb_symm/pyatb-main/src:$PYTHONPATH pyatb`
+- Results:
+  - The new regression test fails before the fix as expected:
+    - observed `shift=[0,-1,0]`, expected `shift=[0,0,0]`
+  - Focused subset after the fix: PASS (3/3)
+  - Full module after the fix: PASS (27/27)
+  - Real sample `test-abacus-3/pyatb`: PASS
+- Geometric re-validation:
+  - Recomputed under the unwrapped fractional-coordinate convention:
+    - `max_geom_resid=4.6629367034256575e-15`
+    - `mismatch_count=0`
+  - This confirms the current `R'` now matches the user-defined `d = M * R' + d'` criterion.
+- Output re-check:
+  - The regenerated `Out/CHARACTER/standardization_summary.json` now contains the corrected shifts, for example:
+    - `old_atom=4 -> new_atom=2, shift=[-1, 0, 0]`
+    - `old_atom=7 -> new_atom=2, shift=[0, 0, 0]`
+- Conclusion:
+  - The main issue in this round was not the `R` formula itself but `shift` contamination caused by ASE coordinate wrapping.
+  - After forcing `wrap=False`, the geometric `R` mapping criterion is satisfied.
+
+## Update 6: Matrix Covariance Check in the Requested Order
+- Purpose:
+  - Check HS covariance in the requested sequence:
+    1. orbital active/passive convention
+    2. whether spin rotation participates correctly
+    3. whether the left/right multiplication order of each atom-pair block is correct
+- Diagnostic method:
+  - Source matrices:
+    - `test-abacus-3/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+    - `test-abacus-3/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+  - Reference matrices:
+    - `test-abacus-2/soc/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+    - `test-abacus-2/soc/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+  - With the corrected `R'` mapping fixed, compare combinations of:
+    - `cart_rotation = xyz / inv(xyz) / I`
+    - `spin = S(cart) / I`
+    - block orders `D_a H D_b^\dagger` and `D_a^\dagger H D_b`
+- Key findings:
+  - The current implementation (`inv_cart + D_a H D_b^\dagger`) is not optimal:
+    - HR `rel_fro_diff=1.0368627556552867`
+    - SR `rel_fro_diff=1.1960439121329194`
+  - The best two variants are equivalent:
+    - `cart + D_a H D_b^\dagger`
+    - `inv_cart + D_a^\dagger H D_b`
+  - Therefore:
+    - a nontrivial orbital rotation is necessary; `identity` is worse
+    - `cart` and `inv(cart)` are equivalent only if the multiplication convention is changed consistently
+    - since the code path already uses `inv(cart)`, the block covariance form must be `D_a^\dagger H D_b`
+  - Spin is not the dominant source of error:
+    - the difference between `cart + spin` and `cart + spin=I` is only at the `1e-6` level
+- Code changes:
+  - Updated `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - changed `standardize_sparse_blocks()` from `D_a H D_b^\dagger` to `D_a^\dagger H D_b`
+    - changed `_assemble_target_dense_blocks()` consistently to `D_a^\dagger H D_b`
+  - Updated `pyatb-main/tests/test_hs_standardize.py`
+    - added `test_standardize_sparse_blocks_uses_passive_basis_rotation_order`
+- Commands:
+  - `cd pyatb-main && pytest tests/test_hs_standardize.py -k passive_basis_rotation_order`
+  - `cd pyatb-main && pytest tests/test_hs_standardize.py tests/test_character_module.py`
+  - `cd test_workspace/test-abacus-3/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache PYTHONPATH=/home/zjdai/file-test/pyatb_symm/pyatb-main/src:$PYTHONPATH pyatb`
+- Results:
+  - The new regression test fails before the fix and passes after the fix
+  - Unit tests: `31 passed`
+  - Real sample: PASS
+- Post-fix numeric comparison against the reference:
+  - HR:
+    - `R_num(ref/new)=165/149`
+    - `common=149, only_ref=16, only_new=0`
+    - `max_abs_diff=41.318272667030875`, worst key `R=(0,0,0)`
+    - `rel_fro_diff=0.9960972407198854`
+  - SR:
+    - `R_num(ref/new)=165/149`
+    - `common=149, only_ref=16, only_new=0`
+    - `max_abs_diff=1.0000000000000027`, worst key `R=(0,0,0)`
+    - `rel_fro_diff=0.9592156252752511`
+- Conclusion:
+  - Item 3, the block multiplication order, was indeed wrong and has been fixed.
+  - Item 1, the orbital active/passive convention, is coupled to item 3; with the current `inv(cart)` choice, the correct passive-basis form is `D_a^\dagger H D_b`.
+  - Item 2, spin rotation, is not the main source of the remaining discrepancy.
+  - Even after the order fix, `HR/SR` are still not fully aligned with the independent reference, so the dominant remaining issue is likely in the local orbital representation convention itself rather than these three layers.
+
+## Update 7: Independent Two-Step Verification Using the User-Defined Formulation
+- Verification definition:
+  - Step 1: determine `(R, atom1, atom2) -> (R', atom1', atom2')` using only the real-space displacement `d`
+  - Step 2: use the global rotation `Q` between the primitive cell in the original Cartesian frame and the final standardized structure, construct orbital+spin representations, and verify block covariance with the passive-basis rule `D_a^\dagger H D_b`
+- Procedure:
+  - Generated the primitive cell in the original Cartesian frame with `spglib.standardize_cell(..., no_idealize=True)`
+  - Reconstructed each target block index independently from
+    - `d = (R + tau_b - tau_a) * A_old`
+    - `R' = round(d * M^{-1} - (tau'_b - tau'_a))`
+  - Checked that this `R'` matches the program formula
+    - `R' = R * B + shift_b - shift_a`
+  - Then assembled primitive-same-frame blocks without rotation, applied the local representation of `Q` as
+    - `H_final = D_a^\dagger H_primitive D_b`
+    - `S_final = D_a^\dagger S_primitive D_b`
+  - Finally compared the reconstructed result against the independent reference in `test-abacus-2/soc`
+- Key results:
+  - The atom-pair block mapping under the `d` criterion is fully consistent:
+    - `pair_mapping_by_d_mismatch_count = 0`
+    - `pair_mapping_sample_mismatch = None`
+  - The primitive cell in the original frame and the final standardized structure use the same atom ordering:
+    - `mapping_final_species_equal = True`
+    - `mapping_final_frac_maxdiff = 4.440892098500626e-16`
+  - The global frame transform is a proper rotation:
+    - `det(Q) = 1.0`
+  - After reconstructing with `D_a^\dagger H D_b` / `D_a^\dagger S D_b`, comparison against the independent reference gives:
+    - HR:
+      - `common=149, only_ref=16, only_new=0`
+      - `max_abs_diff=41.31827266703096`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9960972407198853`
+    - SR:
+      - `common=148, only_ref=17, only_new=0`
+      - `max_abs_diff=1.0000000000000036`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9592156252752608`
+- Conclusion:
+  - Part 1, the `d`-based `(R, atom1, atom2) -> (R', atom1', atom2')` mapping, can now be considered correct.
+  - Part 2, the orbital+spin reconstruction with `Q` and the passive rule `D_a^\dagger H D_b`, still does not fully reproduce the independent reference.
+  - Therefore, the dominant remaining discrepancy is no longer in `R` mapping or in the passive covariance formula itself, but more likely in the local orbital representation convention or ABACUS local basis ordering.
+
+## Update 8: Independent `S1` DFT Cross-Check (`test-abacus-4`, 12 MPI x 1 OMP)
+- Goal:
+  - Run an independent DFT calculation on the `S1` structure in `test_workspace/test-abacus-4`, then validate in two steps:
+    1. whether the `S0 -> S1` block regrouping is correct
+    2. whether the `S1 -> S2` rotational covariance is correct
+- Calculation setup:
+  - `STRU` uses the `S1` structure generated by `spglib.standardize_cell(..., no_idealize=True)`
+  - Run command:
+    - `mpirun -np 12 abacus`
+    - `OMP_NUM_THREADS=1`
+  - Result:
+    - SCF completed successfully
+    - `START Time  : Mon Apr 27 20:53:17 2026`
+    - `FINISH Time : Mon Apr 27 20:57:24 2026`
+    - `TOTAL Time  : 247`
+    - Successfully produced:
+      - `test_workspace/test-abacus-4/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+      - `test_workspace/test-abacus-4/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+- Step 1 validation: `S0 -> S1`
+  - First re-check the atom-pair block labels using only the real-space displacement `d`:
+    - `pair_mapping_by_d_mismatch_count = 0`
+  - Then regroup the original `S0` `HS` into `S1` block labels and compare directly against the independently computed `S1` `HS`.
+  - Result:
+    - HR:
+      - `common=149, only_ref=16, only_new=0`
+      - `max_abs_diff=41.36687515024866`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9993125459280097`
+    - SR:
+      - `common=148, only_ref=17, only_new=0`
+      - `max_abs_diff=1.0`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9924510304252063`
+  - Conclusion:
+    - The geometric block-label mapping is correct;
+    - but the `S0 -> S1` block regrouping alone does not reproduce the independently computed `S1` `HS`.
+- Step 2 validation: `S1 -> S2`
+  - Use the independently computed `S1` `HS` as the input;
+  - build the local orbital+spin representation from `Q12 = compute_xyz_axis_transform(A1, A2)`;
+  - rotate with the passive-basis rule `D_a^\dagger H D_b` / `D_a^\dagger S D_b`;
+  - compare against the independent `S2` reference (`test-abacus-2/soc`).
+  - Result:
+    - `det(Q12)=0.9999999999999998`
+    - HR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=0.6912370456794656`
+      - `worst_key=(-1, 0, 1)`
+      - `rel_fro_diff=0.014921678967759013`
+    - SR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=0.07417024416277339`
+      - `worst_key=(-1, 0, 1)`
+      - `rel_fro_diff=0.03710883045545394`
+  - Conclusion:
+    - The `S1 -> S2` rotational covariance is strongly supported; errors are now down to the `1e-2 ~ 1e-3` relative scale.
+- Summary:
+  - This independent cross-check narrows the issue further:
+    - `S0 -> S1`: geometric mapping is correct, but matrix-block regrouping does not hold
+    - `S1 -> S2`: rotational covariance essentially holds
+  - Therefore the dominant remaining problem is concentrated in how the original supercell `S0` `HS` should be reduced to the primitive-cell `S1` `HS`, not in the later `Q` rotation or in the `D_a^\dagger H D_b` formula.
+  - Machine-readable results have been saved at:
+    - `test_workspace/test-abacus-4/verification_report_s1_s2.json`
+
+## Update 9: User-Requested Check with `D_a H D_b^\dagger`
+- Goal:
+  - The user correctly pointed out that `max_abs_diff = 0.6912370456794656` is still too large, and asked to test the alternative `S1 -> S2` order `D_a H D_b^\dagger` directly.
+- Method:
+  - Use the independently computed `S1` `HR/SR`
+  - Compare both orders for the same `Q12`:
+    - `D_a H D_b^\dagger`
+    - `D_a^\dagger H D_b`
+- Results:
+  - `det(Q12) = 1.0`
+  - `D_a H D_b^\dagger`:
+    - HR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=3.6564002975711296`
+      - `worst_key=(1, 1, 0)`
+      - `rel_fro_diff=0.20221819489628454`
+    - SR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=0.3362716783375885`
+      - `worst_key=(0, 0, -1)`
+      - `rel_fro_diff=0.4980809821008054`
+  - `D_a^\dagger H D_b`:
+    - HR:
+      - `max_abs_diff=0.6912370456802207`
+      - `rel_fro_diff=0.01492167896775818`
+    - SR:
+      - `max_abs_diff=0.07417024416282907`
+      - `rel_fro_diff=0.037108830455465466`
+- Conclusion:
+  - After testing the user-requested alternative, we can now confirm directly:
+    - `D_a H D_b^\dagger` is substantially worse than `D_a^\dagger H D_b`
+    - therefore `D_a H D_b^\dagger` is not the correct covariance order for the current `S1 -> S2` step
+  - However, the user's criticism of `0.691` is valid: even the better order cannot yet be claimed to satisfy covariance perfectly.
+  - This reinforces that the remaining dominant error should be sought in the local orbital representation convention, not in further switching between these two left/right multiplication orders.
+
+## Update 10: Direct Quantification of `S1 -> S2` Geometric and Matrix-Element Errors
+- Goal:
+  - As requested by the user, quantify directly:
+    - the geometric accuracy of the current code rotation `Q = compute_xyz_axis_transform(A1, A2)`
+    - the geometric accuracy of the exact orthogonal Procrustes rotation `R`
+    - the maximum matrix-element absolute error, worst element position, and total absolute-error sum for `HR/SR` under a real-displacement-based `d` decomposition
+- Validation objects:
+  - `S1 = test_workspace/test-abacus-4/verification_tmp/STRU_S1_abs`
+  - `S2 = test_workspace/test-abacus-4/verification_tmp/STRU_S2_abs`
+  - `HR/SR` were taken from:
+    - `test_workspace/test-abacus-4/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+    - `test_workspace/test-abacus-4/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+    - `test_workspace/test-abacus-2/soc/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+    - `test_workspace/test-abacus-2/soc/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+- Method:
+  - Do not use `R' = R * B + shift_b - shift_a` for this `S1 -> S2` step;
+  - instead use the real-displacement decomposition requested by the user:
+    - first compute `d_old = R_old A1 + tau_b - tau_a`
+    - then compute `d_new = d_old * rot`
+    - finally decompose `d_new = R_new A2 + (tau'_b - tau'_a)`
+  - Apply the same comparison pipeline to both the current `Q` and the exact `R`.
+- Results:
+  - Current code rotation `Q`:
+    - Lattice-vector rotation error:
+      - `max_abs_component = 7.569692925288651`
+      - `fro_norm = 13.574514778132011`
+      - `sum_abs = 31.227529521950405`
+    - Atomic Cartesian rotation error:
+      - `max_cart_error_norm = 4.533461535158469`
+      - `sum_cart_error_norm = 10.594375286660913`
+      - worst atom:
+        - `old_atom=5 -> new_atom=3`
+        - `shift=(0,-1,1)`
+        - `error_vector_cart=(-1.95008478823786, -0.8213822360093728, 4.009335859193256)`
+    - `R'`-index error after `d` decomposition:
+      - `max_abs_fractional_error = 0.4998014620398614`
+    - `HR`:
+      - `max_abs_diff = 41.41910375158555`
+      - `sum_abs_diff = 19197.814232959812`
+      - worst matrix element:
+        - `R = (0, 0, 0)`
+        - `(row, col) = (199, 199)`
+        - `pred = 0`
+        - `ref = 41.41910375158555`
+    - `SR`:
+      - `max_abs_diff = 1.0089925198200005`
+      - `sum_abs_diff = 2024.0611290509958`
+      - worst matrix element:
+        - `R = (0, 0, 0)`
+        - `(row, col) = (104, 104)`
+        - `pred = 2.0089925198200005`
+        - `ref = 1.0`
+  - Exact orthogonal Procrustes rotation `R`:
+    - Lattice-vector rotation error:
+      - `max_abs_component = 5.081939203677166e-05`
+      - `fro_norm = 9.073280079143255e-05`
+      - `sum_abs = 1.9989181452516889e-04`
+    - Atomic Cartesian rotation error:
+      - `max_cart_error_norm = 1.2074679831641837e-04`
+      - `sum_cart_error_norm = 3.5730079538926005e-04`
+      - worst atom:
+        - `old_atom=4 -> new_atom=4`
+        - `shift=(0,0,0)`
+        - `error_vector_cart=(1.086808421035812e-11, -2.453592884421596e-13, -1.2074679831641788e-04)`
+    - `R'`-index error after `d` decomposition:
+      - `max_abs_fractional_error = 2.019296417365979e-05`
+    - `HR`:
+      - `max_abs_diff = 4.124352676405114`
+      - `sum_abs_diff = 15299.801821154322`
+      - worst matrix element:
+        - `R = (1, 2, 0)`
+        - `(row, col) = (61, 103)`
+        - `pred = 4.1243526735271345 - 1.5407662974328566e-04 i`
+        - `ref = 0`
+    - `SR`:
+      - `max_abs_diff = 0.395826381401726`
+      - `sum_abs_diff = 1754.354197323576`
+      - worst matrix element:
+        - `R = (0, 1, 1)`
+        - `(row, col) = (1, 111)`
+        - `pred = 0.395544578747726`
+        - `ref = -2.81802654e-04`
+- Conclusion:
+  - The current code rotation `Q` is not a “small numerical drift”; it is geometrically wrong already:
+    - lattice rotation errors are `O(1~10)` Angstrom
+    - atomic-position errors are `O(1)` Angstrom
+    - therefore the corresponding `HR/SR` comparison is not physically meaningful
+  - After replacing `Q` by the exact `R`, the geometric errors drop to the `1e-4 ~ 1e-5` scale, so the spatial rotation itself can be considered correct.
+  - However, even after the geometric part is corrected, the `HR/SR` matrix-element errors remain large. Therefore the remaining dominant issue is no longer “which rotation matrix is correct”, but instead lies in:
+    - the local orbital rotation representation
+    - the orbital/spin block convention
+    - or the block-level regrouping rule for `S1 -> S2`
+- Output file:
+  - A detailed machine-readable report has been saved at:
+    - `test_workspace/test-abacus-4/verification_report_s1_s2_detailed.json`
+
+## Update 11: Solve the Rotation Directly from the Lattice Vectors and Compare with `Q` / `Q^{-1}`
+- Goal:
+  - The user suggested two equivalent checks:
+    - test whether `Q^{-1}` is actually the correct rotation;
+    - or solve the rotation directly from the lattice vectors and compare it with `Q`.
+  - Both were carried out here.
+- Method:
+  - Solve an orthogonal Procrustes rotation `R_latt` directly from the `S1` / `S2` lattice matrices `A1` / `A2`, such that:
+    - `A1 * R_latt ≈ A2`
+  - Then compare:
+    - `Q = compute_xyz_axis_transform(A1, A2)`
+    - `Q^{-1}`
+    - `R_latt`
+- Relation results:
+  - `max_abs(Q - R_latt) = 0.8059478593450315`
+  - `max_abs(Q^{-1} - R_latt) = 3.945038740127416e-12`
+  - `max_abs(Q - R_latt^T) = 3.945031801233512e-12`
+  - Conclusion:
+    - the current code `Q` is actually the transpose of the correct rotation matrix
+    - i.e. for the `S1 -> S2` step, the physically correct rotation is `Q^{-1}`, not `Q`
+- Geometric validation using `Q^{-1}`:
+  - Lattice-vector error:
+    - `max_abs_component = 5.081939239026667e-05`
+    - `fro_norm = 9.073280079170419e-05`
+    - `sum_abs = 1.9989181389155252e-04`
+  - Atomic Cartesian error:
+    - `max_cart_error_norm = 1.2074679831287868e-04`
+    - `sum_cart_error_norm = 3.573007953867267e-04`
+    - `max_abs_component = 1.2074679831286517e-04`
+    - worst atom:
+      - `old_atom=4 -> new_atom=4`
+      - `shift=(0,0,0)`
+      - `error_vector_cart=(3.374100998598806e-11, 4.6089132510473974e-11, -1.2074679831286517e-04)`
+  - `R'`-index error after `d` decomposition:
+    - `max_abs_fractional_error = 2.0192963692711174e-05`
+- Matrix-element validation using `Q^{-1}`:
+  - `HR`:
+    - `max_abs_diff = 4.124352676405453`
+    - `sum_abs_diff = 15299.801821172361`
+    - worst matrix element:
+      - `R = (1, 2, 0)`
+      - `(row, col) = (61, 103)`
+  - `SR`:
+    - `max_abs_diff = 0.3958263814017623`
+    - `sum_abs_diff = 1754.3541973262743`
+    - worst matrix element:
+      - `R = (0, 1, 1)`
+      - `(row, col) = (1, 111)`
+- Conclusion:
+  - The user's suspicion was correct:
+    - the correct lattice-derived rotation matrix is `Q^{-1}`
+    - the current `compute_xyz_axis_transform()` returns the opposite orientation
+  - However, even after replacing the rotation by `Q^{-1}`, the geometry matches while `HR/SR` still do not.
+  - Therefore the next debugging target should no longer be “`Q` or `Q^{-1}`?”, but instead:
+    - the local orbital rotation representation
+    - the spin-orbital tensor-product convention
+    - or the block-level `HS` regrouping rule
+
+## Update 12: Re-compare `D_a H D_b^\dagger` and `D_a^\dagger H D_b` Under the Geometrically Correct `Q^{-1}`
+- Goal:
+  - After confirming that `Q^{-1}` is the correct spatial rotation, compare the two block-transform orders again:
+    - `D_a H D_b^\dagger`
+    - `D_a^\dagger H D_b`
+- Method:
+  - Fix the geometric rotation to `rot = Q^{-1}`
+  - Keep the atom mapping and `d`-decomposition rule unchanged
+  - Only switch the local block-transform order
+- Results:
+  - `D_a H D_b^\dagger`:
+    - `HR`
+      - `max_abs_diff = 3.5979647880326615`
+      - `sum_abs_diff = 7107.122524107396`
+      - `rel_fro = 0.14729745463762509`
+      - worst position:
+        - `R = (0, 1, 1)`
+        - `(row, col) = (3, 103)`
+    - `SR`
+      - `max_abs_diff = 0.31502600984906165`
+      - `sum_abs_diff = 865.1989392267225`
+      - `rel_fro = 0.424745413765751`
+      - worst position:
+        - `R = (1, 2, 0)`
+        - `(row, col) = (51, 115)`
+  - `D_a^\dagger H D_b`:
+    - `HR`
+      - `max_abs_diff = 4.124352676405453`
+      - `sum_abs_diff = 15299.801821172361`
+      - `rel_fro = 0.21934757860995513`
+      - worst position:
+        - `R = (1, 2, 0)`
+        - `(row, col) = (61, 103)`
+    - `SR`
+      - `max_abs_diff = 0.3958263814017623`
+      - `sum_abs_diff = 1754.3541973262743`
+      - `rel_fro = 0.5834550105294755`
+      - worst position:
+        - `R = (0, 1, 1)`
+        - `(row, col) = (1, 111)`
+- Conclusion:
+  - Under the geometrically correct `Q^{-1}`, `D_a H D_b^\dagger` is clearly better than `D_a^\dagger H D_b`
+  - Therefore the earlier opposite conclusion was caused by using the incorrectly oriented `Q`
+  - However, even the better order `D_a H D_b^\dagger` still leaves large residuals, so the left/right multiplication order is not the final root cause; it is only a secondary factor
+
+## Update 13: Test Whether the Issue Is the Transpose of the Local Rotation Matrix `D`
+- Goal:
+  - The user suggested another possibility: the issue may not be the left/right order, but that the local rotation matrix itself should be transposed as `D^T`
+- Method:
+  - Under the geometrically correct `rot = Q^{-1}`, compare all four combinations:
+    - `D H D^\dagger`
+    - `D^T H (D^T)^\dagger`
+    - `D^\dagger H D`
+    - `(D^T)^\dagger H D^T`
+- Results:
+  - `D H D^\dagger`
+    - `HR max_abs = 3.5979647880326615`
+    - `HR sum_abs = 7107.122524107396`
+    - `SR max_abs = 0.31502600984906165`
+    - `SR sum_abs = 865.1989392267225`
+  - `D^T H (D^T)^\dagger`
+    - `HR max_abs = 4.1243546988118105`
+    - `HR sum_abs = 15325.867215662282`
+    - `SR max_abs = 0.3958263814017623`
+    - `SR sum_abs = 1754.3541973262743`
+  - `D^\dagger H D`
+    - `HR max_abs = 4.124352676405453`
+    - `HR sum_abs = 15299.801821172361`
+    - `SR max_abs = 0.3958263814017623`
+    - `SR sum_abs = 1754.3541973262743`
+  - `(D^T)^\dagger H D^T`
+    - `HR max_abs = 3.5979648127149577`
+    - `HR sum_abs = 7233.513351009986`
+    - `SR max_abs = 0.31502600984906165`
+    - `SR sum_abs = 865.1989392267225`
+- Conclusion:
+  - Simply replacing `D` by `D^T` does not fundamentally remove the error
+  - Numerically, it almost just swaps the two left/right conventions:
+    - `D H D^\dagger` is nearly equivalent to `(D^T)^\dagger H D^T`
+    - `D^\dagger H D` is nearly equivalent to `D^T H (D^T)^\dagger`
+  - Therefore the problem is not “missing one transpose” in a simple sense; it is closer to an equivalent reparameterization between the row/column convention of the local representation and the left/right multiplication order
+  - The best combination still only reduces the error to:
+    - `HR max_abs ≈ 3.598`
+    - `SR max_abs ≈ 0.315`
+  - This indicates that the dominant issue still lies deeper in the local orbital/spin representation convention, not in a missing `.T`
+
+## Update 14: Construct the Local Representation Matrix `D` from `(Q^{-1})^T`
+- Goal:
+  - The user further suggested that the issue may not be transposing an already-built `D`, but that `D` should itself be generated from the Cartesian rotation `(Q^{-1})^T`
+- Method:
+  - Keep the geometric mapping fixed to the correct `rot_geom = Q^{-1}`
+  - Compare two ways of constructing `D`:
+    - `D_from_Qinv`: local representation generated directly from `Q^{-1}`
+    - `D_from_Qinv_T`: local representation generated from `(Q^{-1})^T = Q`
+  - For each `D`, compare:
+    - `D H D^\dagger`
+    - `D^\dagger H D`
+- Results:
+  - `D_from_Qinv`
+    - `D H D^\dagger`
+      - `HR max_abs = 4.124352676405453`
+      - `HR sum_abs = 15299.801821172361`
+      - `SR max_abs = 0.39582638140176235`
+      - `SR sum_abs = 1754.3541973262745`
+    - `D^\dagger H D`
+      - `HR max_abs = 3.597964788032662`
+      - `HR sum_abs = 7107.122524107394`
+      - `SR max_abs = 0.3150260098490618`
+      - `SR sum_abs = 865.1989392267222`
+  - `D_from_Qinv_T`
+    - `D H D^\dagger`
+      - `HR max_abs = 3.597964788032662`
+      - `HR sum_abs = 7107.122524107394`
+      - `SR max_abs = 0.3150260098490618`
+      - `SR sum_abs = 865.1989392267221`
+    - `D^\dagger H D`
+      - `HR max_abs = 4.124352676405453`
+      - `HR sum_abs = 15299.801821172361`
+      - `SR max_abs = 0.39582638140176235`
+      - `SR sum_abs = 1754.3541973262745`
+- Conclusion:
+  - A strict duality appears here:
+    - when `D` is generated from `Q^{-1}`, the better order is `D^\dagger H D`
+    - when `D` is generated from `(Q^{-1})^T`, the better order is `D H D^\dagger`
+  - This shows that:
+    - “which Cartesian rotation should be used to generate `D`”
+    - and “which left/right block-transform order should be used”
+    - are in fact two equivalent ways of encoding the same convention choice
+  - However, the best error does not decrease any further; it still stalls at:
+    - `HR max_abs ≈ 3.598`
+    - `SR max_abs ≈ 0.315`
+  - Therefore, testing `(Q^{-1})^T` confirms:
+    - it does not produce a new better result
+    - it only rewrites the previous best convention in another notation
+
+## Update 15: First Identify the Actual Geometric Operation Mapping `(R, atom)` to `(R', atom')`, Then Build `D` from It
+- Goal:
+  - As requested by the user, do not assume the form of `D` first; instead determine:
+    1. which operation actually maps the Cartesian `S1` structure to `S2`
+    2. whether this operation exchanges atoms
+    3. then build the spinful `D` directly from that verified operation
+- Geometric result:
+  - The operation obtained directly from the lattice relation remains:
+    - `R_cart = Q^{-1}`
+  - Its parameters are:
+    - `det(R_cart) = 1`
+    - rotation axis: `(0.99050363, 0.07673558, -0.11407987)`
+    - rotation angle: `24.00632002228404 deg`
+    - lattice residual: `max |A1 R_cart - A2| = 5.081939239026667e-05`
+- Atomic mapping result:
+  - This geometric operation maps all `S1` atoms onto `S2`
+  - `max_atom_error = 1.2074679831287868e-04`
+  - The atom mapping is:
+    - `1 -> 1` (`Bi`), shift=`(0,0,0)`
+    - `2 -> 2` (`Bi`), shift=`(0,0,0)`
+    - `3 -> 3` (`Se`), shift=`(0,1,0)`
+    - `4 -> 4` (`Se`), shift=`(0,0,0)`
+    - `5 -> 5` (`Se`), shift=`(0,0,0)`
+  - Conclusion:
+    - there is **no atom exchange** in this `S1 -> S2` verification
+    - only `Se(3)` requires a lattice translation `(0,1,0)`
+- Important additional check:
+  - I also enumerated all `spglib` space-group operations of `S2` and tested whether any one of them maps `S1` to `S2`
+  - Result:
+    - `found_count = 0`
+  - Therefore:
+    - this `S1 -> S2` step is **not** a single genuine space-group operation of `S2`
+    - it is a global cell/basis convention change, not a standard group element
+- Verified `(R, atom) -> (R', atom')` rule:
+  - For any block pair, define the real-space displacement as:
+    - `d_old = R_old * A1 + tau_b - tau_a`
+    - `d_new = d_old * R_cart`
+    - then solve:
+      - `d_new = R_new * A2 + (tau'_b - tau'_a)`
+  - The maximum fractional residual in this step is:
+    - `max_fractional_residual = 2.0192963692711174e-05`
+  - This shows that the `(R, atom)` to `(R', atom')` mapping rule is geometrically self-consistent
+- After building the spinful `D` directly from this geometric operation, compare the two covariance orders:
+  - Here `D` is the tensor product of the orbital representation and spin representation built directly from `R_cart`
+  - `D^\dagger H D`
+    - `HR`
+      - `max_abs_diff = 3.597964788032662`
+      - `sum_abs_diff = 7107.122524107394`
+      - `rel_fro = 0.14729745463762509`
+    - `SR`
+      - `max_abs_diff = 0.3150260098490618`
+      - `sum_abs_diff = 865.1989392267222`
+      - `rel_fro = 0.424745413765751`
+  - `D H D^\dagger`
+    - `HR`
+      - `max_abs_diff = 4.124352676405453`
+      - `sum_abs_diff = 15299.801821172361`
+      - `rel_fro = 0.2193475786099551`
+    - `SR`
+      - `max_abs_diff = 0.39582638140176235`
+      - `sum_abs_diff = 1754.3541973262745`
+      - `rel_fro = 0.5834550105294756`
+- Conclusion:
+  - The actual geometric operation mapping `(R, atom)` to `(R', atom')` has now been identified:
+    - it is exactly `R_cart = Q^{-1}`
+  - This operation does not exchange atoms; it only introduces lattice-shift relabeling
+  - But it is **not** a single group operation inside the symmetry group of `S2`; it is a cell/basis convention transformation
+  - Under the convention “build `D` directly from this geometric operation”, `D^\dagger H D` is better than `D H D^\dagger`
+  - A detailed machine-readable report has been written to:
+    - `test_workspace/test-abacus-4/s1_s2_operation_verification.json`
+
+## Update 16: Fix the Boundary-Atom Wrap Convention and Re-check Atom-Block Symmetry with `R_cart = Q^{-1}`
+- Goal:
+  - The user pointed out that:
+    - ABACUS wraps atoms on the cell boundary or outside the cell back into one primitive cell
+    - therefore the first `Se` atom should be treated as `0 0 0`, and should no longer be recorded as an atom identity carrying a cell shift
+- Code fix:
+  - Added a fractional-coordinate canonicalization helper:
+    - `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+      - `canonicalize_fractional_coordinates()`
+  - Fixed boundary-point handling in atom mapping:
+    - `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+      - `_build_atom_mapping()` now canonicalizes `wrap=False` fractional coordinates into `[0,1)` and collapses boundary-near `1` back to `0`
+- Tests:
+  - Added/updated tests, all related tests pass:
+    - `test_canonicalize_fractional_coordinates_wraps_boundary_points`
+    - `test_build_atom_mapping_wraps_boundary_equivalent_positions_without_extra_shift`
+    - `test_build_atom_mapping_supports_supercell_to_primitive_basis_change`
+  - Aggregate result:
+    - `5 passed, 27 deselected`
+- Corrected `S1 -> S2` atom identity mapping (wrapped atom convention):
+  - `1 -> 1` `Bi`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - `2 -> 2` `Bi`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - `3 -> 3` `Se`, `shift=(0,0,0)`, `match_image=(0,1,0)`
+  - `4 -> 4` `Se`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - `5 -> 5` `Se`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - Here:
+    - `shift` means the ABACUS-wrapped in-cell atom identity offset, which is now zero for all atoms
+    - `match_image` only records which nearest periodic image was used during matching
+- Re-checked `(R, atom) -> (R', atom')` atom-block correspondence:
+  - Geometric rotation fixed to:
+    - `R_cart = Q^{-1}`
+  - Block `R'` is still solved from real-space displacements:
+    - `d_old = R_old A1 + r_b - r_a`
+    - `d_new = d_old R_cart`
+    - `d_new = R_new A2 + (r'_b - r'_a)`
+  - Maximum fractional residual remains:
+    - `2.0192963692711174e-05`
+- Global matrix comparison after the fix:
+  - `D^\dagger H D`
+    - `HR`
+      - `max_abs_diff = 3.597964788032662`
+      - `sum_abs_diff = 7107.122524107394`
+      - `rel_fro = 0.14729745463762509`
+    - `SR`
+      - `max_abs_diff = 0.3150260098490618`
+      - `sum_abs_diff = 865.1989392267222`
+      - `rel_fro = 0.424745413765751`
+  - `D H D^\dagger`
+    - `HR`
+      - `max_abs_diff = 4.124352676405453`
+      - `sum_abs_diff = 15299.801821172361`
+      - `rel_fro = 0.2193475786099551`
+    - `SR`
+      - `max_abs_diff = 0.39582638140176235`
+      - `sum_abs_diff = 1754.3541973262745`
+      - `rel_fro = 0.5834550105294756`
+- Main atom-block error sources (ranked under `D^\dagger H D`):
+  - `HR`
+    - `(atom1, atom3)`:
+      - `max_abs_diff = 3.597964788032662`
+    - `(atom2, atom3)`:
+      - `max_abs_diff = 3.597928309115292`
+    - `(atom3, atom4)`:
+      - `max_abs_diff = 1.2811569496661406`
+    - `(atom3, atom5)`:
+      - `max_abs_diff = 1.2811296913245622`
+  - `SR`
+    - `(atom2, atom3)`:
+      - `max_abs_diff = 0.3150260098490618`
+    - `(atom1, atom3)`:
+      - `max_abs_diff = 0.315023684`
+    - `(atom3, atom5)`:
+      - `max_abs_diff = 0.2725724138153027`
+    - `(atom3, atom4)`:
+      - `max_abs_diff = 0.27257225323724354`
+- Conclusion:
+  - The boundary-atom identity bug has been fixed:
+    - `Se(3)` is no longer incorrectly recorded as an identity carrying a cell shift
+  - After the fix, the dominant residuals remain concentrated in `Se atom3`-related blocks:
+    - `(1,3)`, `(2,3)`, `(3,4)`, `(3,5)`
+  - This points more strongly to an incorrect local rotational convention for those `Se` orbital blocks, rather than to a wrap/identity-shift issue
+- Output file:
+  - The corrected machine-readable result has been written to:
+    - `test_workspace/test-abacus-4/s1_s2_operation_verification_wrapped.json`
+
+## Update 17: User-Requested Check with No `R -> R'` Remapping, Comparing the Same `R` Only
+- Goal:
+  - The user further clarified:
+    - no `R -> R'` remapping is needed at all
+    - each `H(R)` should be compared directly with the final structure's `H(R)` at the same `R`
+    - atom-pair blocks are also fixed to the same pair `(a,b)`
+    - `D` is constructed directly from `Q^{-1}`
+- Verification rule:
+  - No atom-translation identity correction
+  - Atom pair fixed:
+    - `(a,b) in H_source(R)` maps only to `(a,b) in H_target(R)`
+  - Lattice index fixed:
+    - `R_source = R_target`
+- Results:
+  - `D^\dagger H D`
+    - `HR`
+      - `max_abs_diff = 0.8298050095751303`
+      - `sum_abs_diff = 457.7214594120439`
+      - `rel_fro = 0.021617312841080948`
+    - `SR`
+      - `max_abs_diff = 0.10526765625377109`
+      - `sum_abs_diff = 39.453501649742975`
+      - `rel_fro = 0.059010241629167334`
+  - `D H D^\dagger`
+    - `HR`
+      - `max_abs_diff = 3.6564002975711296`
+      - `sum_abs_diff = 12956.671110812531`
+      - `rel_fro = 0.20275087616763537`
+    - `SR`
+      - `max_abs_diff = 0.3362716783375885`
+      - `sum_abs_diff = 1407.6808911536646`
+      - `rel_fro = 0.4995223563590714`
+- Conclusion:
+  - Under the user's stricter rule “no `R -> R'` remapping, compare the same `R` only”:
+    - `D^\dagger H D` is clearly better than `D H D^\dagger`
+  - Moreover, the `D^\dagger H D` error scale drops substantially:
+    - `HR rel_fro` decreases from `O(1e-1)` to `2.16e-2`
+    - `SR rel_fro` decreases from `O(1e-1)` to `5.90e-2`
+  - This suggests that for the current `S1/S2` pair, the ABACUS `HS` is much closer to a convention where the same `R` label is preserved, rather than one where the geometric displacement is first transformed and then relabeled to `R'`
+- Main residual sources under `D^\dagger H D`:
+  - `HR`
+    - `(4,4)` and `(5,5)`:
+      - `max_abs_diff = 0.8298050095751303`
+    - `(1,1)` and `(2,2)`:
+      - `max_abs_diff = 0.5892101247952874`
+    - `(3,3)`:
+      - `max_abs_diff = 0.4958234795353154`
+  - `SR`
+    - `(3,3)`, `(4,4)`, `(5,5)`:
+      - `max_abs_diff = 0.10526765625377109`
+    - `(1,1)`, `(2,2)`:
+      - `max_abs_diff = 0.07915485737628104`
+- Output file:
+  - The detailed machine-readable result has been written to:
+    - `test_workspace/test-abacus-4/s1_s2_covariance_same_R_only.json`
+
+## Update 18 (2026-04-28): Main-flow active/passive fix in structure standardization, with regression tests
+- Goal:
+  - Fix active/passive convention handling in the `symm_stru` standardization pipeline
+  - Promote the validated two-stage mapping (`stru1 -> stru2 -> stru3`) into `analyze_nonmagnetic`
+- Code changes:
+  - File: `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+  - Key updates:
+    - `analyze_nonmagnetic` now constructs the final atom mapping in two stages:
+      - Stage-1: `mapping12 = _build_atom_mapping(source_atoms, mapping_atoms, tol)`
+      - Stage-2: fit `q23 = _fit_row_rotation(mapping_lattice, std_lattice)` and solve `mapping23 = _build_rotated_atom_mapping(...)`
+      - Compose: `atom_mapping = _compose_two_stage_mapping(mapping12, mapping23, b23)`
+    - Final `B13` is validated by both chain and direct formulas:
+      - Chain: `B13 = M12 @ B23`
+      - Direct: `round((A1 @ Q23) @ inv(A3))`
+      - A mismatch now raises an explicit error to prevent bad mappings from propagating
+    - Passive/active convention for HS standardization is now explicit:
+      - `xyz_axis_transform_cartesian = Q23^T`
+      - This is consistent with the current `hs_standardize` convention (`D^\dagger H D` with `passive_basis=True`)
+    - `R_block_mapping.txt` single-atom mapping output now uses `map_target_r_vector(...)` instead of the old `R + shift` shortcut
+  - Cleanup:
+    - Removed unused `ase_write` import
+- New tests:
+  - File: `pyatb-main/tests/test_character_module.py`
+  - Added:
+    - `test_compose_two_stage_mapping_applies_intermediate_lattice_transform`
+    - `test_build_rotated_atom_mapping_matches_rotated_primitive_atoms`
+- Test log:
+  - Command:
+    - `cd pyatb-main && pytest -q tests/test_character_module.py tests/test_hs_standardize.py`
+  - Result:
+    - `36 passed, 4 warnings`
+  - Runtime check:
+    - `cd test_workspace/test-abacus-3/pyatb && conda activate symm && pyatb > run_after_fix.log 2>&1`
+    - Result: completed without `Traceback` and without the previous `Gimbal lock` warning
+    - Remaining messages are environment cache warnings (`fontconfig` writable cache), not physics/workflow errors
+
+## Update 19 (2026-04-28): Character-table validation (test-abacus-3 vs test-abacus-2)
+- Goal:
+  - Validate character output consistency between `test-abacus-3/pyatb` and `test-abacus-2/pyatb`
+  - Compared files:
+    - `Out/CHARACTER/trace.txt`
+    - `Out/CHARACTER/band_irrep.txt`
+    - `Out/CHARACTER/symmetry_character_report.txt`
+- Setup:
+  - To align with the reference path, `test-abacus-3/pyatb/Input` was temporarily updated to `kpoint_num=5` and the `L` point was added:
+    - `0.47435553  0.54325500  0.34421415`
+  - Run command:
+    - `cd test_workspace/test-abacus-3/pyatb && conda activate symm && pyatb > run_char_validate.log 2>&1`
+- Validation result:
+  - All three compared files differ (`diff -q` reports `differ`)
+  - `band_irrep` summary shows strong mismatch:
+    - `rows_ref = 195`
+    - `rows_new = 390`
+    - `common_keys = 78`
+    - `ndg_equal = 0/78`
+    - `irrep_equal = 0/78`
+    - `energy_abs_diff_max = 19.38084716`
+  - By-kpoint profile:
+    - Reference: each k-point has `39` entries, all with `ndg=2`, no `??`
+    - New run: each k-point has `78` entries, all with `ndg=1`, high `??` ratio
+  - `trace.txt` k-point list used for character assignment also differs:
+    - Reference: `(0,0,0)`, `(0.5,0.5,0.5)`, `(0.5,0.5,0)`, `(0,0.5,0)`, `(0.474356,0.543255,0.344214)`
+    - New run: `(0,0,0)`, `(-0.5,-0.5,0)`, `(-0.25,-0.5,0.25)`, `(-0.25,0,0.25)`, `(-0.443735,-0.474356,0.09952)`
+- Output artifact:
+  - Machine-readable validation report:
+    - `test_workspace/test-abacus-3/pyatb/Out/CHARACTER/character_table_validation_3_vs_2.txt`

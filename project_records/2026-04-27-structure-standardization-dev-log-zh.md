@@ -1,0 +1,944 @@
+# 结构标准化与 HS 统一规范日志（2026-04-27）
+
+## 更新 1：方案A的无磁结构统一规范实现
+- 代码更新:
+  - 新增 `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - 实现 `map_target_r_vector()`，按 `R_new = B * R_old + shift_b - shift_a` 计算目标晶格向量。
+    - 实现 `accumulate_block()` 与 `standardize_sparse_blocks()`，用于块级最小行为测试。
+    - 实现 `compute_xyz_axis_transform()`，从旧/新晶格构造正交化的笛卡尔坐标轴变换矩阵。
+    - 实现 `canonicalize_abacus_hs()`，读取原始 ABACUS `HR/SR`，按原子映射、晶格变换和轨道旋转重建 `-symm` 版本，并写出新的稀疏 `.csr` 文件。
+  - 修改 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - 新增 `StandardizationResult`。
+    - 新增晶格变化判定、仅原子置换判定、k 点到标准化晶格的坐标变换、以及 `_finalize_standardization_result()`。
+    - `analyze_nonmagnetic()` 现在写出 `standardization_summary.txt/json`、旧/新晶格矩阵、晶格变换矩阵、坐标轴变换矩阵、原子映射文件和 `R_block_mapping.txt`。
+    - 当判定需要重建时，写出 `STRU-symm`，并把后续 CHARACTER 分析切换到标准化晶格规范。
+  - 修改 `pyatb-main/src/pyatb/symmetry/character.py`
+    - 保留原始 `STRU` 读取以获取源基组元数据。
+    - 当 `need_rebuild_hs=True` 时，重建标准化 `HR/SR`，基于新晶格重建 TB 模型，重新读取 `STRU-symm`，后续特征标流程使用标准化后的 `k` 点和 `HS`。
+  - 修改 `pyatb-main/src/pyatb/main.py`
+    - CHARACTER 额外接收 `SR_route` 和 `HR_unit`，保证 HS 标准化重建后的读写规范一致。
+- 测试更新:
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 `test_standardization_reuses_original_files_when_only_permutation`
+    - 新增 `test_standardization_requires_rebuild_when_atoms_move_beyond_permutation`
+    - 新增 `test_character_reads_canonicalized_stru_when_rebuild_is_required`
+  - 新增 `pyatb-main/tests/test_hs_standardize.py`
+    - 覆盖 `R_new` 映射、重复块累加、目标键重写。
+- 测试命令:
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_hs_standardize.py -q`
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_character_core.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_hs_standardize.py -q`
+- 测试结果:
+  - RED 阶段:
+    - 失败（符合预期）
+    - 失败原因：`_finalize_standardization_result()` 未实现、`hs_standardize.py` 不存在、CHARACTER 仍只使用原始 `STRU`
+  - GREEN 阶段:
+    - `test_character_module.py + test_hs_standardize.py`: 通过（20/20）
+    - 相关回归集合: 通过（25/25）
+- 环境说明:
+  - 直接源码导入 smoke check 失败，原因是当前 `symm` 环境缺少已编译的 `pyatb.interface_python` 扩展模块；这是现有环境前置条件，不是本次 Python 层改动引入的新错误。
+
+## 更新 2：真实样例验证与 JSON 序列化修复
+- 真实实跑发现的问题:
+  - 在 `test_workspace/test-abacus-2/pyatb` 执行 `conda run -n symm pyatb` 时，程序在写出 `standardization_summary.json` 阶段失败。
+  - 根因：`_finalize_standardization_result()` 只转换了顶层 `ndarray`，但 `atom_mapping[*]["shift"]` 里仍然保留了嵌套的 `numpy.ndarray`。
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - 新增 `_jsonable()`，递归序列化嵌套的 `dict/list/tuple/ndarray`。
+    - `_finalize_standardization_result()` 改为使用递归序列化后的结果字典。
+- 测试更新:
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 `test_standardization_result_is_json_serializable_with_atom_shift_arrays`
+- 验证命令:
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py -k 'json_serializable_with_atom_shift_arrays' -q`
+  - `conda run -n symm pytest pyatb-main/tests/test_character_module.py pyatb-main/tests/test_character_core.py pyatb-main/tests/test_abacus_read_stru.py pyatb-main/tests/test_hs_standardize.py -q`
+  - `conda run -n symm python -m pip install --no-build-isolation -e /home/zjdai/file-test/pyatb_symm/.worktrees/structure-hs-canonicalization/pyatb-main`
+  - `cd /home/zjdai/file-test/pyatb_symm/test_workspace/test-abacus-2/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- 验证结果:
+  - JSON 回归测试：通过（1/1）
+  - 相关回归测试集合：通过（26/26）
+  - 真实样例运行：通过
+- 已确认输出文件:
+  - `Out/CHARACTER/standardization_summary.txt`
+  - `Out/CHARACTER/standardization_summary.json`
+  - `Out/CHARACTER/lattice_old.txt`
+  - `Out/CHARACTER/lattice_new.txt`
+  - `Out/CHARACTER/lattice_transform_matrix.txt`
+  - `Out/CHARACTER/xyz_axis_transform_matrix.txt`
+  - `Out/CHARACTER/atom_mapping.txt`
+  - `Out/CHARACTER/R_block_mapping.txt`
+  - `Out/CHARACTER/trace.txt`
+  - `Out/CHARACTER/symmetry_character_report.txt`
+- 该样例的结论:
+  - `test-abacus-2` 的标准化判定结果为：
+    - `lattice_changed: False`
+    - `atom_permutation_only: True`
+    - `need_rebuild_hs: False`
+  - 因此这个样例没有生成 `data-HR-sparse_SPIN0-symm.csr` 和 `data-SR-sparse_SPIN0-symm.csr` 是正确行为，不是漏生成。
+
+## 更新 3：旋转后 HS 数值一致性验证（仅比较共有 R 键）
+- 验证目的:
+  - 在允许 `R` 集合不同的前提下，仅比较旋转后 `HS-symm` 与参考 `soc` 在共有 `R` 键上的数值一致性。
+- 验证输入:
+  - 参考：`test_workspace/test-abacus-2/soc/OUT.ABACUS/data-HR-sparse_SPIN0.csr`、`data-SR-sparse_SPIN0.csr`
+  - 待验证：`test_workspace/test-abacus-3/pyatb/data-HR-sparse_SPIN0-symm.csr`、`data-SR-sparse_SPIN0-symm.csr`
+- 验证方法:
+  - 使用 `nspin=4` 读取 ABACUS 稀疏上三角表示。
+  - 以 `R_direct_coor` 求交集，仅在共有 `R` 上比较上三角向量误差。
+  - 输出 `max_abs_diff`、`rel_fro_diff`、最大误差 `R` 列表、`only_ref/only_new` 键列表。
+- 核心结果:
+  - HR：
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=4.131827266703e+01`
+    - `rel_fro_diff_on_common_R=1.016064491225e+00`
+  - SR：
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=1.000000000000e+00`
+    - `rel_fro_diff_on_common_R=1.115319460174e+00`
+- 结论:
+  - 旋转后矩阵当前“数值不一致”，尚未达到正确对齐。
+  - 报告已保存：
+    - `test_workspace/test-abacus-3/pyatb/Out/CHARACTER/hs_rotation_validation_report.txt`
+
+## 更新 4：被动变换试验（D 矩阵改为逆矩阵）
+- 变更目的:
+  - 按“坐标轴被动变换 vs 原子主动旋转差一个逆矩阵”的思路，验证局域轨道/自旋旋转是否应使用 `xyz` 变换矩阵的逆。
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - `_local_rotation()` 中把 `cart_rotation` 改为 `inv(xyz_axis_transform_cartesian)`。
+    - SOC 自旋旋转也改为基于该逆矩阵构造。
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 `test_local_rotation_uses_inverse_cartesian_transform`
+    - 保持 `test_local_rotation_includes_spin_rotation_for_soc`
+- 测试命令:
+  - `cd pyatb-main && pytest -q tests/test_character_module.py -k "local_rotation_uses_inverse_cartesian_transform or local_rotation_includes_spin_rotation_for_soc"`
+  - `cd test_workspace/test-abacus-3/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache conda run -n symm pyatb`
+- 测试结果:
+  - 单测: 通过（2/2）
+  - 实样例运行: 成功（无报错）
+- 数值验证（common-R only）:
+  - HR:
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=4.196264037856e+01`
+    - `rel_fro_diff_on_common_R=1.028613730451e+00`
+  - SR:
+    - `R_num(ref/new)=165/163`
+    - `common_R=122, only_ref=43, only_new=41`
+    - `max_abs_diff_on_common_R=1.000000000000e+00`
+    - `rel_fro_diff_on_common_R=1.191444992659e+00`
+- 结论:
+  - 改为逆矩阵后误差没有下降，反而略有上升；当前主误差根因不在该主动/被动逆变换选择。
+
+## 更新 5：`R` 映射根因定位到 ASE 分数坐标 wrap
+- 定位目的:
+  - 按用户给出的几何判据 `d = M * R' + d'` 独立复核当前 `R'` 是否正确。
+  - 先确认 `test-abacus-3/pyatb/STRU-symm` 与 `test-abacus-2/soc/STRU` 一致，再排查 `R` 指标错误来源。
+- 关键发现:
+  - 结构一致性成立：
+    - `natom=5 vs 5`
+    - `species_equal=True`
+    - `max_abs_lattice_diff=5.081943307061465e-05`
+    - `max_abs_fracpos_diff=3.3306690738754696e-16`
+  - 直接用几何公式反求 `R'` 时，几何分解残差极小：
+    - `max_geom_residual=4.107825191113079e-15`
+  - 当前代码错误首先出在 `_build_atom_mapping()`：
+    - ASE 默认 `get_scaled_positions()` 会把接近 `0` 的负小数 wrap 到 `1.0`
+    - 这会把本应为 `shift=[0,0,0]` 的情况误判成 `shift=[0,-1,0]`
+    - 继而导致后续 `R' = R * B + shift_b - shift_a` 偏移一个晶格矢量
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+    - `_build_atom_mapping()` 中对原始结构和 primitive 结构都改为使用 `get_scaled_positions(wrap=False)`
+  - 修改 `pyatb-main/tests/test_character_module.py`
+    - 新增 `test_build_atom_mapping_uses_unwrapped_scaled_positions`
+- 测试命令:
+  - `cd pyatb-main && pytest tests/test_character_module.py -k unwrapped_scaled_positions`
+  - `cd pyatb-main && pytest tests/test_character_module.py -k 'unwrapped_scaled_positions or supercell_to_primitive_basis_change or standardize_nonmagnetic_cell_separates_mapping'`
+  - `cd pyatb-main && pytest tests/test_character_module.py`
+  - `cd test_workspace/test-abacus-3/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache PYTHONPATH=/home/zjdai/file-test/pyatb_symm/pyatb-main/src:$PYTHONPATH pyatb`
+- 测试结果:
+  - 新增失败测试在修复前按预期失败：
+    - 实际错误 `shift=[0,-1,0]`，期望 `shift=[0,0,0]`
+  - 修复后相关子集测试: 通过（3/3）
+  - 修复后完整模块测试: 通过（27/27）
+  - `test-abacus-3/pyatb` 实样例: 运行成功
+- 几何复验:
+  - 在未 wrap 的分数坐标定义下重新计算：
+    - `max_geom_resid=4.6629367034256575e-15`
+    - `mismatch_count=0`
+  - 说明当前 `R'` 与用户给定的 `d = M * R' + d'` 判据一致
+- 输出复核:
+  - 新生成的 `Out/CHARACTER/standardization_summary.json` 中，关键映射已更新为修正后的值，例如：
+    - `old_atom=4 -> new_atom=2, shift=[-1, 0, 0]`
+    - `old_atom=7 -> new_atom=2, shift=[0, 0, 0]`
+- 结论:
+  - 这一轮主问题不是 `R` 公式本身，而是原子映射里的 `shift` 因 ASE wrap 被污染。
+  - 修复 `wrap=False` 后，`R` 几何映射判据已经对齐。
+
+## 更新 6：按“轨道旋转 / 自旋旋转 / 左右乘顺序”逐项检查矩阵协变性
+- 检查目的:
+  - 用户要求按如下顺序检查标准化 HS 的矩阵协变性：
+    1. 轨道旋转主动/被动约定
+    2. 自旋旋转是否一起参与
+    3. 原子对块的左右乘顺序是否正确
+- 诊断方法:
+  - 以 `test-abacus-3/OUT.ABACUS/data-HR-sparse_SPIN0.csr`、`data-SR-sparse_SPIN0.csr` 为源矩阵。
+  - 以 `test-abacus-2/soc/OUT.ABACUS/data-HR-sparse_SPIN0.csr`、`data-SR-sparse_SPIN0.csr` 为参考矩阵。
+  - 在固定正确 `R'` 映射后，穷举比较以下约定组合：
+    - `cart_rotation = xyz / inv(xyz) / I`
+    - 自旋矩阵 `spin = S(cart) / I`
+    - 块变换顺序 `D_a H D_b^\dagger`、`D_a^\dagger H D_b`
+- 关键诊断结果:
+  - 当前代码（`inv_cart + D_a H D_b^\dagger`）不是最佳：
+    - HR `rel_fro_diff=1.0368627556552867`
+    - SR `rel_fro_diff=1.1960439121329194`
+  - 最优两组是等价组合：
+    - `cart + D_a H D_b^\dagger`
+    - `inv_cart + D_a^\dagger H D_b`
+  - 这说明：
+    - 非平凡轨道旋转是有效的，`identity` 更差
+    - 只要保持同一套主动/被动约定，`cart` 与 `inv(cart)` 可以互相等价转换
+    - 但在当前代码已经固定使用 `inv(cart)` 的前提下，块矩阵左右乘顺序必须改成 `D_a^\dagger H D_b`
+  - 自旋项影响很小，不是当前主误差来源：
+    - `cart + spin` 与 `cart + spin=I` 的误差差异仅在 `1e-6` 量级
+- 代码更新:
+  - 修改 `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+    - `standardize_sparse_blocks()` 中块变换由 `D_a H D_b^\dagger` 改为 `D_a^\dagger H D_b`
+    - `_assemble_target_dense_blocks()` 中同步改为 `D_a^\dagger H D_b`
+  - 修改 `pyatb-main/tests/test_hs_standardize.py`
+    - 新增 `test_standardize_sparse_blocks_uses_passive_basis_rotation_order`
+- 测试命令:
+  - `cd pyatb-main && pytest tests/test_hs_standardize.py -k passive_basis_rotation_order`
+  - `cd pyatb-main && pytest tests/test_hs_standardize.py tests/test_character_module.py`
+  - `cd test_workspace/test-abacus-3/pyatb && MPLCONFIGDIR=/tmp/mpl XDG_CACHE_HOME=/tmp/xdg-cache PYTHONPATH=/home/zjdai/file-test/pyatb_symm/pyatb-main/src:$PYTHONPATH pyatb`
+- 测试结果:
+  - 新增失败测试在修复前按预期失败，修复后通过
+  - 单元测试: `31 passed`
+  - 实样例运行: 成功
+- 修复后与参考矩阵的数值对比:
+  - HR:
+    - `R_num(ref/new)=165/149`
+    - `common=149, only_ref=16, only_new=0`
+    - `max_abs_diff=41.318272667030875`，最坏键 `R=(0,0,0)`
+    - `rel_fro_diff=0.9960972407198854`
+  - SR:
+    - `R_num(ref/new)=165/149`
+    - `common=149, only_ref=16, only_new=0`
+    - `max_abs_diff=1.0000000000000027`，最坏键 `R=(0,0,0)`
+    - `rel_fro_diff=0.9592156252752511`
+- 结论:
+  - 第 3 项“左右乘顺序”确实有问题，已修正。
+  - 第 1 项“轨道主动/被动约定”与第 3 项是耦合的；在当前保留 `inv(cart)` 的实现下，正确块协变形式应是 `D_a^\dagger H D_b`。
+  - 第 2 项“自旋旋转”不是当前主误差来源。
+  - 尽管顺序修正后误差明显下降，但 `HR/SR` 仍未与参考完全一致，后续主问题已不在这三项，而更可能在局域轨道表示矩阵本身的规范上。
+
+## 更新 7：按用户最终定义做两步独立验证
+- 验证定义:
+  - 第一步：`(R, atom1, atom2) -> (R', atom1', atom2')` 只用真实位移 `d` 判定
+  - 第二步：使用“原始结构同坐标系 primitive cell”和“最终结构”之间的整体旋转矩阵 `Q`，构造轨道+自旋表示，并按被动变换关系 `D_a^\dagger H D_b` 验证矩阵块
+- 验证过程:
+  - `spglib.standardize_cell(..., no_idealize=True)` 生成与原始结构处于同一笛卡尔坐标系下的 primitive cell
+  - 使用
+    - `d = (R + tau_b - tau_a) * A_old`
+    - `R' = round(d * M^{-1} - (tau'_b - tau'_a))`
+    独立重建每个原子对块的目标 `R'`
+  - 检查该 `R'` 是否与程序中的
+    - `R' = R * B + shift_b - shift_a`
+    一致
+  - 然后先无旋转地组装 primitive 同坐标系下的块矩阵，再用 `Q` 对应的局域表示做
+    - `H_final = D_a^\dagger H_primitive D_b`
+    - `S_final = D_a^\dagger S_primitive D_b`
+  - 最后与独立参考 `test-abacus-2/soc` 的 `HR/SR` 比较
+- 关键结果:
+  - `d` 判据下的原子对块映射完全一致：
+    - `pair_mapping_by_d_mismatch_count = 0`
+    - `pair_mapping_sample_mismatch = None`
+  - primitive 同坐标系结构与最终结构的原子顺序一致：
+    - `mapping_final_species_equal = True`
+    - `mapping_final_frac_maxdiff = 4.440892098500626e-16`
+  - 对应整体旋转矩阵为正定旋转：
+    - `det(Q) = 1.0`
+  - 按 `D_a^\dagger H D_b` / `D_a^\dagger S D_b` 独立重建后，与参考比较结果为：
+    - HR:
+      - `common=149, only_ref=16, only_new=0`
+      - `max_abs_diff=41.31827266703096`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9960972407198853`
+    - SR:
+      - `common=148, only_ref=17, only_new=0`
+      - `max_abs_diff=1.0000000000000036`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9592156252752608`
+- 结论:
+  - 第一部分，即基于真实位移 `d` 的 `(R, atom1, atom2) -> (R', atom1', atom2')` 映射，现在可以确认是正确的。
+  - 第二部分，即使用整体 `Q` 构造轨道+自旋表示并按 `D_a^\dagger H D_b` 检查后，矩阵块与独立参考仍未完全一致。
+  - 因此后续剩余主误差不在 `R` 映射，也不在被动变换公式本身，而更可能在轨道局域表示矩阵规范或 ABACUS 轨道基顺序约定上。
+
+## 更新 8：独立 `S1` DFT 交叉验证（`test-abacus-4`，12 MPI x 1 OMP）
+- 目的:
+  - 在 `test_workspace/test-abacus-4` 中单独对 `S1` 结构做 DFT，获得独立 `HS`，然后分两步验证：
+    1. `S0 -> S1` 的块重组关系是否正确
+    2. `S1 -> S2` 的旋转协变关系是否正确
+- 计算设置:
+  - `STRU` 使用 `spglib.standardize_cell(..., no_idealize=True)` 生成的 `S1`
+  - 运行命令:
+    - `mpirun -np 12 abacus`
+    - `OMP_NUM_THREADS=1`
+  - 结果:
+    - 计算正常完成
+    - `START Time  : Mon Apr 27 20:53:17 2026`
+    - `FINISH Time : Mon Apr 27 20:57:24 2026`
+    - `TOTAL Time  : 247`
+    - 成功生成:
+      - `test_workspace/test-abacus-4/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+      - `test_workspace/test-abacus-4/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+- 第一步验证：`S0 -> S1`
+  - 先仅用真实位移 `d` 复核原子对块标签映射：
+    - `pair_mapping_by_d_mismatch_count = 0`
+  - 然后用 `S0` 的原始 `HS` 按 `(R, atom1, atom2) -> (R1, atom1', atom2')` 重组，直接与独立 DFT 得到的 `S1` `HS` 比较。
+  - 结果:
+    - HR:
+      - `common=149, only_ref=16, only_new=0`
+      - `max_abs_diff=41.36687515024866`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9993125459280097`
+    - SR:
+      - `common=148, only_ref=17, only_new=0`
+      - `max_abs_diff=1.0`
+      - `worst_key=(0, 0, 0)`
+      - `rel_fro_diff=0.9924510304252063`
+  - 结论:
+    - 几何块标签映射正确；
+    - 但仅靠 `S0 -> S1` 的块重组，不能重现实算的 `S1` `HS`。
+- 第二步验证：`S1 -> S2`
+  - 取独立 DFT 得到的 `S1` `HS` 作为输入；
+  - 使用 `Q12 = compute_xyz_axis_transform(A1, A2)` 构造轨道+自旋局域表示；
+  - 按被动变换关系 `D_a^\dagger H D_b` / `D_a^\dagger S D_b` 旋转到 `S2`；
+  - 再与独立 `S2` 参考（`test-abacus-2/soc`）比较。
+  - 结果:
+    - `det(Q12)=0.9999999999999998`
+    - HR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=0.6912370456794656`
+      - `worst_key=(-1, 0, 1)`
+      - `rel_fro_diff=0.014921678967759013`
+    - SR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=0.07417024416277339`
+      - `worst_key=(-1, 0, 1)`
+      - `rel_fro_diff=0.03710883045545394`
+  - 结论:
+    - `S1 -> S2` 的旋转协变性明显成立，数值误差已降到 `1e-2 ~ 1e-3` 相对量级。
+- 总结:
+  - 这次独立交叉验证把问题进一步定位清楚：
+    - `S0 -> S1`：几何映射对，但矩阵块重组不成立
+    - `S1 -> S2`：旋转协变关系基本成立
+  - 因而当前主要矛盾集中在“原始超胞 `S0` 的 `HS` 如何归并为 primitive `S1` 的 `HS`”这一段，而不是后续 `Q` 旋转或 `D_a^\dagger H D_b` 公式。
+  - 详细机器可读结果已保存到：
+    - `test_workspace/test-abacus-4/verification_report_s1_s2.json`
+
+## 更新 9：按用户要求测试 `D_a H D_b^\dagger`
+- 目的:
+  - 用户指出 `max_abs_diff = 0.6912370456794656` 仍然偏大，要求把 `S1 -> S2` 的变换顺序改为 `D_a H D_b^\dagger` 再直接对比一次。
+- 验证方法:
+  - 使用独立 DFT 得到的 `S1` `HR/SR`
+  - 对同一个 `Q12` 同时比较两种顺序：
+    - `D_a H D_b^\dagger`
+    - `D_a^\dagger H D_b`
+- 结果:
+  - `det(Q12) = 1.0`
+  - `D_a H D_b^\dagger`:
+    - HR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=3.6564002975711296`
+      - `worst_key=(1, 1, 0)`
+      - `rel_fro_diff=0.20221819489628454`
+    - SR:
+      - `common=165, only_ref=0, only_new=0`
+      - `max_abs_diff=0.3362716783375885`
+      - `worst_key=(0, 0, -1)`
+      - `rel_fro_diff=0.4980809821008054`
+  - `D_a^\dagger H D_b`:
+    - HR:
+      - `max_abs_diff=0.6912370456802207`
+      - `rel_fro_diff=0.01492167896775818`
+    - SR:
+      - `max_abs_diff=0.07417024416282907`
+      - `rel_fro_diff=0.037108830455465466`
+- 结论:
+  - 按用户要求重新测试后，可以明确确认：
+    - `D_a H D_b^\dagger` 比 `D_a^\dagger H D_b` 明显更差
+    - 因此在当前 `S1 -> S2` 这一步，`D_a H D_b^\dagger` 不是正确的协变顺序
+  - 但用户指出 `0.691` 仍然偏大是成立的，所以即使 `D_a^\dagger H D_b` 是两者中更好的顺序，也还不能宣称已经完全满足协变性。
+  - 这进一步说明当前剩余误差应继续追查局域轨道表示规范，而不是继续在这两个左右乘顺序之间摇摆。
+
+## 更新 10：直接量化 `S1 -> S2` 旋转几何误差与矩阵元误差
+- 目的:
+  - 按用户要求，不先改代码，直接量化：
+    - 当前代码使用的 `Q = compute_xyz_axis_transform(A1, A2)` 的几何精度
+    - 严格正交 Procrustes 旋转 `R` 的几何精度
+    - 在真实笛卡尔位移 `d` 分解规则下，`HR/SR` 的最大矩阵元绝对误差、最坏位置、以及全部元素绝对误差总和
+- 验证对象:
+  - `S1 = test_workspace/test-abacus-4/verification_tmp/STRU_S1_abs`
+  - `S2 = test_workspace/test-abacus-4/verification_tmp/STRU_S2_abs`
+  - `HR/SR` 分别取：
+    - `test_workspace/test-abacus-4/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+    - `test_workspace/test-abacus-4/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+    - `test_workspace/test-abacus-2/soc/OUT.ABACUS/data-HR-sparse_SPIN0.csr`
+    - `test_workspace/test-abacus-2/soc/OUT.ABACUS/data-SR-sparse_SPIN0.csr`
+- 方法:
+  - 不再使用 `R' = R * B + shift_b - shift_a` 去做 `S1 -> S2` 这一步；
+  - 改为按用户提出的真实位移分解法：
+    - 先算 `d_old = R_old A1 + tau_b - tau_a`
+    - 再算 `d_new = d_old * rot`
+    - 最后分解 `d_new = R_new A2 + (tau'_b - tau'_a)`
+  - 分别对当前代码的 `Q` 和严格旋转 `R` 做同样比较。
+- 结果:
+  - 当前代码的 `Q`:
+    - 晶格矢量旋转误差:
+      - `max_abs_component = 7.569692925288651`
+      - `fro_norm = 13.574514778132011`
+      - `sum_abs = 31.227529521950405`
+    - 原子笛卡尔坐标旋转误差:
+      - `max_cart_error_norm = 4.533461535158469`
+      - `sum_cart_error_norm = 10.594375286660913`
+      - 最坏原子:
+        - `old_atom=5 -> new_atom=3`
+        - `shift=(0,-1,1)`
+        - `error_vector_cart=(-1.95008478823786, -0.8213822360093728, 4.009335859193256)`
+    - `d` 分解后的 `R'` 指标误差:
+      - `max_abs_fractional_error = 0.4998014620398614`
+    - `HR`:
+      - `max_abs_diff = 41.41910375158555`
+      - `sum_abs_diff = 19197.814232959812`
+      - 最坏矩阵元位置:
+        - `R = (0, 0, 0)`
+        - `(row, col) = (199, 199)`
+        - `pred = 0`
+        - `ref = 41.41910375158555`
+    - `SR`:
+      - `max_abs_diff = 1.0089925198200005`
+      - `sum_abs_diff = 2024.0611290509958`
+      - 最坏矩阵元位置:
+        - `R = (0, 0, 0)`
+        - `(row, col) = (104, 104)`
+        - `pred = 2.0089925198200005`
+        - `ref = 1.0`
+  - 严格正交 Procrustes 旋转 `R`:
+    - 晶格矢量旋转误差:
+      - `max_abs_component = 5.081939203677166e-05`
+      - `fro_norm = 9.073280079143255e-05`
+      - `sum_abs = 1.9989181452516889e-04`
+    - 原子笛卡尔坐标旋转误差:
+      - `max_cart_error_norm = 1.2074679831641837e-04`
+      - `sum_cart_error_norm = 3.5730079538926005e-04`
+      - 最坏原子:
+        - `old_atom=4 -> new_atom=4`
+        - `shift=(0,0,0)`
+        - `error_vector_cart=(1.086808421035812e-11, -2.453592884421596e-13, -1.2074679831641788e-04)`
+    - `d` 分解后的 `R'` 指标误差:
+      - `max_abs_fractional_error = 2.019296417365979e-05`
+    - `HR`:
+      - `max_abs_diff = 4.124352676405114`
+      - `sum_abs_diff = 15299.801821154322`
+      - 最坏矩阵元位置:
+        - `R = (1, 2, 0)`
+        - `(row, col) = (61, 103)`
+        - `pred = 4.1243526735271345 - 1.5407662974328566e-04 i`
+        - `ref = 0`
+    - `SR`:
+      - `max_abs_diff = 0.395826381401726`
+      - `sum_abs_diff = 1754.354197323576`
+      - 最坏矩阵元位置:
+        - `R = (0, 1, 1)`
+        - `(row, col) = (1, 111)`
+        - `pred = 0.395544578747726`
+        - `ref = -2.81802654e-04`
+- 结论:
+  - 当前代码里的 `Q` 不是“小偏差”，而是在几何层面就已经错了：
+    - 晶格旋转误差是 `O(1~10)` Angstrom
+    - 原子位置误差是 `O(1)` Angstrom
+    - 因此用它得到的 `HR/SR` 比较没有物理意义
+  - 换成严格 `R` 以后，几何误差已经降到 `1e-4 ~ 1e-5` 量级，说明旋转矩阵本身可以认为是对的。
+  - 但是即便几何层面修正以后，`HR/SR` 的矩阵元误差仍然很大，说明当前剩余主问题已经不在“旋转矩阵是否取对”，而在：
+    - 局域轨道旋转表示
+    - 轨道/自旋块规范
+    - 或 `S1 -> S2` 的块级矩阵归并规则
+- 输出文件:
+  - 详细机器可读报告已保存到：
+    - `test_workspace/test-abacus-4/verification_report_s1_s2_detailed.json`
+
+## 更新 11：直接用晶格矢量关系求旋转矩阵，并与 `Q` / `Q^{-1}` 对比
+- 目的:
+  - 用户提出两种等价检查思路：
+    - 直接测试 `Q^{-1}` 是否才是正确旋转；
+    - 或者直接从晶格矢量关系解出旋转矩阵，再看它和 `Q` 的关系。
+  - 本次同时做这两步。
+- 方法:
+  - 对 `S1` / `S2` 晶格矩阵 `A1` / `A2` 直接求解正交 Procrustes 旋转 `R_latt`，满足：
+    - `A1 * R_latt ≈ A2`
+  - 再比较：
+    - `Q = compute_xyz_axis_transform(A1, A2)`
+    - `Q^{-1}`
+    - `R_latt`
+- 关系结果:
+  - `max_abs(Q - R_latt) = 0.8059478593450315`
+  - `max_abs(Q^{-1} - R_latt) = 3.945038740127416e-12`
+  - `max_abs(Q - R_latt^T) = 3.945031801233512e-12`
+  - 结论:
+    - 当前代码中的 `Q` 实际上等于正确旋转矩阵的转置
+    - 也就是说，对于 `S1 -> S2` 这一步，真正应使用的是 `Q^{-1}`，而不是 `Q`
+- 几何验证（使用 `Q^{-1}`）:
+  - 晶格矢量误差:
+    - `max_abs_component = 5.081939239026667e-05`
+    - `fro_norm = 9.073280079170419e-05`
+    - `sum_abs = 1.9989181389155252e-04`
+  - 原子笛卡尔坐标误差:
+    - `max_cart_error_norm = 1.2074679831287868e-04`
+    - `sum_cart_error_norm = 3.573007953867267e-04`
+    - `max_abs_component = 1.2074679831286517e-04`
+    - 最坏原子:
+      - `old_atom=4 -> new_atom=4`
+      - `shift=(0,0,0)`
+      - `error_vector_cart=(3.374100998598806e-11, 4.6089132510473974e-11, -1.2074679831286517e-04)`
+  - `d` 分解后 `R'` 指标误差:
+    - `max_abs_fractional_error = 2.0192963692711174e-05`
+- 矩阵元验证（继续使用 `Q^{-1}`）:
+  - `HR`:
+    - `max_abs_diff = 4.124352676405453`
+    - `sum_abs_diff = 15299.801821172361`
+    - 最坏矩阵元:
+      - `R = (1, 2, 0)`
+      - `(row, col) = (61, 103)`
+  - `SR`:
+    - `max_abs_diff = 0.3958263814017623`
+    - `sum_abs_diff = 1754.3541973262743`
+    - 最坏矩阵元:
+      - `R = (0, 1, 1)`
+      - `(row, col) = (1, 111)`
+- 结论:
+  - 你的判断是对的：
+    - 从晶格矢量关系直接解出来的正确旋转矩阵就是 `Q^{-1}`
+    - 当前 `compute_xyz_axis_transform()` 返回的方向反了
+  - 但即便把旋转矩阵改成 `Q^{-1}` 以后，几何已经匹配上了，`HR/SR` 仍然没有匹配上。
+  - 因而下一步不应该再怀疑“是不是用 `Q` 还是 `Q^{-1}`”，而应该集中排查：
+    - 局域轨道旋转表示
+    - 自旋与轨道张量积顺序
+    - 或块级 `HS` 归并规则
+
+## 更新 12：在几何正确的 `Q^{-1}` 下重新比较 `D_a H D_b^\dagger` 与 `D_a^\dagger H D_b`
+- 目的:
+  - 在确认 `Q^{-1}` 才是正确空间旋转以后，重新单独比较两种块变换顺序：
+    - `D_a H D_b^\dagger`
+    - `D_a^\dagger H D_b`
+- 方法:
+  - 固定几何旋转为 `rot = Q^{-1}`
+  - 固定原子映射与 `d` 分解规则不变
+  - 只切换局域块旋转顺序
+- 结果:
+  - `D_a H D_b^\dagger`:
+    - `HR`
+      - `max_abs_diff = 3.5979647880326615`
+      - `sum_abs_diff = 7107.122524107396`
+      - `rel_fro = 0.14729745463762509`
+      - 最坏位置:
+        - `R = (0, 1, 1)`
+        - `(row, col) = (3, 103)`
+    - `SR`
+      - `max_abs_diff = 0.31502600984906165`
+      - `sum_abs_diff = 865.1989392267225`
+      - `rel_fro = 0.424745413765751`
+      - 最坏位置:
+        - `R = (1, 2, 0)`
+        - `(row, col) = (51, 115)`
+  - `D_a^\dagger H D_b`:
+    - `HR`
+      - `max_abs_diff = 4.124352676405453`
+      - `sum_abs_diff = 15299.801821172361`
+      - `rel_fro = 0.21934757860995513`
+      - 最坏位置:
+        - `R = (1, 2, 0)`
+        - `(row, col) = (61, 103)`
+    - `SR`
+      - `max_abs_diff = 0.3958263814017623`
+      - `sum_abs_diff = 1754.3541973262743`
+      - `rel_fro = 0.5834550105294755`
+      - 最坏位置:
+        - `R = (0, 1, 1)`
+        - `(row, col) = (1, 111)`
+- 结论:
+  - 在几何正确的 `Q^{-1}` 下，`D_a H D_b^\dagger` 明显优于 `D_a^\dagger H D_b`
+  - 也就是说，前面之所以得到相反结论，本质上是因为当时使用了方向错误的 `Q`
+  - 但即便选用较优的 `D_a H D_b^\dagger`，当前误差仍然偏大，因此左右乘顺序不是最后的根因，只是其中一个次级因素
+
+## 更新 13：测试是否是局域旋转矩阵 `D` 的转置问题
+- 目的:
+  - 用户提出另一种可能：不是左右乘顺序错，而是局域旋转矩阵本身应该取转置 `D^T`
+- 方法:
+  - 在几何正确的 `rot = Q^{-1}` 下，同时比较四种组合：
+    - `D H D^\dagger`
+    - `D^T H (D^T)^\dagger`
+    - `D^\dagger H D`
+    - `(D^T)^\dagger H D^T`
+- 结果:
+  - `D H D^\dagger`
+    - `HR max_abs = 3.5979647880326615`
+    - `HR sum_abs = 7107.122524107396`
+    - `SR max_abs = 0.31502600984906165`
+    - `SR sum_abs = 865.1989392267225`
+  - `D^T H (D^T)^\dagger`
+    - `HR max_abs = 4.1243546988118105`
+    - `HR sum_abs = 15325.867215662282`
+    - `SR max_abs = 0.3958263814017623`
+    - `SR sum_abs = 1754.3541973262743`
+  - `D^\dagger H D`
+    - `HR max_abs = 4.124352676405453`
+    - `HR sum_abs = 15299.801821172361`
+    - `SR max_abs = 0.3958263814017623`
+    - `SR sum_abs = 1754.3541973262743`
+  - `(D^T)^\dagger H D^T`
+    - `HR max_abs = 3.5979648127149577`
+    - `HR sum_abs = 7233.513351009986`
+    - `SR max_abs = 0.31502600984906165`
+    - `SR sum_abs = 865.1989392267225`
+- 结论:
+  - 单纯把 `D` 改成 `D^T`，不会本质消除误差
+  - 它只是在数值上把两种左右乘顺序几乎互相对调：
+    - `D H D^\dagger` 约等于 `(D^T)^\dagger H D^T`
+    - `D^\dagger H D` 约等于 `D^T H (D^T)^\dagger`
+  - 因此“是不是少了一个转置”不是最后根因；它更像是“局域表示矩阵列/行约定”与“左右乘顺序”之间的等价重写
+  - 当前最佳组合仍然只是把误差压到：
+    - `HR max_abs ≈ 3.598`
+    - `SR max_abs ≈ 0.315`
+  - 说明问题仍然在更深一层的局域轨道/自旋表示规范，而不是简单差一个 `.T`
+
+## 更新 14：用 `(Q^{-1})^T` 来构造局域表示矩阵 `D`
+- 目的:
+  - 用户进一步提出：也许不是把已经生成好的 `D` 再转置，而是 `D` 本来就应该由 `(Q^{-1})^T` 这个笛卡尔旋转矩阵来生成
+- 方法:
+  - 固定几何映射仍然使用正确的 `rot_geom = Q^{-1}`
+  - 分别比较两种 `D` 的构造来源：
+    - `D_from_Qinv`：局域表示直接由 `Q^{-1}` 生成
+    - `D_from_Qinv_T`：局域表示由 `(Q^{-1})^T = Q` 生成
+  - 对每一种 `D`，再分别测试：
+    - `D H D^\dagger`
+    - `D^\dagger H D`
+- 结果:
+  - `D_from_Qinv`
+    - `D H D^\dagger`
+      - `HR max_abs = 4.124352676405453`
+      - `HR sum_abs = 15299.801821172361`
+      - `SR max_abs = 0.39582638140176235`
+      - `SR sum_abs = 1754.3541973262745`
+    - `D^\dagger H D`
+      - `HR max_abs = 3.597964788032662`
+      - `HR sum_abs = 7107.122524107394`
+      - `SR max_abs = 0.3150260098490618`
+      - `SR sum_abs = 865.1989392267222`
+  - `D_from_Qinv_T`
+    - `D H D^\dagger`
+      - `HR max_abs = 3.597964788032662`
+      - `HR sum_abs = 7107.122524107394`
+      - `SR max_abs = 0.3150260098490618`
+      - `SR sum_abs = 865.1989392267221`
+    - `D^\dagger H D`
+      - `HR max_abs = 4.124352676405453`
+      - `HR sum_abs = 15299.801821172361`
+      - `SR max_abs = 0.39582638140176235`
+      - `SR sum_abs = 1754.3541973262745`
+- 结论:
+  - 这里出现了一个严格的“对偶关系”：
+    - 用 `Q^{-1}` 生成 `D` 时，较优顺序是 `D^\dagger H D`
+    - 用 `(Q^{-1})^T` 生成 `D` 时，较优顺序是 `D H D^\dagger`
+  - 这说明：
+    - “`D` 应该用哪个笛卡尔旋转矩阵生成”
+    - 和 “最终块旋转应该写成哪种左右乘顺序”
+    - 本质上是同一个约定问题的两种写法
+  - 但最佳误差并没有进一步下降，仍然停在：
+    - `HR max_abs ≈ 3.598`
+    - `SR max_abs ≈ 0.315`
+  - 因而“使用 `(Q^{-1})^T` 来验证”这一步已经说明：
+    - 它不会带来新的更优结果
+    - 它只是把原来的最优方案用另一套记号重写出来
+
+## 更新 15：先确定真正把 `(R, atom)` 映到 `(R', atom')` 的几何操作，再用它构造 `D`
+- 目的:
+  - 按用户要求，先不假设 `D` 怎么写，先把真正的几何操作和原子映射确定：
+    1. 哪个操作能把笛卡尔坐标下的 `S1` 映到 `S2`
+    2. 这个操作是否会交换原子
+    3. 用这个已经验证过的操作再去构造带自旋的 `D`
+- 几何验证结果:
+  - 从晶格关系直接解得的几何操作仍然是：
+    - `R_cart = Q^{-1}`
+  - 参数为：
+    - `det(R_cart) = 1`
+    - 旋转轴：`(0.99050363, 0.07673558, -0.11407987)`
+    - 旋转角：`24.00632002228404 deg`
+    - 晶格匹配残差：`max |A1 R_cart - A2| = 5.081939239026667e-05`
+- 原子映射结果:
+  - 该几何操作可以把 `S1` 全部原子映到 `S2`
+  - `max_atom_error = 1.2074679831287868e-04`
+  - 原子映射为：
+    - `1 -> 1` (`Bi`), shift=`(0,0,0)`
+    - `2 -> 2` (`Bi`), shift=`(0,0,0)`
+    - `3 -> 3` (`Se`), shift=`(0,1,0)`
+    - `4 -> 4` (`Se`), shift=`(0,0,0)`
+    - `5 -> 5` (`Se`), shift=`(0,0,0)`
+  - 结论：
+    - 本次 `S1 -> S2` 验证中**没有原子交换**
+    - 只有 `Se(3)` 需要一个晶格平移 `(0,1,0)`
+- 关键附加验证:
+  - 我额外枚举了 `S2` 的全部 `spglib` 空间群操作，逐个检查是否能把 `S1` 映到 `S2`
+  - 结果：
+    - `found_count = 0`
+  - 即：
+    - `S1 -> S2` 这一步 **不是** `S2` 的某个单独真实空间群操作
+    - 它是一个“全局原胞/坐标基变化”，而不是标准意义下的一条群元素
+- `(R, atom) -> (R', atom')` 的验证规则:
+  - 对任意块对，按实空间位移定义：
+    - `d_old = R_old * A1 + tau_b - tau_a`
+    - `d_new = d_old * R_cart`
+    - 再求解：
+      - `d_new = R_new * A2 + (tau'_b - tau'_a)`
+  - 本步最大分数残差：
+    - `max_fractional_residual = 2.0192963692711174e-05`
+  - 说明这个 `(R, atom)` 到 `(R', atom')` 映射规则在几何上是自洽的
+- 用该几何操作直接构造带自旋 `D` 后，对比两种协变顺序:
+  - 这里的 `D` 是直接由 `R_cart` 构造的轨道表示与自旋表示张量积
+  - `D^\dagger H D`
+    - `HR`
+      - `max_abs_diff = 3.597964788032662`
+      - `sum_abs_diff = 7107.122524107394`
+      - `rel_fro = 0.14729745463762509`
+    - `SR`
+      - `max_abs_diff = 0.3150260098490618`
+      - `sum_abs_diff = 865.1989392267222`
+      - `rel_fro = 0.424745413765751`
+  - `D H D^\dagger`
+    - `HR`
+      - `max_abs_diff = 4.124352676405453`
+      - `sum_abs_diff = 15299.801821172361`
+      - `rel_fro = 0.2193475786099551`
+    - `SR`
+      - `max_abs_diff = 0.39582638140176235`
+      - `sum_abs_diff = 1754.3541973262745`
+      - `rel_fro = 0.5834550105294756`
+- 结论:
+  - 真正把 `(R, atom)` 映到 `(R', atom')` 的几何操作已经确定：
+    - 它就是 `R_cart = Q^{-1}`
+  - 这个操作不会交换原子，只会带来晶格平移重标记
+  - 但它**不是** `S2` 对称群里的某个单独群操作，而是一个原胞/坐标规范变换
+  - 在“直接用这个几何操作构造 `D`”的约定下，`D^\dagger H D` 比 `D H D^\dagger` 更好
+  - 详细机器可读结果已输出到：
+    - `test_workspace/test-abacus-4/s1_s2_operation_verification.json`
+
+## 更新 16：修正边界原子 wrap 规范，再按 `R_cart = Q^{-1}` 重新做原子块验证
+- 目的:
+  - 用户指出：
+    - ABACUS 会把位于原胞边界或原胞外的原子 wrap 回原胞内
+    - 因此第一个 `Se` 原子应视为 `0 0 0`，不应再把它记成“带一个原胞 shift 的原子身份”
+- 代码修正:
+  - 新增 fractional 坐标 canonicalize 辅助函数：
+    - `pyatb-main/src/pyatb/symmetry/hs_standardize.py`
+      - `canonicalize_fractional_coordinates()`
+  - 修正原子映射时对边界点的处理：
+    - `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+      - `_build_atom_mapping()` 现在会先把 `wrap=False` 的分数坐标 canonicalize 到 `[0,1)`，并把靠近 `1` 的边界点压回 `0`
+- 测试:
+  - 新增/更新测试后，相关测试通过：
+    - `test_canonicalize_fractional_coordinates_wraps_boundary_points`
+    - `test_build_atom_mapping_wraps_boundary_equivalent_positions_without_extra_shift`
+    - `test_build_atom_mapping_supports_supercell_to_primitive_basis_change`
+  - 汇总运行结果：
+    - `5 passed, 27 deselected`
+- 修正后的 `S1 -> S2` 原子身份映射（wrapped atom convention）:
+  - `1 -> 1` `Bi`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - `2 -> 2` `Bi`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - `3 -> 3` `Se`, `shift=(0,0,0)`, `match_image=(0,1,0)`
+  - `4 -> 4` `Se`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - `5 -> 5` `Se`, `shift=(0,0,0)`, `match_image=(0,0,0)`
+  - 这里：
+    - `shift` 表示按 ABACUS wrap 后的“原胞内原子身份偏移”，现在全部为 `0`
+    - `match_image` 只表示为了在周期镜像下找到同一个目标原子，匹配时用到的最近镜像
+- 重新验证 `(R, atom) -> (R', atom')` 的原子块对应关系:
+  - 几何旋转固定为：
+    - `R_cart = Q^{-1}`
+  - 原子块 `R'` 仍按真实位移求解：
+    - `d_old = R_old A1 + r_b - r_a`
+    - `d_new = d_old R_cart`
+    - `d_new = R_new A2 + (r'_b - r'_a)`
+  - 最大分数残差仍为：
+    - `2.0192963692711174e-05`
+- 全局矩阵比较结果（修正后）:
+  - `D^\dagger H D`
+    - `HR`
+      - `max_abs_diff = 3.597964788032662`
+      - `sum_abs_diff = 7107.122524107394`
+      - `rel_fro = 0.14729745463762509`
+    - `SR`
+      - `max_abs_diff = 0.3150260098490618`
+      - `sum_abs_diff = 865.1989392267222`
+      - `rel_fro = 0.424745413765751`
+  - `D H D^\dagger`
+    - `HR`
+      - `max_abs_diff = 4.124352676405453`
+      - `sum_abs_diff = 15299.801821172361`
+      - `rel_fro = 0.2193475786099551`
+    - `SR`
+      - `max_abs_diff = 0.39582638140176235`
+      - `sum_abs_diff = 1754.3541973262745`
+      - `rel_fro = 0.5834550105294756`
+- 每个原子块的主要误差来源（按 `D^\dagger H D` 排序）:
+  - `HR`
+    - `(atom1, atom3)`:
+      - `max_abs_diff = 3.597964788032662`
+    - `(atom2, atom3)`:
+      - `max_abs_diff = 3.597928309115292`
+    - `(atom3, atom4)`:
+      - `max_abs_diff = 1.2811569496661406`
+    - `(atom3, atom5)`:
+      - `max_abs_diff = 1.2811296913245622`
+  - `SR`
+    - `(atom2, atom3)`:
+      - `max_abs_diff = 0.3150260098490618`
+    - `(atom1, atom3)`:
+      - `max_abs_diff = 0.315023684`
+    - `(atom3, atom5)`:
+      - `max_abs_diff = 0.2725724138153027`
+    - `(atom3, atom4)`:
+      - `max_abs_diff = 0.27257225323724354`
+- 结论:
+  - 边界原子身份的 bug 已修正：
+    - `Se(3)` 不再被错误地记为“带原胞 shift 的身份映射”
+  - 修正后，主要误差仍然集中在与 `atom3 (Se)` 相关的原子块：
+    - `(1,3)`, `(2,3)`, `(3,4)`, `(3,5)`
+  - 这说明当前剩余问题更像是：
+    - 该类 `Se` 局域轨道块在旋转表示下的规范不对
+    - 而不是边界 wrap 或 atom identity shift 处理错误
+- 输出文件:
+  - 修正后的机器可读结果已输出到：
+    - `test_workspace/test-abacus-4/s1_s2_operation_verification_wrapped.json`
+
+## 更新 17：按用户要求，完全不做 `R -> R'` 映射，只比较同一个 `R`
+- 目的:
+  - 用户进一步明确：
+    - 不需要做任何 `R -> R'` 映射
+    - 对每个 `H(R)`，只和最终结构中的同一个 `H(R)` 比较
+    - 原子对块也固定为同一对 `(a,b)`
+    - `D` 直接由 `Q^{-1}` 构造
+- 验证规则:
+  - 不做任何原子平移身份修正
+  - 原子对固定：
+    - `(a,b) in H_source(R)` 只映到 `(a,b) in H_target(R)`
+  - 晶格指标固定：
+    - `R_source = R_target`
+- 结果:
+  - `D^\dagger H D`
+    - `HR`
+      - `max_abs_diff = 0.8298050095751303`
+      - `sum_abs_diff = 457.7214594120439`
+      - `rel_fro = 0.021617312841080948`
+    - `SR`
+      - `max_abs_diff = 0.10526765625377109`
+      - `sum_abs_diff = 39.453501649742975`
+      - `rel_fro = 0.059010241629167334`
+  - `D H D^\dagger`
+    - `HR`
+      - `max_abs_diff = 3.6564002975711296`
+      - `sum_abs_diff = 12956.671110812531`
+      - `rel_fro = 0.20275087616763537`
+    - `SR`
+      - `max_abs_diff = 0.3362716783375885`
+      - `sum_abs_diff = 1407.6808911536646`
+      - `rel_fro = 0.4995223563590714`
+- 结论:
+  - 在“完全不做 `R -> R'` 映射，只比较同一个 `R`”的规则下：
+    - `D^\dagger H D` 明显优于 `D H D^\dagger`
+  - 并且这一次 `D^\dagger H D` 的误差量级显著下降：
+    - `HR rel_fro` 从前面的 `O(1e-1)` 降到 `2.16e-2`
+    - `SR rel_fro` 从前面的 `O(1e-1)` 降到 `5.90e-2`
+  - 这说明对当前这组 `S1/S2` 结构，ABACUS 的 `HS` 更接近于“保持相同 `R` 标签不变”的规范，而不是“先做几何位移变换再重标记到 `R'`”的规范
+- 主要误差来源（`D^\dagger H D`）:
+  - `HR`
+    - `(4,4)` 和 `(5,5)`:
+      - `max_abs_diff = 0.8298050095751303`
+    - `(1,1)` 和 `(2,2)`:
+      - `max_abs_diff = 0.5892101247952874`
+    - `(3,3)`:
+      - `max_abs_diff = 0.4958234795353154`
+  - `SR`
+    - `(3,3)`, `(4,4)`, `(5,5)`:
+      - `max_abs_diff = 0.10526765625377109`
+    - `(1,1)`, `(2,2)`:
+      - `max_abs_diff = 0.07915485737628104`
+- 输出文件:
+  - 详细机器可读结果已输出到：
+    - `test_workspace/test-abacus-4/s1_s2_covariance_same_R_only.json`
+
+## 更新 18（2026-04-28）：主流程修正主动/被动变换，并完成回归测试
+- 目的:
+  - 修正 `symm_stru` 主流程中的结构标准化映射，避免再次混淆主动/被动变换
+  - 将 `stru1 -> stru2 -> stru3` 两步映射正式并入 `analyze_nonmagnetic`
+- 代码修改:
+  - 文件: `pyatb-main/src/pyatb/symmetry/symm_stru.py`
+  - 关键点:
+    - `analyze_nonmagnetic` 现在按两步构建最终映射：
+      - 第一步：`mapping12 = _build_atom_mapping(source_atoms, mapping_atoms, tol)`
+      - 第二步：`q23 = _fit_row_rotation(mapping_lattice, std_lattice)`，再 `mapping23 = _build_rotated_atom_mapping(...)`
+      - 合并：`atom_mapping = _compose_two_stage_mapping(mapping12, mapping23, b23)`
+    - 最终 `B13` 采用链式与直接式双重校验：
+      - 链式：`B13 = M12 @ B23`
+      - 直接式：`round((A1 @ Q23) @ inv(A3))`
+      - 若不一致，直接抛错，防止错误映射进入后续流程
+    - 传入 HS 规范化的坐标变换改为被动形式：
+      - `xyz_axis_transform_cartesian = Q23^T`
+      - 保持 `hs_standardize` 内部 `D^\dagger H D` 与 `passive_basis=True` 约定一致
+    - `R_block_mapping.txt` 的单原子映射输出改为统一调用 `map_target_r_vector(...)`，不再用旧的 `R + shift` 简化写法
+  - 清理:
+    - 删除未使用的 `ase_write` 导入
+- 新增单测:
+  - 文件: `pyatb-main/tests/test_character_module.py`
+  - 新增:
+    - `test_compose_two_stage_mapping_applies_intermediate_lattice_transform`
+    - `test_build_rotated_atom_mapping_matches_rotated_primitive_atoms`
+- 测试记录:
+  - 命令:
+    - `cd pyatb-main && pytest -q tests/test_character_module.py tests/test_hs_standardize.py`
+  - 结果:
+    - `36 passed, 4 warnings`
+  - 实算:
+    - `cd test_workspace/test-abacus-3/pyatb && conda activate symm && pyatb > run_after_fix.log 2>&1`
+    - 结果: 程序执行完成，无 `Traceback`，无 `Gimbal lock` 警告
+    - 仅有环境缓存相关提示（`fontconfig` 可写目录），不影响计算流程
+
+## 更新 19（2026-04-28）：特征标表验证（test-abacus-3 vs test-abacus-2）
+- 目的:
+  - 对比 `test-abacus-3/pyatb` 与 `test-abacus-2/pyatb` 的特征标输出一致性
+  - 验证文件:
+    - `Out/CHARACTER/trace.txt`
+    - `Out/CHARACTER/band_irrep.txt`
+    - `Out/CHARACTER/symmetry_character_report.txt`
+- 前置:
+  - 为了与参考对齐，临时将 `test-abacus-3/pyatb/Input` 的 `kpoint_num` 改为 `5`，并补上 `L` 点：
+    - `0.47435553  0.54325500  0.34421415`
+  - 执行:
+    - `cd test_workspace/test-abacus-3/pyatb && conda activate symm && pyatb > run_char_validate.log 2>&1`
+- 验证结论:
+  - 三个目标文件均不一致（`diff -q` 均为 `differ`）
+  - `band_irrep` 统计差异显著：
+    - `rows_ref = 195`
+    - `rows_new = 390`
+    - `common_keys = 78`
+    - `ndg_equal = 0/78`
+    - `irrep_equal = 0/78`
+    - `energy_abs_diff_max = 19.38084716`
+  - 按 k 点分组：
+    - 参考结果每个 k 点是 `39` 条、`ndg=2`，无 `??`
+    - 新结果每个 k 点是 `78` 条、`ndg=1`，`??` 占比很高
+  - `trace.txt` 中最终参与判定的 k 点坐标也不同：
+    - 参考: `(0,0,0)`, `(0.5,0.5,0.5)`, `(0.5,0.5,0)`, `(0,0.5,0)`, `(0.474356,0.543255,0.344214)`
+    - 新结果: `(0,0,0)`, `(-0.5,-0.5,0)`, `(-0.25,-0.5,0.25)`, `(-0.25,0,0.25)`, `(-0.443735,-0.474356,0.09952)`
+- 输出文件:
+  - 机器可读验证报告已写入：
+    - `test_workspace/test-abacus-3/pyatb/Out/CHARACTER/character_table_validation_3_vs_2.txt`
