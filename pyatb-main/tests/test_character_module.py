@@ -1373,6 +1373,16 @@ def test_k_little_group_symbolic_coordinate_format_matches_irvsp(load_pyatb) -> 
     assert formatted == "  u   -u    w  "
 
 
+def test_k_little_group_variable_match_tolerates_negative_zero(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.k_little_groups")
+    db_path = Path(module.__file__).resolve().parents[1] / "kLittleGroups" / "kLG_166.data"
+    db = module.KLittleGroupsDB.load(db_path)
+
+    matches = db._reference_kpoint_matches(np.array([0.525, -1.2e-17, -9.2e-18], dtype=float))
+
+    assert any(entry.name == "GP" for entry, *_ in matches)
+
+
 
 def test_k_little_group_resolve_f_point_via_star_rotation(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.k_little_groups")
