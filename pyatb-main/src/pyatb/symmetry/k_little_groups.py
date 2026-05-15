@@ -383,7 +383,12 @@ class KLittleGroupsDB:
                     refkpoint[j] = _token_to_value(token)
 
             refkpointp = refkpoint @ self.kc2p
-            diff = np.abs((refkpointp - np.floor(refkpointp)) - (tkk - np.floor(tkk))).sum()
+            # Use a nearest-integer wrapped distance instead of floor-based
+            # reduction. Star rotations often leave coordinates such as
+            # -1e-17 around zero; floor(-1e-17) maps them to the opposite
+            # side of the Brillouin zone and can hide valid variable-k
+            # matches.
+            diff = _frac_diff(refkpointp, tkk)
             if diff < tol:
                 varnum = _count_variables(ckpoint)
                 matches.append((entry, varnum, tkkc.copy(), entry_index, _frac_diff(tkk, entry.k_prim)))
