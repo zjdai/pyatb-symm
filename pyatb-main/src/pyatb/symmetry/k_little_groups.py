@@ -57,9 +57,9 @@ def _centering_kc2p(symbol: str) -> np.ndarray:
     if s == "A":
         return np.array(
             [
-                [0.5, 0.0, 0.5],
-                [0.0, 1.0, 0.0],
-                [-0.5, 0.0, 0.5],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.5, -0.5],
+                [0.0, 0.5, 0.5],
             ],
             dtype=float,
         )
@@ -312,87 +312,122 @@ class KLittleGroupsDB:
                 k[i] += 1.0
         return k
 
+    @staticmethod
+    def _primitive_periodic_images(k_prim: np.ndarray) -> list[np.ndarray]:
+        k = np.asarray(k_prim, dtype=float).reshape(3)
+        images = [k.copy()]
+        seen = {tuple(np.round(k, 12))}
+
+        for sx in (-1.0, 0.0, 1.0):
+            for sy in (-1.0, 0.0, 1.0):
+                for sz in (-1.0, 0.0, 1.0):
+                    shifted = k + np.array([sx, sy, sz], dtype=float)
+                    key = tuple(np.round(shifted, 12))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    images.append(shifted)
+        return images
+
     def _reference_kpoint_matches(
         self,
         k_prim: np.ndarray,
         tol: float = 1.0e-5,
     ) -> list[tuple[KPointEntry, int, np.ndarray, int, float]]:
-        tkk = np.asarray(k_prim, dtype=float)
-        tkkc = tkk @ self.p2c
+        base_tkk = np.asarray(k_prim, dtype=float).reshape(3)
+        matches_by_entry: dict[tuple[str, int], tuple[tuple[float, float, float, int], tuple[KPointEntry, int, np.ndarray, int, float]]] = {}
 
-        matches: list[tuple[KPointEntry, int, np.ndarray, int, float]] = []
+        for image_index, tkk in enumerate(self._primitive_periodic_images(base_tkk)):
+            tkkc = tkk @ self.p2c
+            image_shift = float(np.sum(np.abs(tkk - base_tkk)))
 
-        for entry_index, entry in enumerate(self.kpoints, start=1):
-            ckpoint = kreal_to_string(entry.k_conv)
-            refkpoint = np.full(3, 9999.0, dtype=float)
-            is_variable = [False, False, False]
+            for entry_index, entry in enumerate(self.kpoints, start=1):
+                ckpoint = kreal_to_string(entry.k_conv)
+                refkpoint = np.full(3, 9999.0, dtype=float)
+                is_variable = [False, False, False]
 
-            token1 = ckpoint[0:5]
-            token2 = ckpoint[5:10]
-            token3 = ckpoint[10:15]
+                token1 = ckpoint[0:5]
+                token2 = ckpoint[5:10]
+                token3 = ckpoint[10:15]
 
-            if token1 == "  u  ":
-                is_variable[0] = True
-                refkpoint[0] = tkkc[0]
-                if token2 == "  u  ":
-                    refkpoint[1] = refkpoint[0]
-                if token2 == " 1-u ":
-                    refkpoint[1] = 1.0 - refkpoint[0]
-                if token2 == "-2u  ":
-                    refkpoint[1] = -2.0 * refkpoint[0]
-                if token2 == " -u  ":
-                    refkpoint[1] = -refkpoint[0]
-                if token2 == " 1+u ":
-                    refkpoint[1] = 1.0 + refkpoint[0]
-                if token3 == "  u  ":
-                    refkpoint[2] = refkpoint[0]
-                if token3 == " 1-u ":
-                    refkpoint[2] = 1.0 - refkpoint[0]
-                if token3 == "-2u  ":
-                    refkpoint[2] = -2.0 * refkpoint[0]
-                if token3 == " -u  ":
-                    refkpoint[2] = -refkpoint[0]
-                if token3 == " 1+u ":
-                    refkpoint[2] = 1.0 + refkpoint[0]
+                if token1 == "  u  ":
+                    is_variable[0] = True
+                    refkpoint[0] = tkkc[0]
+                    if token2 == "  u  ":
+                        refkpoint[1] = refkpoint[0]
+                    if token2 == " 1-u ":
+                        refkpoint[1] = 1.0 - refkpoint[0]
+                    if token2 == "-2u  ":
+                        refkpoint[1] = -2.0 * refkpoint[0]
+                    if token2 == " -u  ":
+                        refkpoint[1] = -refkpoint[0]
+                    if token2 == " 1+u ":
+                        refkpoint[1] = 1.0 + refkpoint[0]
+                    if token3 == "  u  ":
+                        refkpoint[2] = refkpoint[0]
+                    if token3 == " 1-u ":
+                        refkpoint[2] = 1.0 - refkpoint[0]
+                    if token3 == "-2u  ":
+                        refkpoint[2] = -2.0 * refkpoint[0]
+                    if token3 == " -u  ":
+                        refkpoint[2] = -refkpoint[0]
+                    if token3 == " 1+u ":
+                        refkpoint[2] = 1.0 + refkpoint[0]
 
-            if token2 == "  v  ":
-                is_variable[1] = True
-                refkpoint[1] = tkkc[1]
-                if token1 == " 1-v ":
-                    refkpoint[0] = 1.0 - refkpoint[1]
-                if token3 == " 1-v ":
-                    refkpoint[2] = 1.0 - refkpoint[1]
-                if token3 == "  v  ":
-                    refkpoint[2] = refkpoint[1]
+                if token2 == "  v  ":
+                    is_variable[1] = True
+                    refkpoint[1] = tkkc[1]
+                    if token1 == " 1-v ":
+                        refkpoint[0] = 1.0 - refkpoint[1]
+                    if token3 == " 1-v ":
+                        refkpoint[2] = 1.0 - refkpoint[1]
+                    if token3 == "  v  ":
+                        refkpoint[2] = refkpoint[1]
 
-            if token3 == "  w  ":
-                is_variable[2] = True
-                refkpoint[2] = tkkc[2]
+                if token3 == "  w  ":
+                    is_variable[2] = True
+                    refkpoint[2] = tkkc[2]
 
-            # IRVSP exceptions around off-diagonal u templates.
-            if token1 != "  u  " and token2 == "  u  ":
-                is_variable[0] = True
-                refkpoint[1] = tkkc[1]
-            if token1 == " 1+u " and token2 == " 1-u ":
-                is_variable[0] = True
-                refkpoint[0] = tkkc[0]
-                refkpoint[1] = 2.0 - refkpoint[0]
+                # IRVSP exceptions around off-diagonal u templates.
+                if token1 != "  u  " and token2 == "  u  ":
+                    is_variable[0] = True
+                    refkpoint[1] = tkkc[1]
+                if token1 == " 1+u " and token2 == " 1-u ":
+                    is_variable[0] = True
+                    refkpoint[0] = tkkc[0]
+                    refkpoint[1] = 2.0 - refkpoint[0]
 
-            for j, token in enumerate((token1, token2, token3)):
-                if abs(refkpoint[j] - 9999.0) < tol:
-                    refkpoint[j] = _token_to_value(token)
+                for j, token in enumerate((token1, token2, token3)):
+                    if abs(refkpoint[j] - 9999.0) < tol:
+                        refkpoint[j] = _token_to_value(token)
 
-            refkpointp = refkpoint @ self.kc2p
-            # Use a nearest-integer wrapped distance instead of floor-based
-            # reduction. Star rotations often leave coordinates such as
-            # -1e-17 around zero; floor(-1e-17) maps them to the opposite
-            # side of the Brillouin zone and can hide valid variable-k
-            # matches.
-            diff = _frac_diff(refkpointp, tkk)
-            if diff < tol:
-                varnum = _count_variables(ckpoint)
-                matches.append((entry, varnum, tkkc.copy(), entry_index, _frac_diff(tkk, entry.k_prim)))
+                refkpointp = refkpoint @ self.kc2p
+                # Use a nearest-integer wrapped distance instead of floor-based
+                # reduction. Star rotations often leave coordinates such as
+                # -1e-17 around zero; floor(-1e-17) maps them to the opposite
+                # side of the Brillouin zone and can hide valid variable-k
+                # matches.  For centered lattices, also try nearby periodic
+                # primitive images before converting to conventional coordinates:
+                # a floored primitive representative can otherwise hide a
+                # lower-dimensional line such as LD behind the generic GP point.
+                diff = _frac_diff(refkpointp, tkk)
+                if diff < tol:
+                    varnum = _count_variables(ckpoint)
+                    fracdiff = _frac_diff(tkk, entry.k_prim)
+                    k_conv_match = refkpoint.copy()
+                    for axis, token in enumerate((token1, token2, token3)):
+                        if token in {"  u  ", "  v  ", "  w  "}:
+                            k_conv_match[axis] -= np.floor(k_conv_match[axis])
+                            if abs(k_conv_match[axis] - 1.0) < tol:
+                                k_conv_match[axis] = 0.0
+                    match = (entry, varnum, k_conv_match, entry_index, fracdiff)
+                    score = (float(varnum), fracdiff, image_shift, image_index)
+                    key = (entry.name, entry_index)
+                    previous = matches_by_entry.get(key)
+                    if previous is None or score < previous[0]:
+                        matches_by_entry[key] = (score, match)
 
+        matches = [match for _score, match in matches_by_entry.values()]
         matches.sort(key=lambda item: (item[1], item[4], item[3]))
         return matches
 
