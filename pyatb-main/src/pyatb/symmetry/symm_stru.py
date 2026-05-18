@@ -1908,25 +1908,48 @@ class SymmStructureAnalyzer:
             current_to_db_prim = self._kpoint_current_to_database_primitive(lattice_new, database_primitive_lattice)
         except AttributeError:
             current_to_db_prim = np.eye(3, dtype=float)
+        align_tol = max(1.0e-6, map_tol * 10.0)
+        database_origin_shift = np.zeros(3, dtype=float)
+        database_aligned_operations = operations
+        database_alignment_warnings: list[str] = []
+        solved_origin_shift = self._solve_origin_shift_from_operations(operations, db, tol=align_tol)
+        if solved_origin_shift is not None and float(np.max(np.abs(solved_origin_shift))) > align_tol:
+            database_origin_shift = np.asarray(solved_origin_shift, dtype=float)
+            shifted_std_atoms = std_atoms.copy()
+            shifted_pos = (
+                np.asarray(shifted_std_atoms.get_scaled_positions(wrap=False), dtype=float)
+                + database_origin_shift
+            )
+            shifted_std_atoms.set_scaled_positions(_wrap_fractional_coordinates(shifted_pos))
+            shifted_sym_data = self._get_symmetry_data(shifted_std_atoms, symm_prec)
+            database_aligned_operations = self._sort_operations_irvsp_like(
+                self._build_symmetry_operations(shifted_std_atoms, shifted_sym_data)
+            )
+            database_alignment_warnings.append(
+                "spglib operations matched kLittleGroups after fractional origin shift "
+                f"{self._format_translation(database_origin_shift)}"
+            )
         if bool(standardization_result["need_rebuild_hs"]):
-            reordered_ops, reorder_warnings = self._reorder_operations_with_database(operations, db)
+            reordered_ops, reorder_warnings = self._reorder_operations_with_database(database_aligned_operations, db)
+            reorder_warnings = database_alignment_warnings + reorder_warnings
             aligned_source_ops = list(reordered_ops)
-            match_summary_ok, match_summary_details = self._database_alignment_summary(operations, db)
+            match_summary_ok, match_summary_details = self._database_alignment_summary(database_aligned_operations, db)
         else:
             try:
                 reordered_ops, reorder_warnings = self._reorder_operations_with_database(source_operations, db)
                 aligned_source_ops = list(reordered_ops)
                 match_summary_ok, match_summary_details = self._database_alignment_summary(source_operations, db)
             except ValueError as source_align_error:
-                reordered_ops, reorder_warnings = self._reorder_operations_with_database(operations, db)
+                reordered_ops, reorder_warnings = self._reorder_operations_with_database(database_aligned_operations, db)
+                reorder_warnings = database_alignment_warnings + reorder_warnings
                 aligned_source_ops = self._align_operations_to_reference(
                     reordered_ops,
                     source_operations,
-                    origin_shift=source_to_std_origin_shift,
-                    tol=max(1.0e-6, map_tol * 10.0),
+                    origin_shift=source_to_std_origin_shift + database_origin_shift,
+                    tol=align_tol,
                 )
                 del source_align_error
-                match_summary_ok, match_summary_details = self._database_alignment_summary(operations, db)
+                match_summary_ok, match_summary_details = self._database_alignment_summary(database_aligned_operations, db)
         kpoint_records = []
         if canonical_kpoints.size > 0:
             kpoint_records = self._resolve_kpoint_records(
