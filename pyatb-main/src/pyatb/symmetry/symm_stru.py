@@ -129,8 +129,19 @@ class SymmStructureAnalyzer:
         if std_cell is None:
             raise ValueError("spglib failed to standardize structure to primitive cell.")
 
+        conv_cell = self._standardize_cell_without_deprecation_warning(
+            spglib,
+            cell,
+            to_primitive=False,
+            no_idealize=False,
+            symprec=symm_prec,
+        )
+        if conv_cell is None:
+            raise ValueError("spglib failed to standardize structure to conventional cell.")
+
         mapping_lattice, mapping_positions, mapping_numbers = mapping_cell
         std_lattice, std_positions, std_numbers = std_cell
+        conv_lattice, conv_positions, conv_numbers = conv_cell
         mapping_atoms = Atoms(
             numbers=np.asarray(mapping_numbers, dtype=int),
             cell=np.asarray(mapping_lattice, dtype=float),
@@ -143,10 +154,17 @@ class SymmStructureAnalyzer:
             scaled_positions=np.asarray(std_positions, dtype=float),
             pbc=True,
         )
+        conv_atoms = Atoms(
+            numbers=np.asarray(conv_numbers, dtype=int),
+            cell=np.asarray(conv_lattice, dtype=float),
+            scaled_positions=np.asarray(conv_positions, dtype=float),
+            pbc=True,
+        )
         mapping_atoms.set_scaled_positions(
             _wrap_fractional_coordinates(mapping_atoms.get_scaled_positions(wrap=False))
         )
         std_atoms.set_scaled_positions(_wrap_fractional_coordinates(std_atoms.get_scaled_positions(wrap=False)))
+        conv_atoms.set_scaled_positions(_wrap_fractional_coordinates(conv_atoms.get_scaled_positions(wrap=False)))
 
         std_cell_for_sym = (
             np.asarray(std_lattice, dtype=float),
@@ -158,7 +176,17 @@ class SymmStructureAnalyzer:
             raise ValueError("spglib failed to get real-space symmetry operations for standardized primitive structure.")
         sym_data = self._symmetry_dict_from_dataset(sym_dataset)
 
-        return dataset, std_atoms, mapping_atoms, sym_data
+        conv_cell_for_sym = (
+            np.asarray(conv_lattice, dtype=float),
+            np.asarray(conv_positions, dtype=float),
+            np.asarray(conv_numbers, dtype=int),
+        )
+        conv_sym_dataset = spglib.get_symmetry_dataset(conv_cell_for_sym, symprec=symm_prec, _throw=True)
+        if conv_sym_dataset is None:
+            raise ValueError("spglib failed to get real-space symmetry operations for standardized conventional structure.")
+        conv_sym_data = self._symmetry_dict_from_dataset(conv_sym_dataset)
+
+        return dataset, std_atoms, mapping_atoms, sym_data, conv_atoms, conv_sym_data
 
     def _standardize_magnetic_cell(self, atoms: Atoms, magnetic_moments: np.ndarray, symm_prec: float):
         try:
@@ -1094,6 +1122,55 @@ class SymmStructureAnalyzer:
                         return shift
         return None
 
+    @classmethod
+    def _solve_conventional_origin_shift_from_database(
+        cls,
+        conventional_operations: list[SymmetryOperation],
+        db: KLittleGroupsDB,
+        tol: float = 1.0e-6,
+    ) -> np.ndarray | None:
+        n_target = min(len(getattr(db, "symops", [])), db.doubnum // 2)
+        if n_target == 0:
+            return np.zeros(3, dtype=float)
+
+        grid = np.arange(24, dtype=float) / 24.0
+        identity = np.eye(3, dtype=float)
+        for sx in grid:
+            for sy in grid:
+                for sz in grid:
+                    shift = np.array([sx, sy, sz], dtype=float)
+                    used: set[int] = set()
+                    ok = True
+                    for db_idx in range(n_target):
+                        db_op = db.symops[db_idx]
+                        match_index = None
+                        for op_idx, op in enumerate(conventional_operations):
+                            if op_idx in used:
+                                continue
+                            if not cls._rotation_match(op.rotation, db_op.rotation):
+                                continue
+                            shifted_tau = (
+                                np.asarray(op.translation, dtype=float)
+                                + shift @ (identity - np.asarray(op.rotation, dtype=float).T)
+                            )
+                            if cls._translation_match(shifted_tau, db_op.translation, tol=tol):
+                                match_index = op_idx
+                                break
+                        if match_index is None:
+                            ok = False
+                            break
+                        used.add(match_index)
+                    if ok:
+                        return shift
+        return None
+
+    @staticmethod
+    def _conventional_origin_shift_to_primitive(shift_conventional: np.ndarray, db: KLittleGroupsDB) -> np.ndarray:
+        transform = getattr(db, "kc2p", None)
+        if transform is None:
+            return np.asarray(shift_conventional, dtype=float)
+        return np.linalg.inv(np.asarray(transform, dtype=float)) @ np.asarray(shift_conventional, dtype=float)
+
     def _reorder_operations_with_database(self, operations: list[SymmetryOperation], db: KLittleGroupsDB):
         n_target = min(len(operations), db.doubnum // 2)
         used: set[int] = set()
@@ -1810,7 +1887,10 @@ class SymmStructureAnalyzer:
 
     def analyze_nonmagnetic(self, requested_group, symm_prec: float, kpoints_direct=None):
         source_atoms, source_path = self._load_input_stru()
-        dataset, std_atoms, mapping_atoms, sym_data = self._standardize_nonmagnetic_cell(source_atoms, symm_prec)
+        dataset, std_atoms, mapping_atoms, sym_data, conv_atoms, conv_sym_data = self._standardize_nonmagnetic_cell(
+            source_atoms,
+            symm_prec,
+        )
         source_sym_data = self._get_symmetry_data(source_atoms, symm_prec)
 
         detected_group = int(dataset.number)
@@ -1895,6 +1975,9 @@ class SymmStructureAnalyzer:
         )
 
         operations = self._sort_operations_irvsp_like(self._build_symmetry_operations(std_atoms, sym_data))
+        conventional_operations = self._sort_operations_irvsp_like(
+            self._build_symmetry_operations(conv_atoms, conv_sym_data)
+        )
         source_operations = self._sort_operations_irvsp_like(self._build_symmetry_operations(source_atoms, source_sym_data))
 
         klg_dir = Path(__file__).resolve().parents[1] / "kLittleGroups"
@@ -1915,6 +1998,27 @@ class SymmStructureAnalyzer:
         solved_origin_shift = self._solve_origin_shift_from_operations(operations, db, tol=align_tol)
         if solved_origin_shift is not None and float(np.max(np.abs(solved_origin_shift))) > align_tol:
             database_origin_shift = np.asarray(solved_origin_shift, dtype=float)
+            database_alignment_warnings.append(
+                "spglib operations matched kLittleGroups after primitive fractional origin shift "
+                f"{self._format_translation(database_origin_shift)}"
+            )
+        elif solved_origin_shift is None:
+            conventional_origin_shift = self._solve_conventional_origin_shift_from_database(
+                conventional_operations,
+                db,
+                tol=align_tol,
+            )
+            if (
+                conventional_origin_shift is not None
+                and float(np.max(np.abs(conventional_origin_shift))) > align_tol
+            ):
+                database_origin_shift = self._conventional_origin_shift_to_primitive(conventional_origin_shift, db)
+                database_alignment_warnings.append(
+                    "spglib operations matched kLittleGroups after conventional fractional origin shift "
+                    f"{self._format_translation(conventional_origin_shift)} "
+                    f"(primitive {self._format_translation(database_origin_shift)})"
+                )
+        if float(np.max(np.abs(database_origin_shift))) > align_tol:
             shifted_std_atoms = std_atoms.copy()
             shifted_pos = (
                 np.asarray(shifted_std_atoms.get_scaled_positions(wrap=False), dtype=float)
@@ -1924,10 +2028,6 @@ class SymmStructureAnalyzer:
             shifted_sym_data = self._get_symmetry_data(shifted_std_atoms, symm_prec)
             database_aligned_operations = self._sort_operations_irvsp_like(
                 self._build_symmetry_operations(shifted_std_atoms, shifted_sym_data)
-            )
-            database_alignment_warnings.append(
-                "spglib operations matched kLittleGroups after fractional origin shift "
-                f"{self._format_translation(database_origin_shift)}"
             )
         if bool(standardization_result["need_rebuild_hs"]):
             reordered_ops, reorder_warnings = self._reorder_operations_with_database(database_aligned_operations, db)
@@ -2089,7 +2189,7 @@ class SymmStructureAnalyzer:
                     f.write("  - All spglib symmetry operations fully match the kLittleGroups table.\n")
                 for detail in match_summary_details:
                     f.write(f"  - {detail}\n")
-                if not match_summary_ok and reorder_warnings:
+                if reorder_warnings:
                     for warning in reorder_warnings:
                         f.write(f"  - reorder note: {warning}\n")
                 f.write("\n")
