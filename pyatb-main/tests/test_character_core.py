@@ -42,6 +42,15 @@ def test_group_degenerate_bands_respects_energy_tolerance(load_pyatb) -> None:
 
 
 
+def test_group_degenerate_bands_uses_character_energy_tolerance_by_default(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+    energies = np.array([0.0, 4.9e-4, 1.2e-3], dtype=float)
+
+    groups = module.group_degenerate_bands(energies)
+
+    assert groups == [(0, 1), (2, 2)]
+
+
 def test_assign_irrep_matches_trace_vector(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.character_core")
     resolution = _FakeResolution(

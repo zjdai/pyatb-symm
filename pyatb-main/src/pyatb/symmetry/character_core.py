@@ -61,7 +61,7 @@ def _resolved_irrep_characters(irrep, resolution) -> np.ndarray:
     return table
 
 
-def group_degenerate_bands(energies: np.ndarray, tol: float = 1.0e-6) -> list[tuple[int, int]]:
+def group_degenerate_bands(energies: np.ndarray, tol: float = 5.0e-4) -> list[tuple[int, int]]:
     values = np.asarray(energies, dtype=float).reshape(-1)
     if values.size == 0:
         return []

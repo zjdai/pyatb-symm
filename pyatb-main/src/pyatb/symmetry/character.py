@@ -362,7 +362,7 @@ class Character:
                 )
                 for op_index in active_operation_indices
             ]
-            groups = group_degenerate_bands(eigenvalues[k_index], tol=1.0e-6)
+            groups = group_degenerate_bands(eigenvalues[k_index], tol=5.0e-4)
 
             for group_start, group_stop in groups:
                 if group_stop < requested_start or group_start > requested_stop:
