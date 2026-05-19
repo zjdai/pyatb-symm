@@ -6,12 +6,15 @@ import shutil
 from pathlib import Path
 import re
 import warnings
+import traceback
 
 import numpy as np
 
 from pyatb import OUTPUT_PATH, RANK, RUNNING_LOG
+from pyatb.parallel import COMM, SIZE
 from pyatb.kpt import kpoint_generator
 from pyatb.tb.tb import tb as TBModel
+from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR
 from pyatb.symmetry.Dk_matrix import build_dk_matrix, spin_half_matrix_from_cartesian_rotation
 from pyatb.symmetry.character_core import (
     assign_irrep_combination,
@@ -21,7 +24,6 @@ from pyatb.symmetry.character_core import (
 from pyatb.symmetry.hs_standardize import canonicalize_abacus_hs
 from pyatb.symmetry.symm_stru import SymmStructureAnalyzer
 from pyatb.symmetry.data_covariance_constraint import (
-    build_multixr_from_dense_blocks,
     get_symmetry_operations_from_metadata,
     load_abacus_hs_blocks,
     prepare_operation_contexts,
@@ -61,6 +63,8 @@ class Character:
                 f.write("\n|                                                    |")
                 f.write("\n------------------------------------------------------")
                 f.write("\n\n")
+
+        COMM.Barrier()
 
     @staticmethod
     def _collect_all_kpoints(generator) -> np.ndarray:
@@ -323,6 +327,30 @@ class Character:
 
         report_path.write_text("".join(updated_lines), encoding="utf-8")
 
+    def _set_tb_from_hs_files(
+        self,
+        active_stru_path: Path,
+        active_hr_path: Path,
+        active_sr_path: Path,
+        HR_unit: str,
+        lattice_constant: float,
+        lattice_vector: np.ndarray,
+    ) -> None:
+        if int(self._tb.nspin) == 2:
+            raise ValueError("CHARACTER does not support nspin=2.")
+
+        hr_obj = abacus_readHR(int(self._tb.nspin), str(active_hr_path), str(HR_unit))
+        sr_obj = abacus_readSR(int(self._tb.nspin), str(active_sr_path))
+        active_tb = TBModel(
+            int(self._tb.nspin),
+            float(lattice_constant),
+            np.asarray(lattice_vector, dtype=float),
+            self._max_kpoint_num,
+        )
+        active_tb.set_solver_HSR(hr_obj, sr_obj, bool(getattr(self._tb, "HSR_iSsparse", False)))
+        active_tb.read_stru(str(active_stru_path), need_orb=True)
+        self._tb = active_tb
+
     def _calculate_character_rows(
         self,
         kpoints_direct: np.ndarray,
@@ -338,15 +366,28 @@ class Character:
         if not source_operations or not kpoint_records:
             return []
 
-        eigenvectors, eigenvalues = self._tb.tb_solver.diago_H(np.asarray(kpoints_direct, dtype=float))
-        overlaps = self._tb.tb_solver.get_Sk(np.asarray(kpoints_direct, dtype=float))
-
         requested_start = int(band_array[0]) - 1
         requested_stop = int(band_array[1]) - 1
+        local_records = [
+            record
+            for record in kpoint_records
+            if (int(record["k_index"]) - 1) % max(int(SIZE), 1) == int(RANK)
+        ]
+        local_k_indices = sorted({int(record["k_index"]) - 1 for record in local_records})
+        local_index_map = {k_index: local_pos for local_pos, k_index in enumerate(local_k_indices)}
+
+        if local_k_indices:
+            local_kpoints = np.asarray(kpoints_direct, dtype=float)[local_k_indices]
+            eigenvectors, eigenvalues = self._tb.tb_solver.diago_H(local_kpoints)
+            overlaps = self._tb.tb_solver.get_Sk(local_kpoints)
+        else:
+            eigenvectors = eigenvalues = overlaps = None
+
         rows: list[dict] = []
 
-        for record in kpoint_records:
+        for record in local_records:
             k_index = int(record["k_index"]) - 1
+            local_pos = local_index_map[k_index]
             active_operation_indices = list(record.get("active_operation_indices", []))
             if not active_operation_indices:
                 continue
@@ -362,14 +403,14 @@ class Character:
                 )
                 for op_index in active_operation_indices
             ]
-            groups = group_degenerate_bands(eigenvalues[k_index], tol=5.0e-4)
+            groups = group_degenerate_bands(eigenvalues[local_pos], tol=5.0e-4)
 
             for group_start, group_stop in groups:
                 if group_stop < requested_start or group_start > requested_stop:
                     continue
                 characters = calculate_subspace_characters(
-                    eigenvectors=eigenvectors[k_index],
-                    overlap=overlaps[k_index],
+                    eigenvectors=eigenvectors[local_pos],
+                    overlap=overlaps[local_pos],
                     operation_matrices=op_matrices,
                     band_range=(group_start, group_stop),
                 )
@@ -403,7 +444,7 @@ class Character:
                         "k_name": record.get("k_name", ""),
                         "start_band": group_start + 1,
                         "degeneracy": group_stop - group_start + 1,
-                        "energy": float(np.mean(eigenvalues[k_index, group_start : group_stop + 1])),
+                        "energy": float(np.mean(eigenvalues[local_pos, group_start : group_stop + 1])),
                         "active_operation_indices": active_operation_indices,
                         "table_operation_indices": table_operation_indices,
                         "active_operation_labels": active_operation_labels,
@@ -412,7 +453,13 @@ class Character:
                     }
                 )
 
-        return rows
+        gathered_rows = COMM.gather(rows, root=0)
+        if RANK != 0:
+            return []
+
+        merged_rows = [row for rank_rows in gathered_rows for row in rank_rows]
+        merged_rows.sort(key=lambda row: (int(row["k_index"]), int(row["start_band"])))
+        return merged_rows
 
     def set_k_mp(
         self,
@@ -580,64 +627,22 @@ class Character:
             )
         return np.asarray(values[:required], dtype=float).reshape(atom_count, 3)
 
-    def calculate_character(
+    def _prepare_character_on_root(
         self,
-        stru_file="STRU",
-        kpoint_mode="direct",
-        group="auto",
-        symm_prec=1e-5,
-        occ_band=1,
-        band=(1, 1),
-        mag_tag=0,
-        mag="auto",
-        HR_route=None,
-        SR_route="data-SR-sparse_SPIN0.csr",
-        HR_unit="Ry",
-        data_symmetrize=0,
-        data_symm_target_max_abs_ry=1.0e-8,
-        data_symm_max_iter_per_operation=5,
-        data_symm_nonzero_block_tol=1.0e-9,
-        data_symm_verbose=0,
-        **kwargs,
-    ) -> None:
-        data_symmetrize = int(data_symmetrize)
-        if data_symmetrize not in (0, 1):
-            raise ValueError("CHARACTER.data_symmetrize must be 0 or 1.")
-        data_symm_max_iter_per_operation = int(data_symm_max_iter_per_operation)
-        if data_symm_max_iter_per_operation <= 0:
-            raise ValueError("CHARACTER.data_symm_max_iter_per_operation must be a positive integer.")
-        data_symm_target_max_abs_ry = float(data_symm_target_max_abs_ry)
-        if data_symm_target_max_abs_ry <= 0.0:
-            raise ValueError("CHARACTER.data_symm_target_max_abs_ry must be greater than 0.")
-        data_symm_nonzero_block_tol = float(data_symm_nonzero_block_tol)
-        if data_symm_nonzero_block_tol <= 0.0:
-            raise ValueError("CHARACTER.data_symm_nonzero_block_tol must be greater than 0.")
-        data_symm_verbose = int(data_symm_verbose)
-        if data_symm_verbose not in (0, 1):
-            raise ValueError("CHARACTER.data_symm_verbose must be 0 or 1.")
-
-        _, kpoint_parameters = self._validate_parameters(
-            kpoint_mode=kpoint_mode,
-            group=group,
-            symm_prec=symm_prec,
-            occ_band=occ_band,
-            band=band,
-            mag_tag=mag_tag,
-            mag=mag,
-            **kwargs,
-        )
-
-        if kpoint_mode == "mp":
-            self.set_k_mp(**kpoint_parameters)
-        elif kpoint_mode == "line":
-            self.set_k_line(**kpoint_parameters)
-        else:
-            self.set_k_direct(**kpoint_parameters)
-
-        if mag_tag == 1 and group == "auto":
-            raise ValueError("CHARACTER.mag_tag=1 requires an explicit CHARACTER.group space-group number.")
-
-        self._tb.read_stru(stru_file, need_orb=True)
+        stru_file,
+        group,
+        symm_prec,
+        mag_tag,
+        mag,
+        HR_route,
+        SR_route,
+        HR_unit,
+        data_symmetrize,
+        data_symm_target_max_abs_ry,
+        data_symm_max_iter_per_operation,
+        data_symm_nonzero_block_tol,
+        data_symm_verbose,
+    ) -> dict:
         kpoints_direct = self._collect_all_kpoints(self._k_generator)
         analyzer = SymmStructureAnalyzer(self._tb, self.output_path)
         if mag_tag == 1:
@@ -655,6 +660,8 @@ class Character:
         active_hr_path = Path(HR_route or "data-HR-sparse_SPIN0.csr")
         active_sr_path = Path(SR_route or "data-SR-sparse_SPIN0.csr")
         structure_standardized = bool(analysis_result.get("need_rebuild_hs"))
+        active_lattice_constant = float(self._tb.lattice_constant)
+        active_lattice_vector = np.asarray(self._tb.lattice_vector, dtype=float)
 
         if RANK == 0:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
@@ -665,35 +672,25 @@ class Character:
             hr_source = HR_route or analysis_result.get("source_hr", "data-HR-sparse_SPIN0.csr")
             sr_source = SR_route or analysis_result.get("source_sr", "data-SR-sparse_SPIN0.csr")
             full_matrix_from_hermitian = bool(analysis_result.get("full_matrix_from_hermitian", True))
-            canonical = canonicalize_abacus_hs(
-                tb=self._tb,
-                target_stru_path=Path(analysis_result["target_stru"]),
-                hr_route=hr_source,
-                sr_route=sr_source,
-                hr_unit=HR_unit,
-                atom_mapping=analysis_result["atom_mapping"],
-                lattice_new=np.asarray(analysis_result["lattice_new"], dtype=float),
-                lattice_transform_fractional=np.asarray(analysis_result["lattice_transform_fractional"], dtype=float),
-                xyz_axis_transform_cartesian=np.asarray(analysis_result["xyz_axis_transform_cartesian"], dtype=float),
-                output_hr_path=Path(analysis_result["target_hr"]),
-                output_sr_path=Path(analysis_result["target_sr"]),
-                mapping_output_path=(Path(self.output_path) / "R_block_mapping.txt") if self._emit_character_aux_outputs else None,
-                full_matrix_from_hermitian=full_matrix_from_hermitian,
-            )
+            if RANK == 0:
+                canonicalize_abacus_hs(
+                    tb=self._tb,
+                    target_stru_path=Path(analysis_result["target_stru"]),
+                    hr_route=hr_source,
+                    sr_route=sr_source,
+                    hr_unit=HR_unit,
+                    atom_mapping=analysis_result["atom_mapping"],
+                    lattice_new=np.asarray(analysis_result["lattice_new"], dtype=float),
+                    lattice_transform_fractional=np.asarray(analysis_result["lattice_transform_fractional"], dtype=float),
+                    xyz_axis_transform_cartesian=np.asarray(analysis_result["xyz_axis_transform_cartesian"], dtype=float),
+                    output_hr_path=Path(analysis_result["target_hr"]),
+                    output_sr_path=Path(analysis_result["target_sr"]),
+                    mapping_output_path=(Path(self.output_path) / "R_block_mapping.txt") if self._emit_character_aux_outputs else None,
+                    full_matrix_from_hermitian=full_matrix_from_hermitian,
+                )
 
-            canonical_tb = TBModel(
-                int(self._tb.nspin),
-                float(self._tb.lattice_constant),
-                np.asarray(analysis_result["lattice_new"], dtype=float) / float(self._tb.lattice_constant),
-                self._max_kpoint_num,
-            )
-            canonical_tb.set_solver_HSR(canonical["hr"], canonical["sr"], bool(getattr(self._tb, "HSR_iSsparse", False)))
-            canonical_tb.read_stru(
-                analysis_result["target_stru"],
-                need_orb=True,
-            )
-            self._tb = canonical_tb
             active_stru_path = Path(analysis_result["target_stru"])
+            active_lattice_vector = np.asarray(analysis_result["lattice_new"], dtype=float) / active_lattice_constant
             active_hr_path = Path(analysis_result["target_hr"])
             active_sr_path = Path(analysis_result["target_sr"])
 
@@ -790,15 +787,16 @@ class Character:
 
             cov_hr_path = Path(self.output_path) / f"{active_hr_path.stem}-covsymm.csr"
             cov_sr_path = Path(self.output_path) / f"{active_sr_path.stem}-covsymm.csr"
-            write_symmetrized_hs(
-                hr_blocks=hr_symm,
-                sr_blocks=sr_symm,
-                output_hr_path=cov_hr_path,
-                output_sr_path=cov_sr_path,
-                basis_num=int(metadata.basis_num),
-                nspin=int(self._tb.nspin),
-                hr_unit=str(HR_unit),
-            )
+            if RANK == 0:
+                write_symmetrized_hs(
+                    hr_blocks=hr_symm,
+                    sr_blocks=sr_symm,
+                    output_hr_path=cov_hr_path,
+                    output_sr_path=cov_sr_path,
+                    basis_num=int(metadata.basis_num),
+                    nspin=int(self._tb.nspin),
+                    hr_unit=str(HR_unit),
+                )
 
             symm_report_path = Path(self.output_path) / "data_symmetrization_report.txt"
             hr_max_before = float(before_hr["global_max_abs"])
@@ -894,29 +892,122 @@ class Character:
             active_hr_path = cov_hr_path
             active_sr_path = cov_sr_path
 
-            hr_obj, sr_obj = build_multixr_from_dense_blocks(
-                hr_blocks=hr_symm,
-                sr_blocks=sr_symm,
-                basis_num=int(metadata.basis_num),
-                nspin=int(self._tb.nspin),
-                hr_unit=str(HR_unit),
-            )
-            symm_tb = TBModel(
-                int(self._tb.nspin),
-                float(self._tb.lattice_constant),
-                np.asarray(self._tb.lattice_vector, dtype=float),
-                self._max_kpoint_num,
-            )
-            symm_tb.set_solver_HSR(hr_obj, sr_obj, bool(getattr(self._tb, "HSR_iSsparse", False)))
-            symm_tb.read_stru(
-                str(active_stru_path),
-                need_orb=True,
-            )
-            self._tb = symm_tb
         elif RANK == 0:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
                 fp.write("\nData Symmetrization (CHARACTER)\n")
                 fp.write("enabled = 0\n")
+
+        return {
+            "analysis_result": analysis_result,
+            "effective_kpoints": np.asarray(effective_kpoints, dtype=float),
+            "active_stru_path": str(active_stru_path.resolve()),
+            "active_hr_path": str(active_hr_path.resolve()),
+            "active_sr_path": str(active_sr_path.resolve()),
+            "lattice_constant": float(active_lattice_constant),
+            "lattice_vector": np.asarray(active_lattice_vector, dtype=float),
+        }
+
+    def calculate_character(
+        self,
+        stru_file="STRU",
+        kpoint_mode="direct",
+        group="auto",
+        symm_prec=1e-5,
+        occ_band=1,
+        band=(1, 1),
+        mag_tag=0,
+        mag="auto",
+        HR_route=None,
+        SR_route="data-SR-sparse_SPIN0.csr",
+        HR_unit="Ry",
+        data_symmetrize=0,
+        data_symm_target_max_abs_ry=1.0e-8,
+        data_symm_max_iter_per_operation=5,
+        data_symm_nonzero_block_tol=1.0e-9,
+        data_symm_verbose=0,
+        **kwargs,
+    ) -> None:
+        data_symmetrize = int(data_symmetrize)
+        if data_symmetrize not in (0, 1):
+            raise ValueError("CHARACTER.data_symmetrize must be 0 or 1.")
+        data_symm_max_iter_per_operation = int(data_symm_max_iter_per_operation)
+        if data_symm_max_iter_per_operation <= 0:
+            raise ValueError("CHARACTER.data_symm_max_iter_per_operation must be a positive integer.")
+        data_symm_target_max_abs_ry = float(data_symm_target_max_abs_ry)
+        if data_symm_target_max_abs_ry <= 0.0:
+            raise ValueError("CHARACTER.data_symm_target_max_abs_ry must be greater than 0.")
+        data_symm_nonzero_block_tol = float(data_symm_nonzero_block_tol)
+        if data_symm_nonzero_block_tol <= 0.0:
+            raise ValueError("CHARACTER.data_symm_nonzero_block_tol must be greater than 0.")
+        data_symm_verbose = int(data_symm_verbose)
+        if data_symm_verbose not in (0, 1):
+            raise ValueError("CHARACTER.data_symm_verbose must be 0 or 1.")
+
+        _, kpoint_parameters = self._validate_parameters(
+            kpoint_mode=kpoint_mode,
+            group=group,
+            symm_prec=symm_prec,
+            occ_band=occ_band,
+            band=band,
+            mag_tag=mag_tag,
+            mag=mag,
+            **kwargs,
+        )
+
+        if kpoint_mode == "mp":
+            self.set_k_mp(**kpoint_parameters)
+        elif kpoint_mode == "line":
+            self.set_k_line(**kpoint_parameters)
+        else:
+            self.set_k_direct(**kpoint_parameters)
+
+        if mag_tag == 1 and group == "auto":
+            raise ValueError("CHARACTER.mag_tag=1 requires an explicit CHARACTER.group space-group number.")
+
+        self._tb.read_stru(stru_file, need_orb=True)
+        COMM.Barrier()
+
+        try:
+            preprocess_payload = self._prepare_character_on_root(
+                stru_file=stru_file,
+                group=group,
+                symm_prec=symm_prec,
+                mag_tag=mag_tag,
+                mag=mag,
+                HR_route=HR_route,
+                SR_route=SR_route,
+                HR_unit=HR_unit,
+                data_symmetrize=data_symmetrize,
+                data_symm_target_max_abs_ry=data_symm_target_max_abs_ry,
+                data_symm_max_iter_per_operation=data_symm_max_iter_per_operation,
+                data_symm_nonzero_block_tol=data_symm_nonzero_block_tol,
+                data_symm_verbose=data_symm_verbose,
+            )
+            preprocess_payload["ok"] = True
+        except Exception:
+            preprocess_payload = {
+                "ok": False,
+                "traceback": traceback.format_exc(),
+            }
+
+        preprocess_payload = COMM.bcast(preprocess_payload if RANK == 0 else None, root=0)
+        if not preprocess_payload.get("ok", False):
+            raise RuntimeError("CHARACTER root preprocessing failed:\n" + str(preprocess_payload.get("traceback", "")))
+
+        analysis_result = preprocess_payload["analysis_result"]
+        effective_kpoints = np.asarray(preprocess_payload["effective_kpoints"], dtype=float)
+        active_stru_path = Path(preprocess_payload["active_stru_path"])
+        active_hr_path = Path(preprocess_payload["active_hr_path"])
+        active_sr_path = Path(preprocess_payload["active_sr_path"])
+        self._set_tb_from_hs_files(
+            active_stru_path=active_stru_path,
+            active_hr_path=active_hr_path,
+            active_sr_path=active_sr_path,
+            HR_unit=str(HR_unit),
+            lattice_constant=float(preprocess_payload["lattice_constant"]),
+            lattice_vector=np.asarray(preprocess_payload["lattice_vector"], dtype=float),
+        )
+        COMM.Barrier()
 
         character_rows = self._calculate_character_rows(
             effective_kpoints,

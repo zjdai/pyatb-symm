@@ -16,6 +16,9 @@ if RANK == 0:
     if not os.path.exists(OUTPUT_PATH):
         os.mkdir(OUTPUT_PATH)
 
+COMM.Barrier()
+
+if RANK == 0:
     RUNNING_LOG = os.path.join(OUTPUT_PATH, 'running.log')
 else:
     RUNNING_LOG = os.path.join(OUTPUT_PATH, 'running-' + str(RANK) + '.log')
