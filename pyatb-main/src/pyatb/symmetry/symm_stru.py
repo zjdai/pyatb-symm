@@ -1870,12 +1870,26 @@ class SymmStructureAnalyzer:
         hall = cls._dataset_value(dataset, "hall", "")
         symbol_text = f" ({symbol})" if symbol else ""
         hall_text = f", Hall symbol {hall}" if hall else ""
+        fp.write("Preprocessing flags:\n")
         fp.write(
-            "Preprocessing flags: "
-            f"operation_pc_to_sc_conversion={'yes' if operation_basis_conversion else 'no'}; "
-            f"symmetry_operations_reordered={'yes' if symmetry_operations_reordered else 'no'}; "
-            f"structure_atoms_reordered={'yes' if structure_atoms_reordered else 'no'}; "
-            f"origin_redefined={'yes' if origin_redefined else 'no'}\n"
+            "operation_pc_to_sc_conversion = "
+            f"{'yes' if operation_basis_conversion else 'no'} ; "
+            "whether symmetry operations required a basis conversion to match the kLittleGroups setting.\n"
+        )
+        fp.write(
+            "symmetry_operations_reordered = "
+            f"{'yes' if symmetry_operations_reordered else 'no'} ; "
+            "whether detected symmetry operations were reordered to match the kLittleGroups table order.\n"
+        )
+        fp.write(
+            "structure_atoms_reordered = "
+            f"{'yes' if structure_atoms_reordered else 'no'} ; "
+            "whether atom indices were reordered when mapping the input STRU to the standardized structure.\n"
+        )
+        fp.write(
+            "origin_redefined = "
+            f"{'yes' if origin_redefined else 'no'} ; "
+            "whether a fractional origin shift was used to align the structure or symmetry operations.\n"
         )
         fp.write(f"spglib determined space group No. {int(detected_group)}{symbol_text}{hall_text}.\n")
         fp.write(f"The kLittleGroups character table number is No. {int(resolved_group)}.\n")
@@ -1896,12 +1910,6 @@ class SymmStructureAnalyzer:
             fp,
             "Primitive-to-conventional cell transformation matrix in kLittleGroups convention:",
             db.p2c,
-        )
-        applied_k_basis = np.eye(3, dtype=float) if current_to_db_prim is None else current_to_db_prim
-        cls._write_report_matrix(
-            fp,
-            "Applied k-basis transformation matrix actually used for k-point matching (current primitive to kLittleGroups primitive):",
-            applied_k_basis,
         )
         fp.write("\n")
 
@@ -1952,21 +1960,48 @@ class SymmStructureAnalyzer:
             k = np.asarray(record["k_direct"], dtype=float)
             resolution = record["resolution"]
             match = resolution.entry
-            match_index = getattr(resolution, "entry_index", 0)
             active_db_ops = list(record["active_operation_indices"])
             table_db_ops = list(record.get("table_operation_indices", active_db_ops))
             if len(table_db_ops) != len(active_db_ops):
                 table_db_ops = active_db_ops
 
             fp.write("\n********************************************************************************\n\n")
-            fp.write(f"knum = {ik:2d}    kname= \n")
-            fp.write(f"k = {k[0]:.6f} {k[1]:.6f} {k[2]:.6f}\n\n")
+            fp.write(f"knum = {ik:2d}    k = {k[0]:.6f} {k[1]:.6f} {k[2]:.6f}\n")
+            fp.write(f"The k-point name is {match.name:<3s}\n")
 
-            fp.write(f"       The k-point name is {match.name:<3s}\n")
-            fp.write(f"       {len(active_db_ops)} symmetry operations (module lattice translations) in space group {db.path.stem.split('_')[-1]}\n")
-            fp.write("\n")
+            star_op_index = int(getattr(resolution, "rotation_index", 1))
+            if star_op_index == 0:
+                star_matrix = -np.eye(3, dtype=int)
+                fp.write("The k-point is transformed by inversion-equivalent operation (-I) to k-star\n")
+                fp.write("Star rotation matrix applied to k:\n")
+                for row in star_matrix:
+                    fp.write(f"  {int(row[0]):3d}{int(row[1]):3d}{int(row[2]):3d}\n")
+            elif 1 <= star_op_index <= len(operations):
+                star_op = operations[star_op_index - 1]
+                star_matrix = np.asarray(star_op.inverse_rotation, dtype=int)
+                if self._matrix_is_identity(star_matrix):
+                    fp.write("The k-point is transformed by Identity operation to k-star\n")
+                else:
+                    fp.write(
+                        "The k-point is transformed by "
+                        f"symmetry operation #{star_op_index} ({star_op.symbol}) to k-star\n"
+                    )
+                    fp.write("Star rotation matrix applied to k (R^-1):\n")
+                    for row in star_matrix:
+                        fp.write(f"  {int(row[0]):3d}{int(row[1]):3d}{int(row[2]):3d}\n")
+            else:
+                fp.write(f"The k-point is transformed by unknown star operation #{star_op_index} to k-star\n")
+
+            k_star_prim = np.asarray(
+                getattr(resolution, "rotated_k_prim", getattr(resolution, "mapped_k_prim", k)),
+                dtype=float,
+            )
+            k_star_conv = np.asarray(resolution.k_conv, dtype=float)
+            fp.write(f"Primitive    basis  {k_star_prim[0]: .6f} {k_star_prim[1]: .6f} {k_star_prim[2]: .6f}\n")
+            fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
             fp.write(
-                f"{match_index:5d}    {match.name:<3s}: kname {resolution.k_conv[0]:9.2f}{resolution.k_conv[1]:5.2f}{resolution.k_conv[2]:5.2f} :  given in the conventional basis\n"
+                f"{len(active_db_ops)} symmetry operations (module lattice translations) "
+                f"in space group {db.path.stem.split('_')[-1]}\n"
             )
             fp.write(
                 f"{match.antisym:5d} : the existence of antiunitary symmetries. 1-exist; 0-no\n"
