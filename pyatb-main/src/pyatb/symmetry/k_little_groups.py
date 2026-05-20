@@ -138,6 +138,7 @@ class KPointResolution:
     mapped_k_prim: np.ndarray | None = None
     rotated_k_prim: np.ndarray | None = None
     cornwell_satisfied: bool = True
+    phase_from_source_operations: bool = False
 
 
 def _count_variables(kstr: str) -> int:
@@ -504,6 +505,28 @@ class KLittleGroupsDB:
         angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
         return np.exp(1j * angle)
 
+    @staticmethod
+    def _source_phase_override_enabled(resolution: KPointResolution) -> bool:
+        return bool(getattr(resolution, "phase_from_source_operations", False)) and bool(
+            getattr(resolution, "cornwell_satisfied", True)
+        )
+
+    @staticmethod
+    def _phase_is_nontrivial(phase: complex, tol: float = 1.0e-8) -> bool:
+        return abs(complex(phase) - (1.0 + 0.0j)) > tol
+
+    @classmethod
+    def _should_use_operation_phase(cls, phase_kind: int, resolution: KPointResolution, phase: complex) -> bool:
+        if int(phase_kind) == 2:
+            return cls._source_phase_override_enabled(resolution)
+        if int(phase_kind) != 1:
+            return False
+        return cls._source_phase_override_enabled(resolution) and cls._phase_is_nontrivial(phase)
+
+    @classmethod
+    def _should_use_coeff_phase(cls, phase_kind: int, resolution: KPointResolution) -> bool:
+        return int(phase_kind) == 2 and not cls._source_phase_override_enabled(resolution)
+
     def irrep_table_character_slice(
         self,
         resolution: KPointResolution,
@@ -525,18 +548,21 @@ class KLittleGroupsDB:
                 values.append(np.nan + 0.0j)
                 continue
             value = raw_characters[int(table_idx)]
-            if irrep.phase_kinds[int(table_idx)] == 2:
-                if (
+            phase_kind = int(irrep.phase_kinds[int(table_idx)])
+            if phase_kind in (1, 2):
+                if self._should_use_coeff_phase(phase_kind, resolution):
+                    angle = -np.pi * float(np.dot(irrep.coeff_uvw[int(table_idx), :], resolution.k_conv))
+                    value *= np.exp(1j * angle)
+                elif (
                     phase_k_direct is not None
                     and phase_operations is not None
                     and int(active_idx) < len(phase_operations)
                 ):
-                    value *= self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-                else:
-                    angle = -np.pi * float(np.dot(irrep.coeff_uvw[int(table_idx), :], resolution.k_conv))
-                    value *= np.exp(1j * angle)
-            elif irrep.phase_kinds[int(table_idx)] != 1:
-                raise ValueError(f"Unexpected phase kind {irrep.phase_kinds[int(table_idx)]} for irrep {irrep.name}.")
+                    phase = self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+                    if self._should_use_operation_phase(phase_kind, resolution, phase):
+                        value *= phase
+            else:
+                raise ValueError(f"Unexpected phase kind {phase_kind} for irrep {irrep.name}.")
             values.append(value)
         return np.asarray(values, dtype=complex)
 

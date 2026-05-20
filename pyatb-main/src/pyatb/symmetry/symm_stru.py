@@ -1478,6 +1478,45 @@ class SymmStructureAnalyzer:
         return inactive
 
     @staticmethod
+    def _representative_k_direct(resolution, fallback: np.ndarray) -> np.ndarray:
+        value = getattr(resolution, "rotated_k_prim", None)
+        if value is None:
+            value = getattr(resolution, "mapped_k_prim", None)
+        if value is None:
+            value = fallback
+        return np.asarray(value, dtype=float)
+
+    @classmethod
+    def _validate_representative_little_group(
+        cls,
+        *,
+        k_direct: np.ndarray,
+        resolution,
+        active_operation_indices: list[int],
+        table_operation_indices: list[int],
+        database_operation_indices: list[int],
+    ) -> None:
+        table_set = {int(idx) for idx in table_operation_indices}
+        database_set = {int(idx) for idx in database_operation_indices}
+        if table_set == database_set:
+            return
+        missing_in_table = sorted(database_set - table_set)
+        extra_in_table = sorted(table_set - database_set)
+        raise ValueError(
+            "Representative k-point little-group operation mismatch with kLittleGroups table. "
+            "The CHARACTER calculation must use the k-star representative and its table little group. "
+            f"k={np.asarray(k_direct, dtype=float).tolist()}, "
+            f"representative_k={cls._representative_k_direct(resolution, k_direct).tolist()}, "
+            f"k_name={resolution.entry.name}, "
+            f"star_op={int(getattr(resolution, 'rotation_index', 0))}, "
+            f"current_ops={[int(idx) + 1 for idx in active_operation_indices]}, "
+            f"mapped_table_ops={[int(idx) + 1 for idx in table_operation_indices]}, "
+            f"database_active_ops={[int(idx) + 1 for idx in database_operation_indices]}, "
+            f"missing_in_mapped_table={[int(idx) + 1 for idx in missing_in_table]}, "
+            f"extra_in_mapped_table={[int(idx) + 1 for idx in extra_in_table]}"
+        )
+
+    @staticmethod
     def _frac_diff_mod1(a: np.ndarray, b: np.ndarray) -> float:
         delta = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
         delta -= np.rint(delta)
@@ -1557,6 +1596,7 @@ class SymmStructureAnalyzer:
         db: KLittleGroupsDB,
         kpoints_direct: np.ndarray,
         current_to_db_prim: np.ndarray | None = None,
+        phase_from_source_operations: bool = False,
     ):
         records = []
         inverse_rotations = [np.asarray(op.inverse_rotation, dtype=int) for op in operations]
@@ -1609,7 +1649,21 @@ class SymmStructureAnalyzer:
                         f"inactive_table_ops={[int(idx) + 1 for idx in inactive_ops]}, "
                         f"database_active_ops={[int(idx) + 1 for idx in active_db_ops]}"
                     )
-                resolution.cornwell_satisfied = self._cornwell_condition_satisfied(k, operations, lkg)
+                self._validate_representative_little_group(
+                    k_direct=k,
+                    resolution=resolution,
+                    active_operation_indices=active_ops,
+                    table_operation_indices=table_ops,
+                    database_operation_indices=active_db_ops,
+                )
+                character_k_direct = self._representative_k_direct(resolution, k)
+                character_operation_indices = list(active_db_ops)
+                resolution.cornwell_satisfied = self._cornwell_condition_satisfied(
+                    character_k_direct,
+                    operations,
+                    [int(idx) + 1 for idx in character_operation_indices],
+                )
+                resolution.phase_from_source_operations = bool(phase_from_source_operations)
                 records.append(
                     {
                         "k_index": ik,
@@ -1618,9 +1672,12 @@ class SymmStructureAnalyzer:
                         "active_operation_indices": active_ops,
                         "table_operation_indices": table_ops,
                         "database_operation_indices": active_db_ops,
+                        "character_k_direct": character_k_direct,
+                        "character_operation_indices": character_operation_indices,
                         "resolution": resolution,
                         "k_name": resolution.entry.name,
                         "cornwell_satisfied": resolution.cornwell_satisfied,
+                        "phase_from_source_operations": resolution.phase_from_source_operations,
                         "mapped_k_direct": np.asarray(
                             getattr(resolution, "mapped_k_prim", np.asarray(k, dtype=float)),
                             dtype=float,
@@ -1707,7 +1764,21 @@ class SymmStructureAnalyzer:
                     f"database_active_ops={[int(idx) + 1 for idx in active_db_ops]}"
                 )
 
-            resolution.cornwell_satisfied = self._cornwell_condition_satisfied(k, operations, lkg)
+            self._validate_representative_little_group(
+                k_direct=k,
+                resolution=resolution,
+                active_operation_indices=active_ops,
+                table_operation_indices=table_ops,
+                database_operation_indices=active_db_ops,
+            )
+            character_k_direct = self._representative_k_direct(resolution, k)
+            character_operation_indices = list(active_db_ops)
+            resolution.cornwell_satisfied = self._cornwell_condition_satisfied(
+                character_k_direct,
+                operations,
+                [int(idx) + 1 for idx in character_operation_indices],
+            )
+            resolution.phase_from_source_operations = bool(phase_from_source_operations)
             records.append(
                 {
                     "k_index": ik,
@@ -1716,9 +1787,12 @@ class SymmStructureAnalyzer:
                     "active_operation_indices": active_ops,
                     "table_operation_indices": table_ops,
                     "database_operation_indices": active_db_ops,
+                    "character_k_direct": character_k_direct,
+                    "character_operation_indices": character_operation_indices,
                     "resolution": resolution,
                     "k_name": resolution.entry.name,
                     "cornwell_satisfied": resolution.cornwell_satisfied,
+                    "phase_from_source_operations": resolution.phase_from_source_operations,
                     "mapped_k_direct": np.asarray(
                         getattr(resolution, "mapped_k_prim", np.asarray(k, dtype=float)),
                         dtype=float,
@@ -1923,7 +1997,10 @@ class SymmStructureAnalyzer:
         cls._write_report_separator(fp)
 
     def _write_symmetry_operations(self, fp, operations: list[SymmetryOperation]):
-        fp.write("SYMMETRY OPERATIONS(primitive basis) Pi={Ri|taui+tm}\n")
+        separator = "---------------------------------------------------------------------------------------\n"
+        fp.write("Symmetry operations Pi={Ri|taui+tm}\n")
+        fp.write("note: primitive basis, original stru(no origin shift)\n")
+        fp.write(separator)
 
         for i, op in enumerate(operations, start=1):
             r_rows = self._collect_matrix_rows(op.rotation)
@@ -1960,10 +2037,25 @@ class SymmStructureAnalyzer:
                 f" {c_rows[2][0]:7.3f}{c_rows[2][1]:7.3f}{c_rows[2][2]:7.3f} {eul[2]:7.3f}"
                 f" {self._format_spin_row(u[1, 0], u[1, 1])}\n"
             )
-            fp.write("\n")
+            fp.write(separator)
 
-    def _write_k_little_group_table(self, fp, operations: list[SymmetryOperation], db: KLittleGroupsDB, kpoints_direct: np.ndarray):
-        for record in self._resolve_kpoint_records(operations, db, kpoints_direct):
+    def _write_k_little_group_table(
+        self,
+        fp,
+        operations: list[SymmetryOperation],
+        db: KLittleGroupsDB,
+        kpoints_direct: np.ndarray,
+        *,
+        phase_operations: list[SymmetryOperation] | None = None,
+        phase_from_source_operations: bool = False,
+    ):
+        table_phase_operations = operations if phase_operations is None else phase_operations
+        for record in self._resolve_kpoint_records(
+            operations,
+            db,
+            kpoints_direct,
+            phase_from_source_operations=phase_from_source_operations,
+        ):
             ik = int(record["k_index"])
             k = np.asarray(record["k_direct"], dtype=float)
             resolution = record["resolution"]
@@ -2007,15 +2099,16 @@ class SymmStructureAnalyzer:
             k_star_conv = np.asarray(resolution.k_conv, dtype=float)
             fp.write(f"Primitive    basis  {k_star_prim[0]: .6f} {k_star_prim[1]: .6f} {k_star_prim[2]: .6f}\n")
             fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
+            display_db_ops = list(record.get("database_operation_indices", table_db_ops))
             fp.write(
-                f"{len(active_db_ops)} symmetry operations (module lattice translations) "
+                f"{len(display_db_ops)} symmetry operations (module lattice translations) "
                 f"in space group {db.path.stem.split('_')[-1]}\n"
             )
             fp.write(
                 f"{match.antisym:5d} : the existence of antiunitary symmetries. 1-exist; 0-no\n"
             )
             fp.write(" Reality")
-            for idx in active_db_ops:
+            for idx in display_db_ops:
                 fp.write(f"{idx + 1:12d}")
             fp.write("\n")
 
@@ -2024,10 +2117,10 @@ class SymmStructureAnalyzer:
                 traces = db.irrep_table_character_slice(
                     resolution,
                     ir,
-                    active_db_ops,
-                    table_db_ops,
-                    phase_k_direct=k,
-                    phase_operations=operations,
+                    display_db_ops,
+                    display_db_ops,
+                    phase_k_direct=k_star_prim,
+                    phase_operations=table_phase_operations,
                 )
                 fp.write(f"{ir.reality:5d}   {display_name:<6s}")
                 for value in traces:
@@ -2038,7 +2131,7 @@ class SymmStructureAnalyzer:
                 current_is_single = not ir.raw_name.startswith("-")
                 if current_is_single and next_is_double:
                     fp.write("        ")
-                    fp.write("-" * (12 * len(active_db_ops)))
+                    fp.write("-" * (12 * len(display_db_ops)))
                     fp.write("\n")
 
             fp.write("\n")
@@ -2050,7 +2143,7 @@ class SymmStructureAnalyzer:
                 f"{'symmetry ops':^{col_ops}s}"
                 f"{'main axes':^{col_axis}s}\n"
             )
-            for idx in active_db_ops:
+            for idx in display_db_ops:
                 op = operations[idx]
                 axis_text = f"({op.axis[0]:7.3f}, {op.axis[1]:7.3f}, {op.axis[2]:7.3f})"
                 fp.write(
@@ -2241,6 +2334,11 @@ class SymmStructureAnalyzer:
                 )
                 del source_align_error
                 match_summary_ok, match_summary_details = self._database_alignment_summary(database_aligned_operations, db)
+        phase_from_source_operations = self._origin_shift_applied(
+            source_to_std_origin_shift,
+            database_origin_shift,
+            tol=align_tol,
+        )
         kpoint_records = []
         if canonical_kpoints.size > 0:
             kpoint_records = self._resolve_kpoint_records(
@@ -2248,6 +2346,7 @@ class SymmStructureAnalyzer:
                 db,
                 canonical_kpoints,
                 current_to_db_prim=current_to_db_prim,
+                phase_from_source_operations=phase_from_source_operations,
             )
 
         if RANK == 0:
@@ -2384,11 +2483,7 @@ class SymmStructureAnalyzer:
                 reordered_ops,
             )
             structure_atoms_reordered = self._atom_mapping_reordered(standardization_result)
-            origin_redefined = self._origin_shift_applied(
-                source_to_std_origin_shift,
-                database_origin_shift,
-                tol=align_tol,
-            )
+            origin_redefined = phase_from_source_operations
             with report_path.open("w", encoding="utf-8") as f:
                 self._write_report_header(
                     f,
@@ -2408,9 +2503,16 @@ class SymmStructureAnalyzer:
                     database_origin_shift=database_origin_shift,
                 )
                 self._write_transformations(f, source_atoms, std_atoms, spgfile, standardization_result)
-                self._write_symmetry_operations(f, reordered_ops)
+                self._write_symmetry_operations(f, source_operations)
                 if canonical_kpoints.size > 0:
-                    self._write_k_little_group_table(f, reordered_ops, db, canonical_kpoints)
+                    self._write_k_little_group_table(
+                        f,
+                        reordered_ops,
+                        db,
+                        canonical_kpoints,
+                        phase_operations=source_operations,
+                        phase_from_source_operations=phase_from_source_operations,
+                    )
 
             with open(RUNNING_LOG, "a", encoding="utf-8") as f:
                 f.write("\nSymmetry detection summary ==> \n")
@@ -2618,6 +2720,11 @@ class SymmStructureAnalyzer:
             if kpoints_direct is None
             else np.asarray(kpoints_direct, dtype=float)
         )
+        phase_from_source_operations = self._origin_shift_applied(
+            source_to_std_origin_shift,
+            origin_shift,
+            tol=max(1.0e-6, map_tol * 10.0),
+        )
         kpoint_records = []
         if canonical_kpoints.size > 0:
             kpoint_records = self._resolve_kpoint_records(
@@ -2625,6 +2732,7 @@ class SymmStructureAnalyzer:
                 db,
                 canonical_kpoints,
                 current_to_db_prim=current_to_db_prim,
+                phase_from_source_operations=phase_from_source_operations,
             )
 
         standardization_result = self._finalize_standardization_result(
@@ -2657,11 +2765,7 @@ class SymmStructureAnalyzer:
                 reordered_ops,
             )
             structure_atoms_reordered = self._atom_mapping_reordered(standardization_result)
-            origin_redefined = self._origin_shift_applied(
-                source_to_std_origin_shift,
-                origin_shift,
-                tol=max(1.0e-6, map_tol * 10.0),
-            )
+            origin_redefined = phase_from_source_operations
             database_alignment_notes = []
             if origin_shift is not None and float(np.max(np.abs(origin_shift))) > max(1.0e-6, map_tol * 10.0):
                 database_alignment_notes.extend(
@@ -2707,9 +2811,16 @@ class SymmStructureAnalyzer:
                             f.write(f"  - reorder note: {warning}\n")
                     f.write("\n")
                 self._write_transformations(f, source_atoms, std_atoms, spgfile, standardization_result)
-                self._write_symmetry_operations(f, reordered_ops)
+                self._write_symmetry_operations(f, source_unitary_ops)
                 if canonical_kpoints.size > 0:
-                    self._write_k_little_group_table(f, reordered_ops, db, canonical_kpoints)
+                    self._write_k_little_group_table(
+                        f,
+                        reordered_ops,
+                        db,
+                        canonical_kpoints,
+                        phase_operations=source_unitary_ops,
+                        phase_from_source_operations=phase_from_source_operations,
+                    )
 
             with open(RUNNING_LOG, "a", encoding="utf-8") as f:
                 f.write("\nMagnetic symmetry detection summary ==> \n")

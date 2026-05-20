@@ -24,7 +24,8 @@ def _filter_irreps_by_spin(reolution_irreps, spinful: bool | None):
     filtered = []
     for irrep in irreps:
         raw_name = getattr(irrep, "raw_name", getattr(irrep, "name", ""))
-        is_double_valued = str(raw_name).startswith("-")
+        reality = int(getattr(irrep, "reality", 1))
+        is_double_valued = str(raw_name).startswith("-") and reality == -1
         if spinful and is_double_valued:
             filtered.append(irrep)
         if not spinful and not is_double_valued:
@@ -39,6 +40,28 @@ def _current_operation_phase(k_direct, operation) -> complex:
         return 1.0 + 0.0j
     angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
     return np.exp(1j * angle)
+
+
+def _source_phase_override_enabled(resolution) -> bool:
+    return bool(getattr(resolution, "phase_from_source_operations", False)) and bool(
+        getattr(resolution, "cornwell_satisfied", True)
+    )
+
+
+def _phase_is_nontrivial(phase: complex, tol: float = 1.0e-8) -> bool:
+    return abs(complex(phase) - (1.0 + 0.0j)) > tol
+
+
+def _should_use_operation_phase(phase_kind: int, resolution, phase: complex) -> bool:
+    if int(phase_kind) == 2:
+        return _source_phase_override_enabled(resolution)
+    if int(phase_kind) != 1:
+        return False
+    return _source_phase_override_enabled(resolution) and _phase_is_nontrivial(phase)
+
+
+def _should_use_coeff_phase(phase_kind: int, resolution) -> bool:
+    return int(phase_kind) == 2 and not _source_phase_override_enabled(resolution)
 
 
 def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_operations=None) -> np.ndarray:
@@ -60,12 +83,14 @@ def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_ope
 
     k_conv = np.asarray(getattr(resolution, "k_conv", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
     for j in range(count):
-        if phase_kinds[j] == 2:
-            if phase_k_direct is not None and phase_operations is not None and j < len(phase_operations):
-                table[j] *= _current_operation_phase(phase_k_direct, phase_operations[j])
-            elif k_conv.size >= 3:
-                angle = -np.pi * float(np.dot(coeff_uvw[j, :3], k_conv[:3]))
-                table[j] *= np.exp(1j * angle)
+        phase_kind = int(phase_kinds[j])
+        if _should_use_coeff_phase(phase_kind, resolution) and k_conv.size >= 3:
+            angle = -np.pi * float(np.dot(coeff_uvw[j, :3], k_conv[:3]))
+            table[j] *= np.exp(1j * angle)
+        elif phase_k_direct is not None and phase_operations is not None and j < len(phase_operations):
+            phase = _current_operation_phase(phase_k_direct, phase_operations[j])
+            if _should_use_operation_phase(phase_kind, resolution, phase):
+                table[j] *= phase
     return table
 
 
@@ -96,16 +121,24 @@ def _resolved_irrep_character_slice(
             values.append(np.nan + 0.0j)
             continue
         value = raw_table[int(table_idx)]
-        if table_idx < phase_kinds.size and phase_kinds[int(table_idx)] == 2:
+        phase_kind = int(phase_kinds[int(table_idx)]) if table_idx < phase_kinds.size else 1
+        if table_idx < phase_kinds.size:
             if (
+                _should_use_coeff_phase(phase_kind, resolution)
+                and coeff_uvw.ndim == 2
+                and coeff_uvw.shape[1] >= 3
+                and k_conv.size >= 3
+            ):
+                angle = -np.pi * float(np.dot(coeff_uvw[int(table_idx), :3], k_conv[:3]))
+                value *= np.exp(1j * angle)
+            elif (
                 phase_k_direct is not None
                 and phase_operations is not None
                 and int(active_idx) < len(phase_operations)
             ):
-                value *= _current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-            elif coeff_uvw.ndim == 2 and coeff_uvw.shape[1] >= 3 and k_conv.size >= 3:
-                angle = -np.pi * float(np.dot(coeff_uvw[int(table_idx), :3], k_conv[:3]))
-                value *= np.exp(1j * angle)
+                phase = _current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+                if _should_use_operation_phase(phase_kind, resolution, phase):
+                    value *= phase
         values.append(value)
     return np.asarray(values, dtype=complex)
 

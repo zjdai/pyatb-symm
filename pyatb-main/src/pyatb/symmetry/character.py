@@ -118,6 +118,19 @@ class Character:
         return grouped
 
     @staticmethod
+    def _record_character_kpoint(record: dict, fallback: np.ndarray) -> np.ndarray:
+        value = record.get("character_k_direct")
+        if value is None:
+            resolution = record.get("resolution")
+            if resolution is not None:
+                value = getattr(resolution, "rotated_k_prim", None)
+                if value is None:
+                    value = getattr(resolution, "mapped_k_prim", None)
+        if value is None:
+            value = fallback
+        return np.asarray(value, dtype=float).reshape(3)
+
+    @staticmethod
     def _analysis_operations_to_covariance_operations(operations: list) -> list[dict]:
         converted: list[dict] = []
         for index, operation in enumerate(operations, start=1):
@@ -373,11 +386,16 @@ class Character:
             for record in kpoint_records
             if (int(record["k_index"]) - 1) % max(int(SIZE), 1) == int(RANK)
         ]
-        local_k_indices = sorted({int(record["k_index"]) - 1 for record in local_records})
-        local_index_map = {k_index: local_pos for local_pos, k_index in enumerate(local_k_indices)}
-
-        if local_k_indices:
-            local_kpoints = np.asarray(kpoints_direct, dtype=float)[local_k_indices]
+        if local_records:
+            local_kpoints = np.vstack(
+                [
+                    self._record_character_kpoint(
+                        record,
+                        np.asarray(kpoints_direct, dtype=float)[int(record["k_index"]) - 1],
+                    )
+                    for record in local_records
+                ]
+            )
             eigenvectors, eigenvalues = self._tb.tb_solver.diago_H(local_kpoints)
             overlaps = self._tb.tb_solver.get_Sk(local_kpoints)
         else:
@@ -385,23 +403,30 @@ class Character:
 
         rows: list[dict] = []
 
-        for record in local_records:
+        for local_pos, record in enumerate(local_records):
             k_index = int(record["k_index"]) - 1
-            local_pos = local_index_map[k_index]
             active_operation_indices = list(record.get("active_operation_indices", []))
             if not active_operation_indices:
                 continue
             table_operation_indices = list(record.get("table_operation_indices", active_operation_indices))
-            active_operation_labels = [str(op_index + 1) for op_index in active_operation_indices]
+            character_operation_indices = list(
+                record.get("character_operation_indices")
+                or record.get("database_operation_indices")
+                or table_operation_indices
+            )
+            if not character_operation_indices:
+                continue
+            character_k_direct = self._record_character_kpoint(record, kpoints_direct[k_index])
+            active_operation_labels = [str(op_index + 1) for op_index in character_operation_indices]
 
             op_matrices = [
                 build_dk_matrix(
                     self._tb,
-                    kpoints_direct[k_index],
+                    character_k_direct,
                     source_operations[op_index],
                     map_tol=float(symm_prec),
                 )
-                for op_index in active_operation_indices
+                for op_index in character_operation_indices
             ]
             groups = group_degenerate_bands(eigenvalues[local_pos], tol=5.0e-4)
 
@@ -419,12 +444,12 @@ class Character:
                     irrep = assign_irrep_combination(
                         characters,
                         record["resolution"],
-                        active_operation_indices,
+                        character_operation_indices,
                         max_terms=max_irrep_terms,
                         tol=5.0e-2,
                         spinful=int(getattr(self._tb, "nspin", 1)) == 4,
-                        table_operation_indices=table_operation_indices,
-                        phase_k_direct=kpoints_direct[k_index],
+                        table_operation_indices=character_operation_indices,
+                        phase_k_direct=character_k_direct,
                         phase_operations=source_operations,
                     )
                 except Exception:
@@ -432,12 +457,12 @@ class Character:
                         irrep = assign_irrep_combination(
                             characters,
                             record["resolution"],
-                            active_operation_indices,
+                            character_operation_indices,
                             max_terms=max_irrep_terms,
                             tol=1.0e-1,
                             spinful=int(getattr(self._tb, "nspin", 1)) == 4,
-                            table_operation_indices=table_operation_indices,
-                            phase_k_direct=kpoints_direct[k_index],
+                            table_operation_indices=character_operation_indices,
+                            phase_k_direct=character_k_direct,
                             phase_operations=source_operations,
                         )
                     except Exception:
@@ -450,8 +475,8 @@ class Character:
                         "start_band": group_start + 1,
                         "degeneracy": group_stop - group_start + 1,
                         "energy": float(np.mean(eigenvalues[local_pos, group_start : group_stop + 1])),
-                        "active_operation_indices": active_operation_indices,
-                        "table_operation_indices": table_operation_indices,
+                        "active_operation_indices": character_operation_indices,
+                        "table_operation_indices": character_operation_indices,
                         "active_operation_labels": active_operation_labels,
                         "characters": characters,
                         "irrep": irrep,
