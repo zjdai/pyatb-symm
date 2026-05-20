@@ -32,17 +32,22 @@ def _filter_irreps_by_spin(reolution_irreps, spinful: bool | None):
     return filtered or irreps
 
 
-def _resolved_irrep_characters(irrep, resolution) -> np.ndarray:
+def _current_operation_phase(k_direct, operation) -> complex:
+    k = np.asarray(k_direct, dtype=float).reshape(-1)
+    tau = np.asarray(getattr(operation, "translation", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
+    if k.size < 3 or tau.size < 3:
+        return 1.0 + 0.0j
+    angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
+    return np.exp(1j * angle)
+
+
+def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_operations=None) -> np.ndarray:
     table = np.asarray(getattr(irrep, "characters", []), dtype=complex).reshape(-1).copy()
     if table.size == 0 or resolution is None:
         return table
 
     if not bool(getattr(resolution, "cornwell_satisfied", True)):
         table = np.conj(table)
-
-    k_conv = np.asarray(getattr(resolution, "k_conv", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
-    if k_conv.size < 3:
-        return table
 
     phase_kinds = np.asarray(getattr(irrep, "phase_kinds", []), dtype=int).reshape(-1)
     coeff_uvw = np.asarray(getattr(irrep, "coeff_uvw", []), dtype=float)
@@ -53,12 +58,56 @@ def _resolved_irrep_characters(irrep, resolution) -> np.ndarray:
     if count <= 0:
         return table
 
-    # Keep the same convention as D(k,g) in PYATB: exp(-i*pi*uvw·k_conv).
+    k_conv = np.asarray(getattr(resolution, "k_conv", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
     for j in range(count):
         if phase_kinds[j] == 2:
-            angle = -np.pi * float(np.dot(coeff_uvw[j, :3], k_conv[:3]))
-            table[j] *= np.exp(1j * angle)
+            if phase_k_direct is not None and phase_operations is not None and j < len(phase_operations):
+                table[j] *= _current_operation_phase(phase_k_direct, phase_operations[j])
+            elif k_conv.size >= 3:
+                angle = -np.pi * float(np.dot(coeff_uvw[j, :3], k_conv[:3]))
+                table[j] *= np.exp(1j * angle)
     return table
+
+
+def _resolved_irrep_character_slice(
+    irrep,
+    resolution,
+    active_operation_indices,
+    table_operation_indices,
+    phase_k_direct=None,
+    phase_operations=None,
+) -> np.ndarray:
+    raw_table = np.asarray(getattr(irrep, "characters", []), dtype=complex).reshape(-1).copy()
+    if raw_table.size == 0 or resolution is None:
+        return raw_table
+
+    if not bool(getattr(resolution, "cornwell_satisfied", True)):
+        raw_table = np.conj(raw_table)
+
+    active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
+    table_active = np.asarray(table_operation_indices, dtype=int).reshape(-1)
+    phase_kinds = np.asarray(getattr(irrep, "phase_kinds", []), dtype=int).reshape(-1)
+    coeff_uvw = np.asarray(getattr(irrep, "coeff_uvw", []), dtype=float)
+    k_conv = np.asarray(getattr(resolution, "k_conv", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
+
+    values: list[complex] = []
+    for active_idx, table_idx in zip(active, table_active):
+        if table_idx < 0 or table_idx >= raw_table.size:
+            values.append(np.nan + 0.0j)
+            continue
+        value = raw_table[int(table_idx)]
+        if table_idx < phase_kinds.size and phase_kinds[int(table_idx)] == 2:
+            if (
+                phase_k_direct is not None
+                and phase_operations is not None
+                and int(active_idx) < len(phase_operations)
+            ):
+                value *= _current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+            elif coeff_uvw.ndim == 2 and coeff_uvw.shape[1] >= 3 and k_conv.size >= 3:
+                angle = -np.pi * float(np.dot(coeff_uvw[int(table_idx), :3], k_conv[:3]))
+                value *= np.exp(1j * angle)
+        values.append(value)
+    return np.asarray(values, dtype=complex)
 
 
 def group_degenerate_bands(energies: np.ndarray, tol: float = 5.0e-4) -> list[tuple[int, int]]:
@@ -83,6 +132,8 @@ def assign_irrep_from_characters(
     tol: float = 1.0e-6,
     spinful: bool | None = None,
     table_operation_indices: list[int] | np.ndarray | None = None,
+    phase_k_direct=None,
+    phase_operations=None,
 ):
     target = np.asarray(characters, dtype=complex).reshape(-1)
     active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
@@ -95,10 +146,17 @@ def assign_irrep_from_characters(
     best_name = None
     best_error = np.inf
     for irrep in _filter_irreps_by_spin(resolution.entry.irreps, spinful):
-        table = _resolved_irrep_characters(irrep, resolution)
-        if np.max(table_active, initial=-1) >= table.size:
+        table = _resolved_irrep_character_slice(
+            irrep,
+            resolution,
+            active,
+            table_active,
+            phase_k_direct=phase_k_direct,
+            phase_operations=phase_operations,
+        )
+        if table.size != target.size:
             continue
-        diff = table[table_active] - target
+        diff = table - target
         err = float(np.max(np.abs(diff))) if diff.size else 0.0
         if err < best_error:
             best_error = err
@@ -135,6 +193,8 @@ def assign_irrep_combination(
     tol: float = 5.0e-2,
     spinful: bool | None = None,
     table_operation_indices: list[int] | np.ndarray | None = None,
+    phase_k_direct=None,
+    phase_operations=None,
 ):
     active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
     table_active = active if table_operation_indices is None else np.asarray(table_operation_indices, dtype=int).reshape(-1)
@@ -147,10 +207,17 @@ def assign_irrep_combination(
     sliced_tables = []
     irrep_labels = []
     for idx, irrep in enumerate(irreps):
-        table = _resolved_irrep_characters(irrep, resolution)
-        if np.max(table_active, initial=-1) >= table.size:
+        table = _resolved_irrep_character_slice(
+            irrep,
+            resolution,
+            active,
+            table_active,
+            phase_k_direct=phase_k_direct,
+            phase_operations=phase_operations,
+        )
+        if table.size != target.size:
             continue
-        sliced_tables.append(table[table_active])
+        sliced_tables.append(table)
         irrep_labels.append(getattr(irrep, "name", getattr(irrep, "raw_name", f"irrep{idx + 1}")))
 
     best = None

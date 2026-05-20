@@ -414,15 +414,18 @@ class Character:
                     operation_matrices=op_matrices,
                     band_range=(group_start, group_stop),
                 )
+                max_irrep_terms = max(4, int(group_stop) - int(group_start) + 1)
                 try:
                     irrep = assign_irrep_combination(
                         characters,
                         record["resolution"],
                         active_operation_indices,
-                        max_terms=4,
+                        max_terms=max_irrep_terms,
                         tol=5.0e-2,
                         spinful=int(getattr(self._tb, "nspin", 1)) == 4,
                         table_operation_indices=table_operation_indices,
+                        phase_k_direct=kpoints_direct[k_index],
+                        phase_operations=source_operations,
                     )
                 except Exception:
                     try:
@@ -430,10 +433,12 @@ class Character:
                             characters,
                             record["resolution"],
                             active_operation_indices,
-                            max_terms=4,
+                            max_terms=max_irrep_terms,
                             tol=1.0e-1,
                             spinful=int(getattr(self._tb, "nspin", 1)) == 4,
                             table_operation_indices=table_operation_indices,
+                            phase_k_direct=kpoints_direct[k_index],
+                            phase_operations=source_operations,
                         )
                     except Exception:
                         irrep = "??"

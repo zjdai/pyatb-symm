@@ -1781,6 +1781,130 @@ class SymmStructureAnalyzer:
         fp.write("Little group file :\n")
         fp.write(f"{spgfile.resolve()}\n\n")
 
+    @staticmethod
+    def _dataset_value(dataset, key: str, default=None):
+        if isinstance(dataset, dict):
+            return dataset.get(key, default)
+        return getattr(dataset, key, default)
+
+    @staticmethod
+    def _matrix_is_identity(matrix, tol: float = 1.0e-8) -> bool:
+        arr = np.asarray(matrix, dtype=float)
+        if arr.shape != (3, 3):
+            return False
+        return bool(np.allclose(arr, np.eye(3), atol=tol))
+
+    @staticmethod
+    def _origin_shift_applied(*shifts, tol: float = 1.0e-8) -> bool:
+        for shift in shifts:
+            if shift is None:
+                continue
+            arr = np.asarray(shift, dtype=float).reshape(-1)
+            if arr.size >= 3 and float(np.max(np.abs(arr[:3]))) > tol:
+                return True
+        return False
+
+    @staticmethod
+    def _atom_mapping_reordered(standardization_result: dict) -> bool:
+        for item in standardization_result.get("atom_mapping", []):
+            try:
+                if int(item.get("old_atom", -1)) != int(item.get("new_atom", -1)):
+                    return True
+            except AttributeError:
+                continue
+        return False
+
+    @classmethod
+    def _operations_sequence_reordered(
+        cls,
+        reference_operations: list[SymmetryOperation],
+        reordered_operations: list[SymmetryOperation],
+    ) -> bool:
+        if len(reference_operations) != len(reordered_operations):
+            return True
+        for ref, current in zip(reference_operations, reordered_operations):
+            if not cls._rotation_match(ref.rotation, current.rotation):
+                return True
+            if not cls._translation_match(ref.translation, current.translation):
+                return True
+        return False
+
+    @classmethod
+    def _operation_basis_conversion_applied(
+        cls,
+        current_to_db_prim: np.ndarray | None,
+        match_summary_details: list[str] | None,
+        reorder_warnings: list[str] | None,
+    ) -> bool:
+        if current_to_db_prim is not None and not cls._matrix_is_identity(current_to_db_prim):
+            return True
+        text = "\n".join((match_summary_details or []) + (reorder_warnings or [])).lower()
+        return "basis conversion" in text or "conventional-to-primitive" in text
+
+    @classmethod
+    def _write_report_matrix(cls, fp, title: str, matrix) -> None:
+        fp.write(f"{title}\n")
+        arr = np.asarray(matrix, dtype=float)
+        for i in range(3):
+            fp.write(f"  {arr[i, 0]:16.8f}{arr[i, 1]:16.8f}{arr[i, 2]:16.8f}\n")
+
+    @classmethod
+    def _write_report_header(
+        cls,
+        fp,
+        *,
+        detected_group: int,
+        resolved_group: int,
+        dataset,
+        db: KLittleGroupsDB,
+        current_to_db_prim: np.ndarray | None,
+        standardization_result: dict,
+        operation_basis_conversion: bool,
+        symmetry_operations_reordered: bool,
+        structure_atoms_reordered: bool,
+        origin_redefined: bool,
+        source_to_standard_origin_shift=None,
+        database_origin_shift=None,
+    ) -> None:
+        symbol = cls._dataset_value(dataset, "international", "")
+        hall = cls._dataset_value(dataset, "hall", "")
+        symbol_text = f" ({symbol})" if symbol else ""
+        hall_text = f", Hall symbol {hall}" if hall else ""
+        fp.write(
+            "Preprocessing flags: "
+            f"operation_pc_to_sc_conversion={'yes' if operation_basis_conversion else 'no'}; "
+            f"symmetry_operations_reordered={'yes' if symmetry_operations_reordered else 'no'}; "
+            f"structure_atoms_reordered={'yes' if structure_atoms_reordered else 'no'}; "
+            f"origin_redefined={'yes' if origin_redefined else 'no'}\n"
+        )
+        fp.write(f"spglib determined space group No. {int(detected_group)}{symbol_text}{hall_text}.\n")
+        fp.write(f"The kLittleGroups character table number is No. {int(resolved_group)}.\n")
+        fp.write(f"The CHARACTER.group number used by pyatb is No. {int(resolved_group)}.\n")
+        fp.write(f"kLittleGroups space-group symbol: {db.spacegroup_symbol}\n")
+        fp.write(f"structure_standardized: {'yes' if standardization_result.get('need_rebuild_hs') else 'no'}\n")
+        fp.write(f"standardization_rebuild_reason: {standardization_result.get('rebuild_reason', 'unknown')}\n")
+        source_shift = np.zeros(3, dtype=float) if source_to_standard_origin_shift is None else source_to_standard_origin_shift
+        database_shift = np.zeros(3, dtype=float) if database_origin_shift is None else database_origin_shift
+        fp.write(f"source_to_standard_origin_shift: {cls._format_translation(source_shift)}\n")
+        fp.write(f"database_matching_origin_shift_primitive: {cls._format_translation(database_shift)}\n")
+        cls._write_report_matrix(
+            fp,
+            "Conventional-to-primitive cell transformation matrix in kLittleGroups convention:",
+            db.kc2p,
+        )
+        cls._write_report_matrix(
+            fp,
+            "Primitive-to-conventional cell transformation matrix in kLittleGroups convention:",
+            db.p2c,
+        )
+        applied_k_basis = np.eye(3, dtype=float) if current_to_db_prim is None else current_to_db_prim
+        cls._write_report_matrix(
+            fp,
+            "Applied k-basis transformation matrix actually used for k-point matching (current primitive to kLittleGroups primitive):",
+            applied_k_basis,
+        )
+        fp.write("\n")
+
     def _write_symmetry_operations(self, fp, operations: list[SymmetryOperation]):
         fp.write("SYMMETRY OPERATIONS Pi={Ri|taui+tm}\n")
         fp.write("  Ri     taui   inv(Ri) Ri(Cartesian coord)  Eulers angles  spin transf.\n\n")
@@ -1854,10 +1978,17 @@ class SymmStructureAnalyzer:
 
             for ir_index, ir in enumerate(match.irreps):
                 display_name = ir.raw_name[1:] if ir.raw_name.startswith("-") else ir.raw_name
-                traces = db.irrep_table_characters(resolution, ir)
+                traces = db.irrep_table_character_slice(
+                    resolution,
+                    ir,
+                    active_db_ops,
+                    table_db_ops,
+                    phase_k_direct=k,
+                    phase_operations=operations,
+                )
                 fp.write(f"{ir.reality:5d}   {display_name:<6s}")
-                for idx in table_db_ops:
-                    fp.write(f"{self._format_complex(traces[idx]):>12s}")
+                for value in traces:
+                    fp.write(f"{self._format_complex(value):>12s}")
                 fp.write("\n")
 
                 next_is_double = ir_index + 1 < len(match.irreps) and match.irreps[ir_index + 1].raw_name.startswith("-")
@@ -2030,16 +2161,19 @@ class SymmStructureAnalyzer:
                 self._build_symmetry_operations(shifted_std_atoms, shifted_sym_data)
             )
         if bool(standardization_result["need_rebuild_hs"]):
+            operation_order_reference = database_aligned_operations
             reordered_ops, reorder_warnings = self._reorder_operations_with_database(database_aligned_operations, db)
             reorder_warnings = database_alignment_warnings + reorder_warnings
             aligned_source_ops = list(reordered_ops)
             match_summary_ok, match_summary_details = self._database_alignment_summary(database_aligned_operations, db)
         else:
             try:
+                operation_order_reference = source_operations
                 reordered_ops, reorder_warnings = self._reorder_operations_with_database(source_operations, db)
                 aligned_source_ops = list(reordered_ops)
                 match_summary_ok, match_summary_details = self._database_alignment_summary(source_operations, db)
             except ValueError as source_align_error:
+                operation_order_reference = database_aligned_operations
                 reordered_ops, reorder_warnings = self._reorder_operations_with_database(database_aligned_operations, db)
                 reorder_warnings = database_alignment_warnings + reorder_warnings
                 aligned_source_ops = self._align_operations_to_reference(
@@ -2183,7 +2317,37 @@ class SymmStructureAnalyzer:
                     if p.exists():
                         p.unlink()
 
+            operation_basis_conversion = self._operation_basis_conversion_applied(
+                current_to_db_prim,
+                match_summary_details,
+                reorder_warnings,
+            )
+            symmetry_operations_reordered = self._operations_sequence_reordered(
+                operation_order_reference,
+                reordered_ops,
+            )
+            structure_atoms_reordered = self._atom_mapping_reordered(standardization_result)
+            origin_redefined = self._origin_shift_applied(
+                source_to_std_origin_shift,
+                database_origin_shift,
+                tol=align_tol,
+            )
             with report_path.open("w", encoding="utf-8") as f:
+                self._write_report_header(
+                    f,
+                    detected_group=detected_group,
+                    resolved_group=resolved_group,
+                    dataset=dataset,
+                    db=db,
+                    current_to_db_prim=current_to_db_prim,
+                    standardization_result=standardization_result,
+                    operation_basis_conversion=operation_basis_conversion,
+                    symmetry_operations_reordered=symmetry_operations_reordered,
+                    structure_atoms_reordered=structure_atoms_reordered,
+                    origin_redefined=origin_redefined,
+                    source_to_standard_origin_shift=source_to_std_origin_shift,
+                    database_origin_shift=database_origin_shift,
+                )
                 f.write("Symmetry operation alignment summary:\n")
                 if match_summary_ok:
                     f.write("  - All spglib symmetry operations fully match the kLittleGroups table.\n")
@@ -2432,7 +2596,38 @@ class SymmStructureAnalyzer:
 
         if RANK == 0:
             report_path = self._output_path / "symmetry_character_report.txt"
+            operation_basis_conversion = self._operation_basis_conversion_applied(
+                current_to_db_prim,
+                match_summary_details,
+                reorder_warnings,
+            )
+            operation_order_reference = std_unitary_ops[: len(reordered_ops)]
+            symmetry_operations_reordered = self._operations_sequence_reordered(
+                operation_order_reference,
+                reordered_ops,
+            )
+            structure_atoms_reordered = self._atom_mapping_reordered(standardization_result)
+            origin_redefined = self._origin_shift_applied(
+                source_to_std_origin_shift,
+                origin_shift,
+                tol=max(1.0e-6, map_tol * 10.0),
+            )
             with report_path.open("w", encoding="utf-8") as f:
+                self._write_report_header(
+                    f,
+                    detected_group=detected_unitary_group,
+                    resolved_group=resolved_group,
+                    dataset={},
+                    db=db,
+                    current_to_db_prim=current_to_db_prim,
+                    standardization_result=standardization_result,
+                    operation_basis_conversion=operation_basis_conversion,
+                    symmetry_operations_reordered=symmetry_operations_reordered,
+                    structure_atoms_reordered=structure_atoms_reordered,
+                    origin_redefined=origin_redefined,
+                    source_to_standard_origin_shift=source_to_std_origin_shift,
+                    database_origin_shift=origin_shift,
+                )
                 f.write("Magnetic symmetry detection:\n")
                 f.write(f"Unitary operations form space group {detected_unitary_group}\n")
                 f.write(f"User requested space group {resolved_group}\n")

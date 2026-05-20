@@ -495,23 +495,70 @@ class KLittleGroupsDB:
             )
         return best[1]
 
-    def irrep_table_characters(self, resolution: KPointResolution, irrep: IrrepEntry) -> np.ndarray:
-        traces = np.zeros((self.doubnum,), dtype=complex)
+    @staticmethod
+    def _current_operation_phase(k_direct, operation) -> complex:
+        k = np.asarray(k_direct, dtype=float).reshape(-1)
+        tau = np.asarray(getattr(operation, "translation", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
+        if k.size < 3 or tau.size < 3:
+            return 1.0 + 0.0j
+        angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
+        return np.exp(1j * angle)
+
+    def irrep_table_character_slice(
+        self,
+        resolution: KPointResolution,
+        irrep: IrrepEntry,
+        active_operation_indices,
+        table_operation_indices,
+        phase_k_direct=None,
+        phase_operations=None,
+    ) -> np.ndarray:
         raw_characters = np.asarray(irrep.characters, dtype=complex)
         if not bool(getattr(resolution, "cornwell_satisfied", True)):
             raw_characters = np.conj(raw_characters)
-        for j in range(self.doubnum):
-            if not irrep.active_ops[j]:
+
+        active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
+        table_active = np.asarray(table_operation_indices, dtype=int).reshape(-1)
+        values: list[complex] = []
+        for active_idx, table_idx in zip(active, table_active):
+            if table_idx < 0 or table_idx >= raw_characters.size:
+                values.append(np.nan + 0.0j)
                 continue
-            if irrep.phase_kinds[j] == 1:
-                traces[j] = raw_characters[j]
-            elif irrep.phase_kinds[j] == 2:
-                # Keep phase convention consistent with D(k,g) and irrep matching:
-                # exp(-i*pi*uvw·k_conv)
-                angle = -np.pi * float(np.dot(irrep.coeff_uvw[j, :], resolution.k_conv))
-                traces[j] = raw_characters[j] * np.exp(1j * angle)
-            else:
-                raise ValueError(f"Unexpected phase kind {irrep.phase_kinds[j]} for irrep {irrep.name}.")
+            value = raw_characters[int(table_idx)]
+            if irrep.phase_kinds[int(table_idx)] == 2:
+                if (
+                    phase_k_direct is not None
+                    and phase_operations is not None
+                    and int(active_idx) < len(phase_operations)
+                ):
+                    value *= self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+                else:
+                    angle = -np.pi * float(np.dot(irrep.coeff_uvw[int(table_idx), :], resolution.k_conv))
+                    value *= np.exp(1j * angle)
+            elif irrep.phase_kinds[int(table_idx)] != 1:
+                raise ValueError(f"Unexpected phase kind {irrep.phase_kinds[int(table_idx)]} for irrep {irrep.name}.")
+            values.append(value)
+        return np.asarray(values, dtype=complex)
+
+    def irrep_table_characters(
+        self,
+        resolution: KPointResolution,
+        irrep: IrrepEntry,
+        phase_k_direct=None,
+        phase_operations=None,
+    ) -> np.ndarray:
+        traces = np.zeros((self.doubnum,), dtype=complex)
+        active = np.where(irrep.active_ops)[0]
+        values = self.irrep_table_character_slice(
+            resolution,
+            irrep,
+            active,
+            active,
+            phase_k_direct=phase_k_direct,
+            phase_operations=phase_operations,
+        )
+        for idx, value in zip(active, values):
+            traces[int(idx)] = value
         return traces
 
     def match_kpoint(self, k_prim: np.ndarray, detected_ops: list[int] | None = None, tol: float = 1e-4) -> KPointEntry | None:
