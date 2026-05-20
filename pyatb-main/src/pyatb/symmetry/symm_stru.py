@@ -1007,8 +1007,10 @@ class SymmStructureAnalyzer:
 
     @staticmethod
     def _format_translation(vec: np.ndarray) -> str:
-        arr = np.asarray(vec, dtype=float)
-        return "(" + ", ".join(f"{x:.8f}" for x in arr) + ")"
+        arr = np.asarray(vec, dtype=float).reshape(-1)
+        if arr.size == 0:
+            return "()"
+        return "(" + f"{arr[0]: .8f}" + "".join(f", {x:.8f}" for x in arr[1:]) + ")"
 
     @staticmethod
     def _database_operation_candidates(db_op, db: KLittleGroupsDB):
@@ -1730,7 +1732,7 @@ class SymmStructureAnalyzer:
         fp,
         source_atoms: Atoms,
         std_atoms: Atoms,
-        spgfile: Path,
+        _spgfile: Path,
         standardization_result: dict,
     ):
         lattice_old = np.asarray(source_atoms.cell.array, dtype=float)
@@ -1778,8 +1780,7 @@ class SymmStructureAnalyzer:
                 )
             fp.write("\n")
 
-        fp.write("Little group file :\n")
-        fp.write(f"{spgfile.resolve()}\n\n")
+        self._write_report_separator(fp)
 
     @staticmethod
     def _dataset_value(dataset, key: str, default=None):
@@ -1848,6 +1849,10 @@ class SymmStructureAnalyzer:
         for i in range(3):
             fp.write(f"  {arr[i, 0]:16.8f}{arr[i, 1]:16.8f}{arr[i, 2]:16.8f}\n")
 
+    @staticmethod
+    def _write_report_separator(fp) -> None:
+        fp.write("*********************************************************************************************\n")
+
     @classmethod
     def _write_report_header(
         cls,
@@ -1863,6 +1868,8 @@ class SymmStructureAnalyzer:
         symmetry_operations_reordered: bool,
         structure_atoms_reordered: bool,
         origin_redefined: bool,
+        spgfile: Path | None = None,
+        database_alignment_notes: list[str] | None = None,
         source_to_standard_origin_shift=None,
         database_origin_shift=None,
     ) -> None:
@@ -1891,16 +1898,15 @@ class SymmStructureAnalyzer:
             f"{'yes' if origin_redefined else 'no'} ; "
             "whether a fractional origin shift was used to align the structure or symmetry operations.\n"
         )
+        for note in database_alignment_notes or []:
+            fp.write(f"{note}\n")
+        fp.write(f"structure_standardized: {'yes' if standardization_result.get('need_rebuild_hs') else 'no'}\n")
+        fp.write(f"standardization_rebuild_reason: {standardization_result.get('rebuild_reason', 'unknown')}\n")
+        cls._write_report_separator(fp)
         fp.write(f"spglib determined space group No. {int(detected_group)}{symbol_text}{hall_text}.\n")
         fp.write(f"The kLittleGroups character table number is No. {int(resolved_group)}.\n")
         fp.write(f"The CHARACTER.group number used by pyatb is No. {int(resolved_group)}.\n")
         fp.write(f"kLittleGroups space-group symbol: {db.spacegroup_symbol}\n")
-        fp.write(f"structure_standardized: {'yes' if standardization_result.get('need_rebuild_hs') else 'no'}\n")
-        fp.write(f"standardization_rebuild_reason: {standardization_result.get('rebuild_reason', 'unknown')}\n")
-        source_shift = np.zeros(3, dtype=float) if source_to_standard_origin_shift is None else source_to_standard_origin_shift
-        database_shift = np.zeros(3, dtype=float) if database_origin_shift is None else database_origin_shift
-        fp.write(f"source_to_standard_origin_shift: {cls._format_translation(source_shift)}\n")
-        fp.write(f"database_matching_origin_shift_primitive: {cls._format_translation(database_shift)}\n")
         cls._write_report_matrix(
             fp,
             "Conventional-to-primitive cell transformation matrix in kLittleGroups convention:",
@@ -1911,11 +1917,13 @@ class SymmStructureAnalyzer:
             "Primitive-to-conventional cell transformation matrix in kLittleGroups convention:",
             db.p2c,
         )
-        fp.write("\n")
+        if spgfile is not None:
+            fp.write("Little group file :\n")
+            fp.write(f"{Path(spgfile).resolve()}\n")
+        cls._write_report_separator(fp)
 
     def _write_symmetry_operations(self, fp, operations: list[SymmetryOperation]):
-        fp.write("SYMMETRY OPERATIONS Pi={Ri|taui+tm}\n")
-        fp.write("  Ri     taui   inv(Ri) Ri(Cartesian coord)  Eulers angles  spin transf.\n\n")
+        fp.write("SYMMETRY OPERATIONS(primitive basis) Pi={Ri|taui+tm}\n")
 
         for i, op in enumerate(operations, start=1):
             r_rows = self._collect_matrix_rows(op.rotation)
@@ -1924,6 +1932,14 @@ class SymmStructureAnalyzer:
             eul = np.asarray(op.euler_zyz, dtype=float)
             u = op.spin_matrix
 
+            fp.write(f"{i} ({op.symbol}): {op.description}\n")
+            order = self._rotation_order_from_symbol(op.symbol)
+            if order > 2:
+                sense = "clockwise" if self._signed_rotation_angle(op.cart_rotation, op.axis) > 0.0 else "counterclockwise"
+                fp.write(f"{sense} rotation through ({op.axis[0]:6.3f}, {op.axis[1]:6.3f}, {op.axis[2]:6.3f})\n")
+            else:
+                fp.write(f"rotation through ({op.axis[0]:6.3f}, {op.axis[1]:6.3f}, {op.axis[2]:6.3f})\n")
+            fp.write("    Ri       taui   inv(Ri)   Ri(Cartesian coord)  Eulers angles       spin transf.\n")
             fp.write(
                 f" {int(r_rows[0][0]):2d} {int(r_rows[0][1]):2d} {int(r_rows[0][2]):2d}"
                 f" {op.translation[0]:7.3f}"
@@ -1944,15 +1960,7 @@ class SymmStructureAnalyzer:
                 f" {c_rows[2][0]:7.3f}{c_rows[2][1]:7.3f}{c_rows[2][2]:7.3f} {eul[2]:7.3f}"
                 f" {self._format_spin_row(u[1, 0], u[1, 1])}\n"
             )
-
-            fp.write(f" {i:3d} ({op.symbol})\n")
-            fp.write(f"{op.description}\n")
-            order = self._rotation_order_from_symbol(op.symbol)
-            if order > 2:
-                sense = "clockwise" if self._signed_rotation_angle(op.cart_rotation, op.axis) > 0.0 else "counterclockwise"
-                fp.write(f"{sense} rotation through ({op.axis[0]:6.3f}, {op.axis[1]:6.3f}, {op.axis[2]:6.3f})\n\n")
-            else:
-                fp.write(f"rotation through ({op.axis[0]:6.3f}, {op.axis[1]:6.3f}, {op.axis[2]:6.3f})\n\n")
+            fp.write("\n")
 
     def _write_k_little_group_table(self, fp, operations: list[SymmetryOperation], db: KLittleGroupsDB, kpoints_direct: np.ndarray):
         for record in self._resolve_kpoint_records(operations, db, kpoints_direct):
@@ -2161,12 +2169,19 @@ class SymmStructureAnalyzer:
         database_origin_shift = np.zeros(3, dtype=float)
         database_aligned_operations = operations
         database_alignment_warnings: list[str] = []
+        database_alignment_notes: list[str] = []
         solved_origin_shift = self._solve_origin_shift_from_operations(operations, db, tol=align_tol)
         if solved_origin_shift is not None and float(np.max(np.abs(solved_origin_shift))) > align_tol:
             database_origin_shift = np.asarray(solved_origin_shift, dtype=float)
             database_alignment_warnings.append(
                 "spglib operations matched kLittleGroups after primitive fractional origin shift "
                 f"{self._format_translation(database_origin_shift)}"
+            )
+            database_alignment_notes.extend(
+                [
+                    "spglib operations matched kLittleGroups after primitive fractional origin shift",
+                    f"primitive  basis: {self._format_translation(database_origin_shift)}",
+                ]
             )
         elif solved_origin_shift is None:
             conventional_origin_shift = self._solve_conventional_origin_shift_from_database(
@@ -2183,6 +2198,13 @@ class SymmStructureAnalyzer:
                     "spglib operations matched kLittleGroups after conventional fractional origin shift "
                     f"{self._format_translation(conventional_origin_shift)} "
                     f"(primitive {self._format_translation(database_origin_shift)})"
+                )
+                database_alignment_notes.extend(
+                    [
+                        "spglib operations matched kLittleGroups after conventional fractional origin shift",
+                        f"convention basis: {self._format_translation(conventional_origin_shift)}",
+                        f"primitive  basis: {self._format_translation(database_origin_shift)}",
+                    ]
                 )
         if float(np.max(np.abs(database_origin_shift))) > align_tol:
             shifted_std_atoms = std_atoms.copy()
@@ -2380,18 +2402,11 @@ class SymmStructureAnalyzer:
                     symmetry_operations_reordered=symmetry_operations_reordered,
                     structure_atoms_reordered=structure_atoms_reordered,
                     origin_redefined=origin_redefined,
+                    spgfile=spgfile,
+                    database_alignment_notes=database_alignment_notes,
                     source_to_standard_origin_shift=source_to_std_origin_shift,
                     database_origin_shift=database_origin_shift,
                 )
-                f.write("Symmetry operation alignment summary:\n")
-                if match_summary_ok:
-                    f.write("  - All spglib symmetry operations fully match the kLittleGroups table.\n")
-                for detail in match_summary_details:
-                    f.write(f"  - {detail}\n")
-                if reorder_warnings:
-                    for warning in reorder_warnings:
-                        f.write(f"  - reorder note: {warning}\n")
-                f.write("\n")
                 self._write_transformations(f, source_atoms, std_atoms, spgfile, standardization_result)
                 self._write_symmetry_operations(f, reordered_ops)
                 if canonical_kpoints.size > 0:
@@ -2647,6 +2662,14 @@ class SymmStructureAnalyzer:
                 origin_shift,
                 tol=max(1.0e-6, map_tol * 10.0),
             )
+            database_alignment_notes = []
+            if origin_shift is not None and float(np.max(np.abs(origin_shift))) > max(1.0e-6, map_tol * 10.0):
+                database_alignment_notes.extend(
+                    [
+                        "spglib operations matched kLittleGroups after primitive fractional origin shift",
+                        f"primitive  basis: {self._format_translation(origin_shift)}",
+                    ]
+                )
             with report_path.open("w", encoding="utf-8") as f:
                 self._write_report_header(
                     f,
@@ -2660,6 +2683,8 @@ class SymmStructureAnalyzer:
                     symmetry_operations_reordered=symmetry_operations_reordered,
                     structure_atoms_reordered=structure_atoms_reordered,
                     origin_redefined=origin_redefined,
+                    spgfile=spgfile,
+                    database_alignment_notes=database_alignment_notes,
                     source_to_standard_origin_shift=source_to_std_origin_shift,
                     database_origin_shift=origin_shift,
                 )
