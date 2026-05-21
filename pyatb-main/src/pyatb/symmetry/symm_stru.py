@@ -2100,6 +2100,16 @@ class SymmStructureAnalyzer:
             fp.write(f"Primitive    basis  {k_star_prim[0]: .6f} {k_star_prim[1]: .6f} {k_star_prim[2]: .6f}\n")
             fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
             display_db_ops = list(record.get("database_operation_indices", table_db_ops))
+            fp.write(f"Cornwell condition: {int(bool(getattr(resolution, 'cornwell_satisfied', True)))}\n")
+            if match.irreps:
+                phase_tags = np.asarray(match.irreps[0].phase_kinds, dtype=int).reshape(-1)
+                fp.write("Phase_kind")
+                for idx in display_db_ops:
+                    value = 0
+                    if 0 <= int(idx) < phase_tags.size:
+                        value = 1 if int(phase_tags[int(idx)]) == 2 else 0
+                    fp.write(f"{value:4d}")
+                fp.write("\n")
             fp.write(
                 f"{len(display_db_ops)} symmetry operations (module lattice translations) "
                 f"in space group {db.path.stem.split('_')[-1]}\n"
@@ -2510,7 +2520,7 @@ class SymmStructureAnalyzer:
                         reordered_ops,
                         db,
                         canonical_kpoints,
-                        phase_operations=source_operations,
+                        phase_operations=aligned_source_ops,
                         phase_from_source_operations=phase_from_source_operations,
                     )
 
@@ -2818,7 +2828,7 @@ class SymmStructureAnalyzer:
                         reordered_ops,
                         db,
                         canonical_kpoints,
-                        phase_operations=source_unitary_ops,
+                        phase_operations=aligned_source_ops,
                         phase_from_source_operations=phase_from_source_operations,
                     )
 

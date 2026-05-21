@@ -506,26 +506,15 @@ class KLittleGroupsDB:
         return np.exp(1j * angle)
 
     @staticmethod
-    def _source_phase_override_enabled(resolution: KPointResolution) -> bool:
-        return bool(getattr(resolution, "phase_from_source_operations", False)) and bool(
-            getattr(resolution, "cornwell_satisfied", True)
-        )
-
-    @staticmethod
-    def _phase_is_nontrivial(phase: complex, tol: float = 1.0e-8) -> bool:
-        return abs(complex(phase) - (1.0 + 0.0j)) > tol
-
-    @classmethod
-    def _should_use_operation_phase(cls, phase_kind: int, resolution: KPointResolution, phase: complex) -> bool:
-        if int(phase_kind) == 2:
-            return cls._source_phase_override_enabled(resolution)
-        if int(phase_kind) != 1:
-            return False
-        return cls._source_phase_override_enabled(resolution) and cls._phase_is_nontrivial(phase)
+    def _uses_nonsymmorphic_factor_system(resolution: KPointResolution) -> bool:
+        return not bool(getattr(resolution, "cornwell_satisfied", True))
 
     @classmethod
     def _should_use_coeff_phase(cls, phase_kind: int, resolution: KPointResolution) -> bool:
-        return int(phase_kind) == 2 and not cls._source_phase_override_enabled(resolution)
+        # coeff_uvw is applied only in the nonsymmorphic kLittleGroups table
+        # branch.  Cornwell-satisfied k points are handled as ordinary
+        # point-group irreps, so phase_kind=2 is not an extra table phase there.
+        return int(phase_kind) == 2 and cls._uses_nonsymmorphic_factor_system(resolution)
 
     def irrep_table_character_slice(
         self,
@@ -537,7 +526,7 @@ class KLittleGroupsDB:
         phase_operations=None,
     ) -> np.ndarray:
         raw_characters = np.asarray(irrep.characters, dtype=complex)
-        if not bool(getattr(resolution, "cornwell_satisfied", True)):
+        if self._uses_nonsymmorphic_factor_system(resolution):
             raw_characters = np.conj(raw_characters)
 
         active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
@@ -553,14 +542,6 @@ class KLittleGroupsDB:
                 if self._should_use_coeff_phase(phase_kind, resolution):
                     angle = -np.pi * float(np.dot(irrep.coeff_uvw[int(table_idx), :], resolution.k_conv))
                     value *= np.exp(1j * angle)
-                elif (
-                    phase_k_direct is not None
-                    and phase_operations is not None
-                    and int(active_idx) < len(phase_operations)
-                ):
-                    phase = self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-                    if self._should_use_operation_phase(phase_kind, resolution, phase):
-                        value *= phase
             else:
                 raise ValueError(f"Unexpected phase kind {phase_kind} for irrep {irrep.name}.")
             values.append(value)

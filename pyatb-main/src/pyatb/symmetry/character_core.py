@@ -42,26 +42,67 @@ def _current_operation_phase(k_direct, operation) -> complex:
     return np.exp(1j * angle)
 
 
-def _source_phase_override_enabled(resolution) -> bool:
-    return bool(getattr(resolution, "phase_from_source_operations", False)) and bool(
-        getattr(resolution, "cornwell_satisfied", True)
-    )
+def _cornwell_satisfied(resolution) -> bool:
+    return bool(getattr(resolution, "cornwell_satisfied", True))
 
 
-def _phase_is_nontrivial(phase: complex, tol: float = 1.0e-8) -> bool:
-    return abs(complex(phase) - (1.0 + 0.0j)) > tol
-
-
-def _should_use_operation_phase(phase_kind: int, resolution, phase: complex) -> bool:
-    if int(phase_kind) == 2:
-        return _source_phase_override_enabled(resolution)
-    if int(phase_kind) != 1:
-        return False
-    return _source_phase_override_enabled(resolution) and _phase_is_nontrivial(phase)
+def _uses_nonsymmorphic_factor_system(resolution) -> bool:
+    return not _cornwell_satisfied(resolution)
 
 
 def _should_use_coeff_phase(phase_kind: int, resolution) -> bool:
-    return int(phase_kind) == 2 and not _source_phase_override_enabled(resolution)
+    # IRVSP applies coeff_uvw only in its nonsymmorphic kLG-table branch
+    # (FGT=.FALSE.).  Cornwell-satisfied k points are classified by the
+    # ordinary point-group branch, so phase_kind=2 must not force an
+    # additional table phase there.
+    return int(phase_kind) == 2 and _uses_nonsymmorphic_factor_system(resolution)
+
+
+def _comparison_characters(
+    characters: np.ndarray,
+    resolution,
+    active_operation_indices,
+    phase_k_direct=None,
+    phase_operations=None,
+) -> np.ndarray:
+    target = np.asarray(characters, dtype=complex).reshape(-1).copy()
+    active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
+
+    if _uses_nonsymmorphic_factor_system(resolution):
+        return target
+
+    # When Cornwell is satisfied, the space-group character is a point-group
+    # character times KPH({R|tau}) = exp(-2*pi*i*k_prim.tau).  Remove KPH before
+    # comparing with ordinary point-group characters.
+    if phase_k_direct is not None and phase_operations is not None:
+        for pos, active_idx in enumerate(active):
+            if pos >= target.size or int(active_idx) < 0 or int(active_idx) >= len(phase_operations):
+                continue
+            target[pos] *= np.conj(_current_operation_phase(phase_k_direct, phase_operations[int(active_idx)]))
+    return target
+
+
+def _comparison_character_candidates(
+    characters: np.ndarray,
+    resolution,
+    active_operation_indices,
+    phase_k_direct=None,
+    phase_operations=None,
+) -> list[np.ndarray]:
+    raw = np.asarray(characters, dtype=complex).reshape(-1).copy()
+    normalized = _comparison_characters(
+        raw,
+        resolution,
+        active_operation_indices,
+        phase_k_direct=phase_k_direct,
+        phase_operations=phase_operations,
+    )
+    if _uses_nonsymmorphic_factor_system(resolution) or np.allclose(normalized, raw, atol=1.0e-10):
+        return [normalized]
+    # Keep the IRVSP-style KPH-normalized convention first, but fall back to
+    # the raw Dk characters for source-origin conventions where the calculated
+    # traces already match the kLittleGroups table.
+    return [normalized, raw]
 
 
 def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_operations=None) -> np.ndarray:
@@ -69,7 +110,7 @@ def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_ope
     if table.size == 0 or resolution is None:
         return table
 
-    if not bool(getattr(resolution, "cornwell_satisfied", True)):
+    if _uses_nonsymmorphic_factor_system(resolution):
         table = np.conj(table)
 
     phase_kinds = np.asarray(getattr(irrep, "phase_kinds", []), dtype=int).reshape(-1)
@@ -87,10 +128,6 @@ def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_ope
         if _should_use_coeff_phase(phase_kind, resolution) and k_conv.size >= 3:
             angle = -np.pi * float(np.dot(coeff_uvw[j, :3], k_conv[:3]))
             table[j] *= np.exp(1j * angle)
-        elif phase_k_direct is not None and phase_operations is not None and j < len(phase_operations):
-            phase = _current_operation_phase(phase_k_direct, phase_operations[j])
-            if _should_use_operation_phase(phase_kind, resolution, phase):
-                table[j] *= phase
     return table
 
 
@@ -106,7 +143,7 @@ def _resolved_irrep_character_slice(
     if raw_table.size == 0 or resolution is None:
         return raw_table
 
-    if not bool(getattr(resolution, "cornwell_satisfied", True)):
+    if _uses_nonsymmorphic_factor_system(resolution):
         raw_table = np.conj(raw_table)
 
     active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
@@ -131,14 +168,6 @@ def _resolved_irrep_character_slice(
             ):
                 angle = -np.pi * float(np.dot(coeff_uvw[int(table_idx), :3], k_conv[:3]))
                 value *= np.exp(1j * angle)
-            elif (
-                phase_k_direct is not None
-                and phase_operations is not None
-                and int(active_idx) < len(phase_operations)
-            ):
-                phase = _current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-                if _should_use_operation_phase(phase_kind, resolution, phase):
-                    value *= phase
         values.append(value)
     return np.asarray(values, dtype=complex)
 
@@ -168,32 +197,42 @@ def assign_irrep_from_characters(
     phase_k_direct=None,
     phase_operations=None,
 ):
-    target = np.asarray(characters, dtype=complex).reshape(-1)
+    raw_target = np.asarray(characters, dtype=complex).reshape(-1)
     active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
     table_active = active if table_operation_indices is None else np.asarray(table_operation_indices, dtype=int).reshape(-1)
     if table_active.size != active.size:
         raise ValueError("table_operation_indices must have the same length as active_operation_indices.")
-    if target.size != table_active.size:
+    if raw_target.size != table_active.size:
         raise ValueError("character vector length must match active_operation_indices.")
+    targets = _comparison_character_candidates(
+        raw_target,
+        resolution,
+        active,
+        phase_k_direct=phase_k_direct,
+        phase_operations=phase_operations,
+    )
 
     best_name = None
     best_error = np.inf
-    for irrep in _filter_irreps_by_spin(resolution.entry.irreps, spinful):
-        table = _resolved_irrep_character_slice(
-            irrep,
-            resolution,
-            active,
-            table_active,
-            phase_k_direct=phase_k_direct,
-            phase_operations=phase_operations,
-        )
-        if table.size != target.size:
-            continue
-        diff = table - target
-        err = float(np.max(np.abs(diff))) if diff.size else 0.0
-        if err < best_error:
-            best_error = err
-            best_name = getattr(irrep, "name", getattr(irrep, "raw_name", None))
+    for target in targets:
+        for irrep in _filter_irreps_by_spin(resolution.entry.irreps, spinful):
+            table = _resolved_irrep_character_slice(
+                irrep,
+                resolution,
+                active,
+                table_active,
+                phase_k_direct=phase_k_direct,
+                phase_operations=phase_operations,
+            )
+            if table.size != target.size:
+                continue
+            diff = table - target
+            err = float(np.max(np.abs(diff))) if diff.size else 0.0
+            if err < best_error:
+                best_error = err
+                best_name = getattr(irrep, "name", getattr(irrep, "raw_name", None))
+            if err <= tol:
+                return getattr(irrep, "name", getattr(irrep, "raw_name", None))
 
     if best_name is None or best_error > tol:
         raise ValueError("Failed to assign irrep from calculated characters.")
@@ -231,11 +270,18 @@ def assign_irrep_combination(
 ):
     active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
     table_active = active if table_operation_indices is None else np.asarray(table_operation_indices, dtype=int).reshape(-1)
-    target = np.asarray(characters, dtype=complex).reshape(-1)
+    raw_target = np.asarray(characters, dtype=complex).reshape(-1)
     if table_active.size != active.size:
         raise ValueError("table_operation_indices must have the same length as active_operation_indices.")
-    if target.size != table_active.size:
+    if raw_target.size != table_active.size:
         raise ValueError("character vector length must match active_operation_indices.")
+    targets = _comparison_character_candidates(
+        raw_target,
+        resolution,
+        active,
+        phase_k_direct=phase_k_direct,
+        phase_operations=phase_operations,
+    )
     irreps = _filter_irreps_by_spin(resolution.entry.irreps, spinful)
     sliced_tables = []
     irrep_labels = []
@@ -248,24 +294,25 @@ def assign_irrep_combination(
             phase_k_direct=phase_k_direct,
             phase_operations=phase_operations,
         )
-        if table.size != target.size:
+        if not targets or table.size != targets[0].size:
             continue
         sliced_tables.append(table)
         irrep_labels.append(getattr(irrep, "name", getattr(irrep, "raw_name", f"irrep{idx + 1}")))
 
     best = None
-    for term_count in range(1, max_terms + 1):
-        for combo in _cached_combinations_with_replacement(len(sliced_tables), term_count):
-            trial = np.zeros_like(target)
-            labels = []
-            for idx in combo:
-                trial = trial + sliced_tables[idx]
-                labels.append(irrep_labels[idx])
-            err = float(np.max(np.abs(trial - target))) if target.size else 0.0
-            if best is None or err < best[0]:
-                best = (err, labels)
-            if err <= tol:
-                return " + ".join(labels)
+    for target in targets:
+        for term_count in range(1, max_terms + 1):
+            for combo in _cached_combinations_with_replacement(len(sliced_tables), term_count):
+                trial = np.zeros_like(target)
+                labels = []
+                for idx in combo:
+                    trial = trial + sliced_tables[idx]
+                    labels.append(irrep_labels[idx])
+                err = float(np.max(np.abs(trial - target))) if target.size else 0.0
+                if best is None or err < best[0]:
+                    best = (err, labels)
+                if err <= tol:
+                    return " + ".join(labels)
 
     if best is None:
         raise ValueError("Failed to assign irreps from character combination.")
