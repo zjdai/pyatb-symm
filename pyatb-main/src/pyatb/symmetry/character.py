@@ -702,6 +702,7 @@ class Character:
             hr_source = HR_route or analysis_result.get("source_hr", "data-HR-sparse_SPIN0.csr")
             sr_source = SR_route or analysis_result.get("source_sr", "data-SR-sparse_SPIN0.csr")
             full_matrix_from_hermitian = bool(analysis_result.get("full_matrix_from_hermitian", True))
+            hs_symmetry_operations = analysis_result.get("source_operations") or analysis_result.get("operations") or []
             if RANK == 0:
                 canonicalize_abacus_hs(
                     tb=self._tb,
@@ -717,6 +718,10 @@ class Character:
                     output_sr_path=Path(analysis_result["target_sr"]),
                     mapping_output_path=(Path(self.output_path) / "R_block_mapping.txt") if self._emit_character_aux_outputs else None,
                     full_matrix_from_hermitian=full_matrix_from_hermitian,
+                    symmetry_operations=hs_symmetry_operations,
+                    symmetry_error_threshold=self._COVARIANCE_ERROR_ABORT_THRESHOLD,
+                    symmetry_report_path=Path(self.output_path) / "hs_standardize_symmetry_check.json",
+                    symmetry_map_tol=float(symm_prec),
                 )
 
             active_stru_path = Path(analysis_result["target_stru"])

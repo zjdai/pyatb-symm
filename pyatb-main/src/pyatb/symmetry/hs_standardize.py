@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -203,6 +204,33 @@ def _local_rotation(source_metadata, atom_index: int, xyz_axis_transform_cartesi
     )
 
 
+def _mapping_image_normalization(atom_mapping: list[dict], target_atom_count: int) -> float:
+    if target_atom_count <= 0:
+        return 1.0
+    counts: dict[int, int] = {}
+    for item in atom_mapping:
+        target_atom = int(item["new_atom"])
+        counts[target_atom] = counts.get(target_atom, 0) + 1
+
+    if len(counts) != int(target_atom_count):
+        raise ValueError(
+            "Atom mapping does not cover every target atom while standardizing HS matrices: "
+            f"mapped={len(counts)}, target={target_atom_count}."
+        )
+
+    multiplicities = sorted(set(counts.values()))
+    if len(multiplicities) != 1:
+        raise ValueError(
+            "Atom mapping has non-uniform target image multiplicities while standardizing HS matrices: "
+            f"{counts}."
+        )
+
+    multiplicity = int(multiplicities[0])
+    if multiplicity <= 0:
+        raise ValueError("Invalid atom mapping image multiplicity while standardizing HS matrices.")
+    return 1.0 / float(multiplicity)
+
+
 def _assemble_target_dense_blocks(
     source_xr,
     source_metadata,
@@ -220,6 +248,7 @@ def _assemble_target_dense_blocks(
 
     target_r_blocks: dict[tuple[int, int, int], np.ndarray] = {}
     mapping_lines: list[str] = []
+    image_normalization = _mapping_image_normalization(atom_mapping, len(target_metadata.atom_ranges))
 
     source_dense_upper_by_r = _dense_blocks_by_r(source_xr)
     if bool(full_matrix_from_hermitian):
@@ -229,8 +258,6 @@ def _assemble_target_dense_blocks(
 
     for r_old in sorted(source_dense_by_r.keys()):
         dense = np.asarray(source_dense_by_r[r_old], dtype=complex)
-        partner_key = tuple(int(-value) for value in r_old)
-        pair_weight = 0.5 if bool(full_matrix_from_hermitian) and (partner_key in source_dense_upper_by_r) else 1.0
         for map_a in atom_mapping:
             old_a = int(map_a["old_atom"])
             source_slice_a = _atom_slice(source_metadata, old_a)
@@ -259,7 +286,7 @@ def _assemble_target_dense_blocks(
                     key,
                     np.zeros((target_metadata.basis_num, target_metadata.basis_num), dtype=complex),
                 )
-                rotated = pair_weight * (d_a.conj().T @ local_block @ d_b)
+                rotated = image_normalization * (d_a.conj().T @ local_block @ d_b)
                 target_dense[target_slice_a, target_slice_b] += rotated
                 mapping_lines.append(
                     "R %4d %4d %4d atom%d ------> R %4d %4d %4d atom%d\n"
@@ -296,12 +323,11 @@ def _write_abacus_sparse_xr(path: Path, matrices_by_r: dict, basis_num: int, nsp
 
         for r_key in r_keys:
             dense = np.asarray(matrices_by_r[r_key], dtype=complex) / float(unit_scale)
-            upper = np.triu(dense)
             if int(nspin) != 4:
-                if np.max(np.abs(upper.imag)) > 1.0e-8:
+                if np.max(np.abs(dense.imag)) > 1.0e-8:
                     raise ValueError("Non-spinor XR writer received complex values beyond tolerance.")
-                upper = upper.real
-            csr = csr_matrix(upper)
+                dense = dense.real
+            csr = csr_matrix(dense)
             handle.write(f"{r_key[0]} {r_key[1]} {r_key[2]} {csr.nnz}\n")
             if csr.nnz == 0:
                 continue
@@ -327,6 +353,115 @@ def _synchronize_block_keys(
     return hr_blocks, sr_blocks
 
 
+def _jsonable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    return value
+
+
+def _operations_to_covariance_dicts(operations: list) -> list[dict]:
+    converted: list[dict] = []
+    for index, operation in enumerate(operations, start=1):
+        if isinstance(operation, dict):
+            rotation = np.asarray(operation.get("rotation", np.eye(3, dtype=int)), dtype=int)
+            translation = np.asarray(operation.get("translation", np.zeros(3, dtype=float)), dtype=float)
+            cart_rotation = np.asarray(operation.get("cart_rotation", np.eye(3, dtype=float)), dtype=float)
+            op_index = int(operation.get("index", index))
+        else:
+            rotation = np.asarray(getattr(operation, "rotation", np.eye(3, dtype=int)), dtype=int)
+            translation = np.asarray(getattr(operation, "translation", np.zeros(3, dtype=float)), dtype=float)
+            cart_rotation = np.asarray(getattr(operation, "cart_rotation", np.eye(3, dtype=float)), dtype=float)
+            op_index = int(getattr(operation, "index", index))
+        converted.append(
+            {
+                "index": op_index,
+                "rotation": rotation,
+                "translation": translation,
+                "cart_rotation": cart_rotation,
+            }
+        )
+    return converted
+
+
+def _validate_standardized_hs_symmetry(
+    hr_blocks: dict[tuple[int, int, int], np.ndarray],
+    sr_blocks: dict[tuple[int, int, int], np.ndarray],
+    target_metadata,
+    symmetry_operations: list | None,
+    *,
+    map_tol: float = 1.0e-5,
+    nonzero_block_tol: float = 1.0e-9,
+    error_threshold: float | None = None,
+    report_path: str | Path | None = None,
+) -> dict | None:
+    if not symmetry_operations:
+        return None
+
+    from pyatb.symmetry.data_covariance_constraint import (
+        prepare_operation_contexts,
+        self_covariance_statistics,
+    )
+
+    operations = _operations_to_covariance_dicts(list(symmetry_operations))
+    operation_contexts = prepare_operation_contexts(
+        target_metadata,
+        operations,
+        map_tol=float(map_tol),
+    )
+    hr_stats = self_covariance_statistics(
+        hr_blocks,
+        target_metadata,
+        operations,
+        map_tol=float(map_tol),
+        nonzero_block_tol=float(nonzero_block_tol),
+        operation_contexts=operation_contexts,
+    )
+    sr_stats = self_covariance_statistics(
+        sr_blocks,
+        target_metadata,
+        operations,
+        map_tol=float(map_tol),
+        nonzero_block_tol=float(nonzero_block_tol),
+        operation_contexts=operation_contexts,
+    )
+    combined_max = float(
+        max(
+            float(hr_stats.get("global_max_abs", 0.0)),
+            float(sr_stats.get("global_max_abs", 0.0)),
+        )
+    )
+    report = {
+        "operation_count": int(len(operations)),
+        "combined_max": combined_max,
+        "hr": hr_stats,
+        "sr": sr_stats,
+    }
+    if report_path is not None:
+        path = Path(report_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_jsonable(report), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    if error_threshold is not None and combined_max > float(error_threshold):
+        hr_mean = float(hr_stats.get("mean_abs_over_operations", 0.0))
+        sr_mean = float(sr_stats.get("mean_abs_over_operations", 0.0))
+        raise ValueError(
+            "Standardized HS matrix failed symmetry covariance check: "
+            f"combined_max={combined_max:.6e}, "
+            f"HR max/mean={float(hr_stats.get('global_max_abs', 0.0)):.6e}/{hr_mean:.6e}, "
+            f"SR max/mean={float(sr_stats.get('global_max_abs', 0.0)):.6e}/{sr_mean:.6e}."
+        )
+
+    return report
+
+
 def canonicalize_abacus_hs(
     tb,
     target_stru_path,
@@ -341,6 +476,11 @@ def canonicalize_abacus_hs(
     output_sr_path,
     mapping_output_path=None,
     full_matrix_from_hermitian: bool = True,
+    symmetry_operations: list | None = None,
+    symmetry_error_threshold: float | None = None,
+    symmetry_report_path=None,
+    symmetry_map_tol: float = 1.0e-5,
+    symmetry_nonzero_block_tol: float = 1.0e-9,
 ):
     source_metadata = extract_abacus_basis_metadata(tb)
     target_metadata = _build_metadata_from_stru(Path(target_stru_path), np.asarray(lattice_new, dtype=float), int(tb.nspin))
@@ -398,6 +538,17 @@ def canonicalize_abacus_hs(
     if mapping_output_path is not None:
         Path(mapping_output_path).write_text("".join(mapping_lines), encoding="utf-8")
 
+    symmetry_report = _validate_standardized_hs_symmetry(
+        hr_blocks,
+        sr_blocks,
+        target_metadata,
+        symmetry_operations,
+        map_tol=float(symmetry_map_tol),
+        nonzero_block_tol=float(symmetry_nonzero_block_tol),
+        error_threshold=symmetry_error_threshold,
+        report_path=symmetry_report_path,
+    )
+
     canonical_hr = abacus_readHR(int(tb.nspin), str(output_hr_path), hr_unit)
     canonical_sr = abacus_readSR(int(tb.nspin), str(output_sr_path))
 
@@ -408,4 +559,5 @@ def canonicalize_abacus_hs(
         "target_basis_num": int(target_metadata.basis_num),
         "r_block_mapping_lines": mapping_lines,
         "full_matrix_from_hermitian": bool(full_matrix_from_hermitian),
+        "symmetry_report": symmetry_report,
     }

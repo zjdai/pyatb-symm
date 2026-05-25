@@ -17,6 +17,12 @@ from pyatb.io.abacus_read_stru import _wrap_fractional_coordinates
 from pyatb.symmetry.Dk_matrix import axis_angle_from_cartesian_rotation, spin_half_matrix_from_cartesian_rotation
 from pyatb.symmetry.hs_standardize import canonicalize_fractional_coordinates, map_target_r_vector
 from pyatb.symmetry.k_little_groups import KLittleGroupsDB, KPointResolution
+from pyatb.symmetry.structure_mapping import (
+    build_structure_mapping,
+    structure_mapping_summary,
+    structure_mapping_to_dicts,
+    structure_mapping_to_tuples,
+)
 
 
 @dataclass
@@ -393,6 +399,46 @@ class SymmStructureAnalyzer:
         return False
 
     @classmethod
+    def _operation_sets_match(
+        cls,
+        left: list[SymmetryOperation],
+        right: list[SymmetryOperation],
+    ) -> bool:
+        if len(left) != len(right):
+            return False
+        return all(cls._operation_in_set(operation, right) for operation in left) and all(
+            cls._operation_in_set(operation, left) for operation in right
+        )
+
+    @classmethod
+    def _operations_after_origin_shift(
+        cls,
+        operations: list[SymmetryOperation],
+        shift: np.ndarray,
+    ) -> list[SymmetryOperation]:
+        shift_vec = np.asarray(shift, dtype=float).reshape(3)
+        identity = np.eye(3, dtype=float)
+        shifted: list[SymmetryOperation] = []
+        for op in operations:
+            rotation = np.asarray(op.rotation, dtype=float)
+            translation = np.asarray(op.translation, dtype=float) + shift_vec @ (identity - rotation.T)
+            translation = canonicalize_fractional_coordinates(translation, tol=1.0e-8)
+            shifted.append(
+                SymmetryOperation(
+                    rotation=np.asarray(op.rotation, dtype=int),
+                    translation=np.asarray(translation, dtype=float),
+                    inverse_rotation=np.asarray(op.inverse_rotation, dtype=int),
+                    cart_rotation=np.asarray(op.cart_rotation, dtype=float),
+                    euler_zyz=np.asarray(op.euler_zyz, dtype=float),
+                    spin_matrix=np.asarray(op.spin_matrix, dtype=complex),
+                    symbol=str(op.symbol),
+                    description=str(op.description),
+                    axis=np.asarray(op.axis, dtype=float),
+                )
+            )
+        return shifted
+
+    @classmethod
     def _requested_group_is_unitary_subgroup(
         cls,
         requested_operations: list[SymmetryOperation],
@@ -729,8 +775,9 @@ class SymmStructureAnalyzer:
             position_meta[species_name] = mag_line
             idx += atom_count + 1
 
-        scaled_positions = np.asarray(std_atoms.get_scaled_positions(), dtype=float)
-        scaled_positions -= np.floor(scaled_positions)
+        scaled_positions = _wrap_fractional_coordinates(np.asarray(std_atoms.get_scaled_positions(wrap=False), dtype=float))
+        scaled_positions[np.isclose(scaled_positions, 1.0, atol=1.0e-8)] = 0.0
+        scaled_positions[np.isclose(scaled_positions, 0.0, atol=1.0e-8)] = 0.0
         symbols = list(std_atoms.get_chemical_symbols())
         lattice_vectors = np.asarray(std_atoms.cell.array, dtype=float) / lattice_scale_ang
 
@@ -780,8 +827,9 @@ class SymmStructureAnalyzer:
         xyz_axis_transform_cartesian: np.ndarray,
         rebuild_reason: str,
         full_matrix_from_hermitian: bool = True,
+        force_rebuild_hs: bool = False,
     ) -> dict:
-        need_rebuild_hs = bool(lattice_changed or not atom_permutation_only)
+        need_rebuild_hs = bool(force_rebuild_hs or lattice_changed or not atom_permutation_only)
         target_stru = "STRU-symm" if need_rebuild_hs else str(source_stru)
         target_hr = (
             str((self._output_path / "data-HR-sparse_SPIN0-symm.csr").resolve())
@@ -1377,78 +1425,14 @@ class SymmStructureAnalyzer:
         return True
 
     @classmethod
-    def _match_operation_by_seitz(
-        cls,
-        rotation: np.ndarray,
-        translation: np.ndarray,
-        operations: list[SymmetryOperation],
-    ) -> int | None:
-        target_rotation = np.asarray(rotation, dtype=int)
-        target_translation = np.asarray(translation, dtype=float)
-        for idx, op in enumerate(operations):
-            if not np.array_equal(np.asarray(op.rotation, dtype=int), target_rotation):
-                continue
-            if cls._translation_match(op.translation, target_translation):
-                return idx
-        return None
-
-    @classmethod
     def _representative_table_operation_indices(
         cls,
         operations: list[SymmetryOperation],
         active_operation_indices: list[int],
         rotation_index: int,
     ) -> list[int]:
-        """Map current-k little-group operations to representative-k table columns.
-
-        resolve_kpoint_from_star matches a user k point to a database representative
-        by k_rep = k @ S, where S is the inverse-rotation matrix of operation
-        rotation_index.  The D(k,g) matrices still use the current-k operations,
-        while irrep tables are tabulated at k_rep.  Therefore the table column for
-        {R_g|t_g} is the full Seitz conjugation p g p^-1, where p is the
-        real-space operation whose inverse rotation is S.
-        """
-        if not active_operation_indices:
-            return []
-        if rotation_index <= 0 or rotation_index > len(operations):
-            return list(active_operation_indices)
-
-        star_operation = operations[rotation_index - 1]
-        star_rotation = np.asarray(star_operation.rotation, dtype=int)
-        star_translation = np.asarray(star_operation.translation, dtype=float)
-        if np.array_equal(star_rotation, np.eye(3, dtype=int)) and cls._translation_match(
-            star_translation,
-            np.zeros(3, dtype=float),
-        ):
-            return list(active_operation_indices)
-        inverse_star_rotation = np.rint(np.linalg.inv(star_rotation)).astype(int)
-
-        mapped: list[int] = []
-        for op_idx in active_operation_indices:
-            operation = operations[int(op_idx)]
-            rotation = np.asarray(operation.rotation, dtype=int)
-            translation = np.asarray(operation.translation, dtype=float)
-            representative_rotation = star_rotation @ rotation @ inverse_star_rotation
-            representative_rotation = np.rint(representative_rotation).astype(int)
-            representative_translation = (
-                star_translation
-                + star_rotation @ translation
-                - representative_rotation @ star_translation
-            )
-            matched = cls._match_operation_by_seitz(
-                representative_rotation,
-                representative_translation,
-                operations,
-            )
-            if matched is None:
-                raise ValueError(
-                    "Failed to map k-point little-group operation to kLittleGroups table column: "
-                    f"source_op={int(op_idx) + 1}, star_op={int(rotation_index)}, "
-                    f"target_rotation={representative_rotation.tolist()}, "
-                    f"target_translation={cls._format_translation(representative_translation)}"
-                )
-            mapped.append(int(matched))
-        return mapped
+        """Return table columns for the actual k-star CHARACTER calculation."""
+        return list(active_operation_indices)
 
     @staticmethod
     def _operation_indices_are_table_active(entry, indices: list[int]) -> bool:
@@ -1525,9 +1509,9 @@ class SymmStructureAnalyzer:
     @staticmethod
     def _shift_negative_to_unit_interval(k_prim: np.ndarray) -> np.ndarray:
         k = np.asarray(k_prim, dtype=float).copy()
-        for i in range(3):
-            if k[i] < 0.0 and abs(k[i]) > 1.0e-6:
-                k[i] += 1.0
+        k -= np.floor(k)
+        k[np.isclose(k, 1.0, atol=1.0e-6)] = 0.0
+        k[np.isclose(k, 0.0, atol=1.0e-6)] = 0.0
         return k
 
     @staticmethod
@@ -1632,13 +1616,13 @@ class SymmStructureAnalyzer:
                 ]
                 table_ops = self._representative_table_operation_indices(
                     operations,
-                    active_ops,
+                    active_db_ops,
                     int(getattr(resolution, "rotation_index", 1)),
                 )
                 if not self._operation_indices_are_table_active(resolution.entry, table_ops):
                     inactive_ops = self._inactive_table_operation_indices(resolution.entry, table_ops)
                     raise ValueError(
-                        "Star-rotated little-group operation mapping is not active in kLittleGroups table. "
+                        "k-star little-group operation selection is not active in kLittleGroups table. "
                         "This indicates an inconsistent k-point representative or symmetry-operation alignment. "
                         f"k={np.asarray(k, dtype=float).tolist()}, "
                         f"representative_k={np.asarray(resolution.rotated_k_prim, dtype=float).tolist()}, "
@@ -1669,7 +1653,8 @@ class SymmStructureAnalyzer:
                         "k_index": ik,
                         "k_direct": np.asarray(k, dtype=float),
                         "little_group_indices": lkg,
-                        "active_operation_indices": active_ops,
+                        "active_operation_indices": character_operation_indices,
+                        "current_active_operation_indices": active_ops,
                         "table_operation_indices": table_ops,
                         "database_operation_indices": active_db_ops,
                         "character_k_direct": character_k_direct,
@@ -1691,7 +1676,7 @@ class SymmStructureAnalyzer:
                 mapped_k_prim = k_current.copy()
             else:
                 mapped_k_prim = k_current @ np.asarray(current_to_db_prim, dtype=float)
-                mapped_k_prim -= np.floor(mapped_k_prim)
+                mapped_k_prim = self._shift_negative_to_unit_interval(mapped_k_prim)
 
             candidate_specs: list[tuple[int, np.ndarray]] = [
                 (idx + 1, np.asarray(inv_rot, dtype=int))
@@ -1707,36 +1692,62 @@ class SymmStructureAnalyzer:
                 if not matches:
                     continue
                 for entry, varnum, k_conv, entry_index, fracdiff in matches:
+                    effective_star_index = int(star_index)
+                    effective_rotated = np.asarray(rotated, dtype=float).copy()
+                    effective_fracdiff = float(fracdiff)
                     resolution = KPointResolution(
                         entry=entry,
                         entry_index=int(entry_index),
                         k_conv=np.asarray(k_conv, dtype=float),
-                        rotation_index=int(star_index),
+                        rotation_index=effective_star_index,
                         variable_count=int(varnum),
                         mapped_k_prim=np.asarray(mapped_k_prim, dtype=float).copy(),
-                        rotated_k_prim=np.asarray(rotated, dtype=float).copy(),
+                        rotated_k_prim=effective_rotated.copy(),
                     )
-                    table_ops = self._representative_table_operation_indices(
-                        operations,
-                        active_ops,
-                        int(star_index),
-                    )
-                    table_active = self._operation_indices_are_table_active(resolution.entry, table_ops)
                     active_db_ops = [
                         int(idx)
                         for idx in resolution.entry.little_group_ops
                         if int(idx) < len(operations)
                     ]
+                    if effective_star_index > 1 and effective_star_index - 1 in active_db_ops:
+                        identity_matches = db._reference_kpoint_matches(mapped_k_prim, tol=1.0e-5)
+                        for identity_entry, identity_varnum, identity_k_conv, identity_entry_index, identity_fracdiff in identity_matches:
+                            if int(identity_entry_index) != int(entry_index):
+                                continue
+                            resolution = KPointResolution(
+                                entry=identity_entry,
+                                entry_index=int(identity_entry_index),
+                                k_conv=np.asarray(identity_k_conv, dtype=float),
+                                rotation_index=1,
+                                variable_count=int(identity_varnum),
+                                mapped_k_prim=np.asarray(mapped_k_prim, dtype=float).copy(),
+                                rotated_k_prim=np.asarray(mapped_k_prim, dtype=float).copy(),
+                            )
+                            effective_star_index = 1
+                            effective_rotated = np.asarray(mapped_k_prim, dtype=float).copy()
+                            effective_fracdiff = float(identity_fracdiff)
+                            break
+                    active_db_ops = [
+                        int(idx)
+                        for idx in resolution.entry.little_group_ops
+                        if int(idx) < len(operations)
+                    ]
+                    table_ops = self._representative_table_operation_indices(
+                        operations,
+                        active_db_ops,
+                        effective_star_index,
+                    )
+                    table_active = self._operation_indices_are_table_active(resolution.entry, table_ops)
                     entry_set = {int(idx) + 1 for idx in active_db_ops}
                     table_set = {int(idx) + 1 for idx in table_ops}
                     score = (
                         0 if table_active else 1,
-                        len(entry_set.symmetric_difference(table_set)),
                         abs(len(entry_set) - len(table_set)),
+                        abs(len(active_db_ops) - len(active_ops)),
                         int(getattr(resolution, "variable_count", 9999)),
-                        float(fracdiff),
+                        effective_fracdiff,
                         int(getattr(resolution, "entry_index", 10**9)),
-                        int(star_index if star_index >= 0 else 10**6),
+                        int(effective_star_index if effective_star_index >= 0 else 10**6),
                     )
                     scored_candidates.append((score, resolution, table_ops, active_db_ops))
 
@@ -1752,7 +1763,7 @@ class SymmStructureAnalyzer:
             if score[0] != 0:
                 inactive_ops = self._inactive_table_operation_indices(resolution.entry, table_ops)
                 raise ValueError(
-                    "Star-rotated little-group operation mapping is not active in kLittleGroups table. "
+                    "k-star little-group operation selection is not active in kLittleGroups table. "
                     "This indicates an inconsistent k-point representative or symmetry-operation alignment. "
                     f"k={np.asarray(k, dtype=float).tolist()}, "
                     f"representative_k={np.asarray(resolution.rotated_k_prim, dtype=float).tolist()}, "
@@ -1784,7 +1795,8 @@ class SymmStructureAnalyzer:
                     "k_index": ik,
                     "k_direct": np.asarray(k, dtype=float),
                     "little_group_indices": lkg,
-                    "active_operation_indices": active_ops,
+                    "active_operation_indices": character_operation_indices,
+                    "current_active_operation_indices": active_ops,
                     "table_operation_indices": table_ops,
                     "database_operation_indices": active_db_ops,
                     "character_k_direct": character_k_direct,
@@ -1851,6 +1863,34 @@ class SymmStructureAnalyzer:
             for i in range(3):
                 fp.write(
                     f"Q{i + 1} {axis_rotation[i, 0]:16.8f}{axis_rotation[i, 1]:16.8f}{axis_rotation[i, 2]:16.8f}\n"
+                )
+            mapping_summary = standardization_result.get("structure_mapping")
+            if isinstance(mapping_summary, dict):
+                fp.write("\nStructure mapping validation\n")
+                fp.write(f"matrix_relation: {mapping_summary.get('matrix_relation', 'unknown')}\n")
+                fp.write(
+                    "max_lattice_error: "
+                    f"{float(mapping_summary.get('max_lattice_error', 0.0)):.6e}\n"
+                )
+                fp.write(
+                    "max_atom_error: "
+                    f"{float(mapping_summary.get('max_atom_error', 0.0)):.6e}\n"
+                )
+                fp.write(
+                    "mean_atom_error: "
+                    f"{float(mapping_summary.get('mean_atom_error', 0.0)):.6e}\n"
+                )
+                fp.write(
+                    "max_fractional_error: "
+                    f"{float(mapping_summary.get('max_fractional_error', 0.0)):.6e}\n"
+                )
+                fp.write(
+                    "global_shift: "
+                    f"{self._format_translation(mapping_summary.get('global_shift', np.zeros(3)))}\n"
+                )
+                fp.write(
+                    "fractional_translation_input: "
+                    f"{self._format_translation(mapping_summary.get('fractional_translation', np.zeros(3)))}\n"
                 )
             fp.write("\n")
 
@@ -1976,6 +2016,19 @@ class SymmStructureAnalyzer:
             fp.write(f"{note}\n")
         fp.write(f"structure_standardized: {'yes' if standardization_result.get('need_rebuild_hs') else 'no'}\n")
         fp.write(f"standardization_rebuild_reason: {standardization_result.get('rebuild_reason', 'unknown')}\n")
+        fp.write(f"active_stru: {standardization_result.get('target_stru', 'STRU')}\n")
+        fp.write(f"active_hr: {standardization_result.get('target_hr', 'data-HR-sparse_SPIN0.csr')}\n")
+        fp.write(f"active_sr: {standardization_result.get('target_sr', 'data-SR-sparse_SPIN0.csr')}\n")
+        if source_to_standard_origin_shift is not None:
+            fp.write(
+                "source_to_active_origin_shift: "
+                f"{cls._format_translation(source_to_standard_origin_shift)}\n"
+            )
+        if database_origin_shift is not None:
+            fp.write(
+                "database_origin_shift_applied_to_active_structure: "
+                f"{cls._format_translation(database_origin_shift)}\n"
+            )
         cls._write_report_separator(fp)
         fp.write(f"spglib determined space group No. {int(detected_group)}{symbol_text}{hall_text}.\n")
         fp.write(f"The kLittleGroups character table number is No. {int(resolved_group)}.\n")
@@ -1999,7 +2052,7 @@ class SymmStructureAnalyzer:
     def _write_symmetry_operations(self, fp, operations: list[SymmetryOperation]):
         separator = "---------------------------------------------------------------------------------------\n"
         fp.write("Symmetry operations Pi={Ri|taui+tm}\n")
-        fp.write("note: primitive basis, original stru(no origin shift)\n")
+        fp.write("note: primitive basis, active CHARACTER structure\n")
         fp.write(separator)
 
         for i, op in enumerate(operations, start=1):
@@ -2048,12 +2101,14 @@ class SymmStructureAnalyzer:
         *,
         phase_operations: list[SymmetryOperation] | None = None,
         phase_from_source_operations: bool = False,
+        current_to_db_prim: np.ndarray | None = None,
     ):
         table_phase_operations = operations if phase_operations is None else phase_operations
         for record in self._resolve_kpoint_records(
             operations,
             db,
             kpoints_direct,
+            current_to_db_prim=current_to_db_prim,
             phase_from_source_operations=phase_from_source_operations,
         ):
             ik = int(record["k_index"])
@@ -2100,7 +2155,8 @@ class SymmStructureAnalyzer:
             fp.write(f"Primitive    basis  {k_star_prim[0]: .6f} {k_star_prim[1]: .6f} {k_star_prim[2]: .6f}\n")
             fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
             display_db_ops = list(record.get("database_operation_indices", table_db_ops))
-            fp.write(f"Cornwell condition: {int(bool(getattr(resolution, 'cornwell_satisfied', True)))}\n")
+            cornwell_ok = bool(getattr(resolution, 'cornwell_satisfied', True))
+            fp.write(f"Cornwell condition: {cornwell_ok}\n")
             if match.irreps:
                 phase_tags = np.asarray(match.irreps[0].phase_kinds, dtype=int).reshape(-1)
                 fp.write("Phase_kind")
@@ -2110,6 +2166,7 @@ class SymmStructureAnalyzer:
                         value = 1 if int(phase_tags[int(idx)]) == 2 else 0
                     fp.write(f"{value:4d}")
                 fp.write("\n")
+
             fp.write(
                 f"{len(display_db_ops)} symmetry operations (module lattice translations) "
                 f"in space group {db.path.stem.split('_')[-1]}\n"
@@ -2174,7 +2231,6 @@ class SymmStructureAnalyzer:
         resolved_group = self._resolve_spacegroup(requested_group, detected_group)
 
         map_tol = max(1e-6, float(symm_prec) * 10.0)
-        mapping12 = self._build_atom_mapping(source_atoms, mapping_atoms, map_tol)
         lattice_old = np.asarray(source_atoms.cell.array, dtype=float)
         lattice_mapping = np.asarray(mapping_atoms.cell.array, dtype=float)
         lattice_new = np.asarray(std_atoms.cell.array, dtype=float)
@@ -2183,13 +2239,6 @@ class SymmStructureAnalyzer:
             (lattice_mapping @ q23_row) @ np.linalg.inv(lattice_new),
             tol=max(1.0e-4, map_tol * 10.0),
         )
-        mapping23, _, _ = self._build_rotated_atom_mapping(
-            mapping_atoms,
-            std_atoms,
-            q23_row,
-            tol=max(5.0e-4, map_tol * 10.0),
-        )
-        atom_mapping = self._compose_two_stage_mapping(mapping12, mapping23, b23)
 
         m12 = self._round_integer_matrix(
             lattice_old @ np.linalg.inv(lattice_mapping),
@@ -2205,6 +2254,16 @@ class SymmStructureAnalyzer:
                 "Inconsistent lattice transform from source to standardized structure: "
                 f"chain={b13_chain.tolist()}, direct={b13_direct.tolist()}"
             )
+        mapping_result = build_structure_mapping(
+            source_atoms,
+            std_atoms,
+            rotation_matrix=q23_row,
+            supercell_matrix=b13_chain,
+            fractional_translation=np.zeros(3, dtype=float),
+            tol=max(5.0e-4, map_tol * 10.0),
+            lattice_tol=max(1.0e-4, map_tol * 10.0),
+        )
+        atom_mapping = structure_mapping_to_tuples(mapping_result)
 
         lattice_changed = self._detect_lattice_change(source_atoms, std_atoms, map_tol) or len(source_atoms) != len(std_atoms)
         permutation_only = False if lattice_changed else self._mapping_is_permutation_only(atom_mapping, map_tol)
@@ -2233,23 +2292,6 @@ class SymmStructureAnalyzer:
             rebuild_reason = "reuse-original-origin-shift"
         else:
             rebuild_reason = "atom-position-changed"
-
-        standardization_result = self._finalize_standardization_result(
-            detected_group=detected_group,
-            resolved_group=resolved_group,
-            lattice_changed=lattice_changed,
-            atom_permutation_only=atom_permutation_only,
-            source_stru=source_path.name,
-            source_hr="data-HR-sparse_SPIN0.csr",
-            source_sr="data-SR-sparse_SPIN0.csr",
-            atom_mapping=self._atom_mapping_to_dicts(atom_mapping),
-            lattice_old=lattice_old,
-            lattice_new=lattice_new,
-            lattice_transform_fractional=lattice_transform_fractional,
-            xyz_axis_transform_cartesian=xyz_axis_transform_cartesian,
-            rebuild_reason=rebuild_reason,
-            full_matrix_from_hermitian=True,
-        )
 
         operations = self._sort_operations_irvsp_like(self._build_symmetry_operations(std_atoms, sym_data))
         conventional_operations = self._sort_operations_irvsp_like(
@@ -2309,7 +2351,9 @@ class SymmStructureAnalyzer:
                         f"primitive  basis: {self._format_translation(database_origin_shift)}",
                     ]
                 )
-        if float(np.max(np.abs(database_origin_shift))) > align_tol:
+        database_origin_shift_applied = float(np.max(np.abs(database_origin_shift))) > align_tol
+        if database_origin_shift_applied:
+            expected_shifted_operations = self._operations_after_origin_shift(operations, database_origin_shift)
             shifted_std_atoms = std_atoms.copy()
             shifted_pos = (
                 np.asarray(shifted_std_atoms.get_scaled_positions(wrap=False), dtype=float)
@@ -2317,9 +2361,66 @@ class SymmStructureAnalyzer:
             )
             shifted_std_atoms.set_scaled_positions(_wrap_fractional_coordinates(shifted_pos))
             shifted_sym_data = self._get_symmetry_data(shifted_std_atoms, symm_prec)
-            database_aligned_operations = self._sort_operations_irvsp_like(
+            shifted_operations = self._sort_operations_irvsp_like(
                 self._build_symmetry_operations(shifted_std_atoms, shifted_sym_data)
             )
+            if not self._operation_sets_match(expected_shifted_operations, shifted_operations):
+                raise ValueError(
+                    "Shifted standardized primitive structure failed spglib symmetry consistency check: "
+                    "symmetry operations reported by spglib do not match the origin-shifted operations."
+                )
+            database_alignment_notes.append(
+                "shifted standardized primitive structure rechecked by spglib without additional standardization"
+            )
+            std_atoms = shifted_std_atoms
+            sym_data = shifted_sym_data
+            operations = shifted_operations
+            database_aligned_operations = shifted_operations
+            mapping_result = build_structure_mapping(
+                source_atoms,
+                std_atoms,
+                rotation_matrix=q23_row,
+                supercell_matrix=b13_chain,
+                fractional_translation=database_origin_shift,
+                tol=max(5.0e-4, map_tol * 10.0),
+                lattice_tol=max(1.0e-4, map_tol * 10.0),
+            )
+            atom_mapping = structure_mapping_to_tuples(mapping_result)
+            permutation_only = False if lattice_changed else self._mapping_is_permutation_only(atom_mapping, map_tol)
+            origin_shift_only = False
+            source_to_std_origin_shift = np.zeros(3, dtype=float)
+            if not lattice_changed and not permutation_only:
+                origin_shift_only, source_to_std_origin_shift, _ = self._match_by_global_fractional_origin_shift(
+                    source_atoms,
+                    std_atoms,
+                    map_tol,
+                )
+            atom_permutation_only = bool(permutation_only or origin_shift_only)
+            if rebuild_reason in {"reuse-original", "reuse-original-origin-shift"}:
+                rebuild_reason = "database-origin-shift"
+            elif "database-origin-shift" not in rebuild_reason:
+                rebuild_reason = f"{rebuild_reason}+database-origin-shift"
+
+        force_rebuild_hs = bool(origin_shift_only or database_origin_shift_applied)
+        standardization_result = self._finalize_standardization_result(
+            detected_group=detected_group,
+            resolved_group=resolved_group,
+            lattice_changed=lattice_changed,
+            atom_permutation_only=atom_permutation_only,
+            source_stru=source_path.name,
+            source_hr="data-HR-sparse_SPIN0.csr",
+            source_sr="data-SR-sparse_SPIN0.csr",
+            atom_mapping=structure_mapping_to_dicts(mapping_result),
+            lattice_old=lattice_old,
+            lattice_new=lattice_new,
+            lattice_transform_fractional=lattice_transform_fractional,
+            xyz_axis_transform_cartesian=xyz_axis_transform_cartesian,
+            rebuild_reason=rebuild_reason,
+            full_matrix_from_hermitian=True,
+            force_rebuild_hs=force_rebuild_hs,
+        )
+        standardization_result["structure_mapping"] = structure_mapping_summary(mapping_result)
+
         if bool(standardization_result["need_rebuild_hs"]):
             operation_order_reference = database_aligned_operations
             reordered_ops, reorder_warnings = self._reorder_operations_with_database(database_aligned_operations, db)
@@ -2344,10 +2445,13 @@ class SymmStructureAnalyzer:
                 )
                 del source_align_error
                 match_summary_ok, match_summary_details = self._database_alignment_summary(database_aligned_operations, db)
-        phase_from_source_operations = self._origin_shift_applied(
+        origin_redefined_for_report = self._origin_shift_applied(
             source_to_std_origin_shift,
             database_origin_shift,
             tol=align_tol,
+        )
+        phase_from_source_operations = origin_redefined_for_report and not bool(
+            standardization_result["need_rebuild_hs"]
         )
         kpoint_records = []
         if canonical_kpoints.size > 0:
@@ -2493,7 +2597,7 @@ class SymmStructureAnalyzer:
                 reordered_ops,
             )
             structure_atoms_reordered = self._atom_mapping_reordered(standardization_result)
-            origin_redefined = phase_from_source_operations
+            origin_redefined = origin_redefined_for_report
             with report_path.open("w", encoding="utf-8") as f:
                 self._write_report_header(
                     f,
@@ -2513,7 +2617,7 @@ class SymmStructureAnalyzer:
                     database_origin_shift=database_origin_shift,
                 )
                 self._write_transformations(f, source_atoms, std_atoms, spgfile, standardization_result)
-                self._write_symmetry_operations(f, source_operations)
+                self._write_symmetry_operations(f, aligned_source_ops)
                 if canonical_kpoints.size > 0:
                     self._write_k_little_group_table(
                         f,
@@ -2522,6 +2626,7 @@ class SymmStructureAnalyzer:
                         canonical_kpoints,
                         phase_operations=aligned_source_ops,
                         phase_from_source_operations=phase_from_source_operations,
+                        current_to_db_prim=current_to_db_prim,
                     )
 
             with open(RUNNING_LOG, "a", encoding="utf-8") as f:
@@ -2593,7 +2698,6 @@ class SymmStructureAnalyzer:
         else:
             current_to_db_prim = np.eye(3, dtype=float)
         map_tol = max(1e-6, float(symm_prec) * 10.0)
-        mapping12 = self._build_atom_mapping(source_atoms, mapping_atoms, map_tol)
         lattice_old = np.asarray(source_atoms.cell.array, dtype=float)
         lattice_mapping = np.asarray(mapping_atoms.cell.array, dtype=float)
         lattice_new = np.asarray(std_atoms.cell.array, dtype=float)
@@ -2602,13 +2706,6 @@ class SymmStructureAnalyzer:
             (lattice_mapping @ q23_row) @ np.linalg.inv(lattice_new),
             tol=max(1.0e-4, map_tol * 10.0),
         )
-        mapping23, _, _ = self._build_rotated_atom_mapping(
-            mapping_atoms,
-            std_atoms,
-            q23_row,
-            tol=max(5.0e-4, map_tol * 10.0),
-        )
-        atom_mapping = self._compose_two_stage_mapping(mapping12, mapping23, b23)
         m12 = self._round_integer_matrix(
             lattice_old @ np.linalg.inv(lattice_mapping),
             tol=max(1.0e-4, map_tol * 10.0),
@@ -2623,6 +2720,16 @@ class SymmStructureAnalyzer:
                 "Inconsistent lattice transform from magnetic source to standardized structure: "
                 f"chain={b13_chain.tolist()}, direct={b13_direct.tolist()}"
             )
+        mapping_result = build_structure_mapping(
+            source_atoms,
+            std_atoms,
+            rotation_matrix=q23_row,
+            supercell_matrix=b13_chain,
+            fractional_translation=np.zeros(3, dtype=float),
+            tol=max(5.0e-4, map_tol * 10.0),
+            lattice_tol=max(1.0e-4, map_tol * 10.0),
+        )
+        atom_mapping = structure_mapping_to_tuples(mapping_result)
 
         lattice_changed = self._detect_lattice_change(source_atoms, std_atoms, map_tol) or len(source_atoms) != len(std_atoms)
         permutation_only = False if lattice_changed else self._mapping_is_permutation_only(atom_mapping, map_tol)
@@ -2649,7 +2756,10 @@ class SymmStructureAnalyzer:
         std_unitary_ops = self._sort_operations_irvsp_like(self._build_symmetry_operations(std_atoms, std_unitary_sym_data))
         source_unitary_ops = self._sort_operations_irvsp_like(self._build_symmetry_operations(source_atoms, source_unitary_sym_data))
         origin_shift = self._solve_origin_shift_from_operations(std_unitary_ops, db, tol=max(1.0e-6, map_tol * 10.0))
-        if origin_shift is not None and float(np.max(np.abs(origin_shift))) > max(1.0e-6, map_tol * 10.0):
+        origin_shift_applied = bool(
+            origin_shift is not None and float(np.max(np.abs(origin_shift))) > max(1.0e-6, map_tol * 10.0)
+        )
+        if origin_shift_applied:
             shifted_std_atoms = std_atoms.copy()
             shifted_pos = np.asarray(shifted_std_atoms.get_scaled_positions(wrap=False), dtype=float) + np.asarray(origin_shift, dtype=float)
             shifted_std_atoms.set_scaled_positions(_wrap_fractional_coordinates(shifted_pos))
@@ -2660,6 +2770,30 @@ class SymmStructureAnalyzer:
                 symm_prec,
             )
             std_unitary_ops = self._sort_operations_irvsp_like(self._build_symmetry_operations(std_atoms, std_unitary_sym_data))
+            mapping_result = build_structure_mapping(
+                source_atoms,
+                std_atoms,
+                rotation_matrix=q23_row,
+                supercell_matrix=b13_chain,
+                fractional_translation=np.asarray(origin_shift, dtype=float),
+                tol=max(5.0e-4, map_tol * 10.0),
+                lattice_tol=max(1.0e-4, map_tol * 10.0),
+            )
+            atom_mapping = structure_mapping_to_tuples(mapping_result)
+            permutation_only = False if lattice_changed else self._mapping_is_permutation_only(atom_mapping, map_tol)
+            origin_shift_only = False
+            source_to_std_origin_shift = np.zeros(3, dtype=float)
+            if not lattice_changed and not permutation_only:
+                origin_shift_only, source_to_std_origin_shift, _ = self._match_by_global_fractional_origin_shift(
+                    source_atoms,
+                    std_atoms,
+                    map_tol,
+                )
+            atom_permutation_only = bool(permutation_only or origin_shift_only)
+            if rebuild_reason in {"magnetic-reuse-original", "magnetic-reuse-original-origin-shift"}:
+                rebuild_reason = "magnetic-database-origin-shift"
+            elif "magnetic-database-origin-shift" not in rebuild_reason:
+                rebuild_reason = f"{rebuild_reason}+magnetic-database-origin-shift"
         try:
             required_operation_count = int(db.doubnum // 2)
             reordered_ops_all, reorder_warnings = self._reorder_operations_with_database(std_unitary_ops, db)
@@ -2753,14 +2887,16 @@ class SymmStructureAnalyzer:
             source_stru=source_path.name,
             source_hr="data-HR-sparse_SPIN0.csr",
             source_sr="data-SR-sparse_SPIN0.csr",
-            atom_mapping=self._atom_mapping_to_dicts(atom_mapping),
+            atom_mapping=structure_mapping_to_dicts(mapping_result),
             lattice_old=lattice_old,
             lattice_new=lattice_new,
             lattice_transform_fractional=lattice_transform_fractional,
             xyz_axis_transform_cartesian=xyz_axis_transform_cartesian,
             rebuild_reason=rebuild_reason,
             full_matrix_from_hermitian=True,
+            force_rebuild_hs=bool(origin_shift_only or origin_shift_applied),
         )
+        standardization_result["structure_mapping"] = structure_mapping_summary(mapping_result)
 
         if RANK == 0:
             report_path = self._output_path / "symmetry_character_report.txt"

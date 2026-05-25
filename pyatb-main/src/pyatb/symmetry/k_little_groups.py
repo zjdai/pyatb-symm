@@ -308,9 +308,9 @@ class KLittleGroupsDB:
     @staticmethod
     def _shift_negative_to_unit_interval(k_prim: np.ndarray) -> np.ndarray:
         k = np.asarray(k_prim, dtype=float).copy()
-        for i in range(3):
-            if k[i] < 0.0 and abs(k[i]) > 1.0e-6:
-                k[i] += 1.0
+        k -= np.floor(k)
+        k[np.isclose(k, 1.0, atol=1.0e-6)] = 0.0
+        k[np.isclose(k, 0.0, atol=1.0e-6)] = 0.0
         return k
 
     @staticmethod
@@ -454,36 +454,56 @@ class KLittleGroupsDB:
             mapped_k_prim = np.asarray(k_prim, dtype=float)
         else:
             mapped_k_prim = np.asarray(k_prim, dtype=float) @ np.asarray(current_to_db_prim, dtype=float)
-            mapped_k_prim -= np.floor(mapped_k_prim)
+            mapped_k_prim = self._shift_negative_to_unit_interval(mapped_k_prim)
         candidate_rotations = [np.asarray(rot, dtype=int) for rot in inverse_rotations]
         if not has_inversion:
             candidate_rotations.append(-np.eye(3, dtype=int))
 
         best = None
-        detected_set = None if detected_ops is None else {int(i) for i in detected_ops}
+        detected_size = None if detected_ops is None else len({int(i) for i in detected_ops})
         for index, inv_rot in enumerate(candidate_rotations, start=1):
             rotated = self._shift_negative_to_unit_interval(mapped_k_prim @ inv_rot)
             entry, varnum, k_conv, entry_index = self._match_reference_kpoint(rotated, tol=tol)
             rotation_index = 0 if (index == len(candidate_rotations) and not has_inversion) else index
 
             if entry is not None:
-                candidate = KPointResolution(
-                    entry=entry,
-                    entry_index=entry_index,
-                    mapped_k_prim=mapped_k_prim.copy(),
-                    rotated_k_prim=rotated,
-                    k_conv=k_conv,
-                    rotation_index=rotation_index,
-                    variable_count=varnum,
-                )
                 entry_lg_size = int(entry.irreps[0].active_ops[: self.doubnum // 2].sum())
                 entry_lg_set = {int(i) + 1 for i in entry.little_group_ops if int(i) < self.doubnum // 2}
+                effective_rotation_index = int(rotation_index)
+                effective_rotated = np.asarray(rotated, dtype=float).copy()
+                effective_varnum = int(varnum)
+                effective_k_conv = np.asarray(k_conv, dtype=float)
+                effective_entry_index = int(entry_index)
+                effective_fracdiff = _frac_diff(rotated, entry.k_prim)
+                effective_entry = entry
+                if effective_rotation_index > 1 and effective_rotation_index in entry_lg_set:
+                    identity_entry, identity_varnum, identity_k_conv, identity_entry_index = self._match_reference_kpoint(
+                        mapped_k_prim,
+                        tol=tol,
+                    )
+                    if identity_entry is not None and int(identity_entry_index) == int(entry_index):
+                        effective_entry = identity_entry
+                        effective_entry_index = int(identity_entry_index)
+                        effective_k_conv = np.asarray(identity_k_conv, dtype=float)
+                        effective_rotation_index = 1
+                        effective_varnum = int(identity_varnum)
+                        effective_rotated = np.asarray(mapped_k_prim, dtype=float).copy()
+                        effective_fracdiff = _frac_diff(effective_rotated, identity_entry.k_prim)
+                candidate = KPointResolution(
+                    entry=effective_entry,
+                    entry_index=effective_entry_index,
+                    mapped_k_prim=mapped_k_prim.copy(),
+                    rotated_k_prim=effective_rotated,
+                    k_conv=effective_k_conv,
+                    rotation_index=effective_rotation_index,
+                    variable_count=effective_varnum,
+                )
                 score = (
-                    len(entry_lg_set.symmetric_difference(detected_set)) if detected_set is not None else 0,
+                    abs(entry_lg_size - detected_size) if detected_size is not None else 0,
                     abs(entry_lg_size - little_group_size) if little_group_size is not None else 0,
                     0,
-                    varnum,
-                    _frac_diff(rotated, entry.k_prim),
+                    effective_varnum,
+                    effective_fracdiff,
                 )
                 if best is None or score < best[0]:
                     best = (score, candidate)
@@ -544,6 +564,13 @@ class KLittleGroupsDB:
                     value *= np.exp(1j * angle)
             else:
                 raise ValueError(f"Unexpected phase kind {phase_kind} for irrep {irrep.name}.")
+            if (
+                phase_k_direct is not None
+                and phase_operations is not None
+                and not self._uses_nonsymmorphic_factor_system(resolution)
+                and 0 <= int(active_idx) < len(phase_operations)
+            ):
+                value *= self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
             values.append(value)
         return np.asarray(values, dtype=complex)
 
