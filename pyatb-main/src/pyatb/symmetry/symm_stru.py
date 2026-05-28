@@ -1319,13 +1319,14 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                 "Inconsistent lattice transform from source to standardized structure: "
                 f"chain={b13_chain.tolist()}, direct={b13_direct.tolist()}"
             )
+        idealized_mapping_tol = max(5.0e-3, 5.0e-4, map_tol * 10.0)
         mapping_result = build_structure_mapping(
             source_atoms,
             std_atoms,
             rotation_matrix=q23_row,
             supercell_matrix=b13_chain,
             fractional_translation=np.zeros(3, dtype=float),
-            tol=max(5.0e-4, map_tol * 10.0),
+            tol=idealized_mapping_tol,
             lattice_tol=max(1.0e-4, map_tol * 10.0),
         )
         atom_mapping = structure_mapping_to_tuples(mapping_result)

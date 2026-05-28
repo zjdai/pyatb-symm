@@ -248,7 +248,10 @@ def build_structure_mapping(
     )
 
     source_frac = np.asarray(source_atoms.get_scaled_positions(wrap=False), dtype=float)
-    target_frac = _wrap_fractional(np.asarray(target_atoms.get_scaled_positions(wrap=False), dtype=float), tol=tol)
+    target_frac = _wrap_fractional(
+        np.asarray(target_atoms.get_scaled_positions(wrap=False), dtype=float),
+        tol=1.0e-9,
+    )
     source_numbers = np.asarray(source_atoms.get_atomic_numbers(), dtype=int)
     target_numbers = np.asarray(target_atoms.get_atomic_numbers(), dtype=int)
     source_symbols = list(source_atoms.get_chemical_symbols())

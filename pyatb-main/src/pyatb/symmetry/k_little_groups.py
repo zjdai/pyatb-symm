@@ -526,6 +526,15 @@ class KLittleGroupsDB:
         return np.exp(1j * angle)
 
     @staticmethod
+    def _translation_phase(k_direct, translation) -> complex:
+        k = np.asarray(k_direct, dtype=float).reshape(-1)
+        tau = np.asarray(translation, dtype=float).reshape(-1)
+        if k.size < 3 or tau.size < 3:
+            return 1.0 + 0.0j
+        angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
+        return np.exp(1j * angle)
+
+    @staticmethod
     def _uses_nonsymmorphic_factor_system(resolution: KPointResolution) -> bool:
         return not bool(getattr(resolution, "cornwell_satisfied", True))
 
@@ -544,6 +553,7 @@ class KLittleGroupsDB:
         table_operation_indices,
         phase_k_direct=None,
         phase_operations=None,
+        table_operation_translations=None,
     ) -> np.ndarray:
         raw_characters = np.asarray(irrep.characters, dtype=complex)
         if self._uses_nonsymmorphic_factor_system(resolution):
@@ -551,8 +561,13 @@ class KLittleGroupsDB:
 
         active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
         table_active = np.asarray(table_operation_indices, dtype=int).reshape(-1)
+        table_translations = None
+        if table_operation_translations is not None:
+            table_translations = np.asarray(table_operation_translations, dtype=float)
+            table_translations = np.atleast_2d(table_translations)
+
         values: list[complex] = []
-        for active_idx, table_idx in zip(active, table_active):
+        for pos, (active_idx, table_idx) in enumerate(zip(active, table_active)):
             if table_idx < 0 or table_idx >= raw_characters.size:
                 values.append(np.nan + 0.0j)
                 continue
@@ -565,6 +580,18 @@ class KLittleGroupsDB:
             else:
                 raise ValueError(f"Unexpected phase kind {phase_kind} for irrep {irrep.name}.")
             if (
+                phase_k_direct is not None
+                and phase_operations is not None
+                and table_translations is not None
+                and self._uses_nonsymmorphic_factor_system(resolution)
+                and pos < table_translations.shape[0]
+                and 0 <= int(active_idx) < len(phase_operations)
+            ):
+                table_phase = self._translation_phase(phase_k_direct, table_translations[pos])
+                active_phase = self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+                if abs(table_phase) > 1.0e-14:
+                    value *= active_phase / table_phase
+            elif (
                 phase_k_direct is not None
                 and phase_operations is not None
                 and not self._uses_nonsymmorphic_factor_system(resolution)

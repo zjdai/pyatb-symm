@@ -86,6 +86,47 @@ class KPointLittleGroupMixin:
             value = fallback
         return np.asarray(value, dtype=float)
 
+    @staticmethod
+    def _table_phase_k_direct(resolution, db, current_to_db_prim: np.ndarray | None = None) -> np.ndarray:
+        k_db = np.asarray(resolution.k_conv, dtype=float) @ np.asarray(db.kc2p, dtype=float)
+        if current_to_db_prim is None:
+            return np.asarray(k_db, dtype=float)
+        transform = np.asarray(current_to_db_prim, dtype=float)
+        if np.allclose(transform, np.eye(3), atol=1.0e-12):
+            return np.asarray(k_db, dtype=float)
+        return np.asarray(k_db @ np.linalg.inv(transform), dtype=float)
+
+    @staticmethod
+    def _table_operation_translations_primitive(
+        db,
+        table_operation_indices,
+        current_to_db_prim: np.ndarray | None = None,
+    ) -> np.ndarray:
+        indices = np.asarray(table_operation_indices, dtype=int).reshape(-1)
+        translations = np.zeros((indices.size, 3), dtype=float)
+        kc2p = getattr(db, "kc2p", None)
+        conv_to_prim = None
+        if kc2p is not None:
+            transform = np.asarray(kc2p, dtype=float)
+            if not np.allclose(transform, np.eye(3), atol=1.0e-12):
+                conv_to_prim = np.linalg.inv(transform)
+        current_transform = None
+        if current_to_db_prim is not None:
+            transform = np.asarray(current_to_db_prim, dtype=float)
+            if not np.allclose(transform, np.eye(3), atol=1.0e-12):
+                current_transform = transform
+
+        for pos, idx in enumerate(indices):
+            if int(idx) < 0 or int(idx) >= len(getattr(db, "symops", [])):
+                continue
+            tau = np.asarray(db.symops[int(idx)].translation, dtype=float).reshape(3)
+            if conv_to_prim is not None:
+                tau = conv_to_prim @ tau
+            if current_transform is not None:
+                tau = current_transform @ tau
+            translations[pos, :] = tau
+        return translations
+
     @classmethod
     def _validate_representative_little_group(
         cls,
@@ -246,6 +287,16 @@ class KPointLittleGroupMixin:
                     database_operation_indices=active_db_ops,
                 )
                 character_k_direct = self._representative_k_direct(resolution, k)
+                phase_k_direct = self._table_phase_k_direct(
+                    resolution,
+                    db,
+                    current_to_db_prim=current_to_db_prim,
+                )
+                table_operation_translations = self._table_operation_translations_primitive(
+                    db,
+                    table_ops,
+                    current_to_db_prim=current_to_db_prim,
+                )
                 character_operation_indices = list(active_db_ops)
                 resolution.cornwell_satisfied = self._cornwell_condition_satisfied(
                     character_k_direct,
@@ -263,6 +314,8 @@ class KPointLittleGroupMixin:
                         "table_operation_indices": table_ops,
                         "database_operation_indices": active_db_ops,
                         "character_k_direct": character_k_direct,
+                        "phase_k_direct": phase_k_direct,
+                        "table_operation_translations": table_operation_translations,
                         "character_operation_indices": character_operation_indices,
                         "resolution": resolution,
                         "k_name": resolution.entry.name,
@@ -394,6 +447,16 @@ class KPointLittleGroupMixin:
                 database_operation_indices=active_db_ops,
             )
             character_k_direct = self._representative_k_direct(resolution, k)
+            phase_k_direct = self._table_phase_k_direct(
+                resolution,
+                db,
+                current_to_db_prim=current_to_db_prim,
+            )
+            table_operation_translations = self._table_operation_translations_primitive(
+                db,
+                table_ops,
+                current_to_db_prim=current_to_db_prim,
+            )
             character_operation_indices = list(active_db_ops)
             resolution.cornwell_satisfied = self._cornwell_condition_satisfied(
                 character_k_direct,
@@ -411,6 +474,8 @@ class KPointLittleGroupMixin:
                     "table_operation_indices": table_ops,
                     "database_operation_indices": active_db_ops,
                     "character_k_direct": character_k_direct,
+                    "phase_k_direct": phase_k_direct,
+                    "table_operation_translations": table_operation_translations,
                     "character_operation_indices": character_operation_indices,
                     "resolution": resolution,
                     "k_name": resolution.entry.name,
@@ -511,6 +576,8 @@ class KPointLittleGroupMixin:
                 fp.write(f"{idx + 1:12d}")
             fp.write("\n")
 
+            table_operation_translations = record.get("table_operation_translations")
+            table_phase_k_direct = record.get("phase_k_direct", k_star_prim)
             for ir_index, ir in enumerate(match.irreps):
                 display_name = ir.raw_name[1:] if ir.raw_name.startswith("-") else ir.raw_name
                 traces = db.irrep_table_character_slice(
@@ -518,8 +585,9 @@ class KPointLittleGroupMixin:
                     ir,
                     display_db_ops,
                     display_db_ops,
-                    phase_k_direct=k_star_prim,
+                    phase_k_direct=table_phase_k_direct,
                     phase_operations=table_phase_operations,
+                    table_operation_translations=table_operation_translations,
                 )
                 fp.write(f"{ir.reality:5d}   {display_name:<6s}")
                 for value in traces:

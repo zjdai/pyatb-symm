@@ -449,8 +449,9 @@ class Character:
                         tol=5.0e-2,
                         spinful=int(getattr(self._tb, "nspin", 1)) == 4,
                         table_operation_indices=character_operation_indices,
-                        phase_k_direct=character_k_direct,
+                        phase_k_direct=record.get("phase_k_direct", kpoints_direct[k_index]),
                         phase_operations=source_operations,
+                        table_operation_translations=record.get("table_operation_translations"),
                     )
                 except Exception:
                     try:
@@ -462,8 +463,9 @@ class Character:
                             tol=1.0e-1,
                             spinful=int(getattr(self._tb, "nspin", 1)) == 4,
                             table_operation_indices=character_operation_indices,
-                            phase_k_direct=character_k_direct,
+                            phase_k_direct=record.get("phase_k_direct", kpoints_direct[k_index]),
                             phase_operations=source_operations,
+                            table_operation_translations=record.get("table_operation_translations"),
                         )
                     except Exception:
                         irrep = "??"
