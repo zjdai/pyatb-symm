@@ -109,14 +109,154 @@ def spin_half_matrix_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarr
     )
 
 
+def _clip_unit(value: float) -> float:
+    return max(-1.0, min(1.0, float(value)))
+
+
+def _snap_irvsp_angle(angle: float, max_angle: float, tolp: float = 5.0e-6) -> float:
+    value = float(angle)
+    pi = float(np.pi)
+    for multiple in range(-4, 5):
+        snapped = multiple * pi
+        if abs(value - snapped) < 1.0e-6:
+            value = snapped
+            break
+
+    while value < 0.0:
+        value += max_angle
+    while value > max_angle:
+        value -= max_angle
+
+    if abs(value) < tolp:
+        value = 1.0e-12
+    if abs(value - max_angle) < tolp:
+        value = float(max_angle)
+    return float(value)
+
+
+def irvsp_euler_angles_from_cartesian_rotation(rot_cart: np.ndarray) -> np.ndarray:
+    """Euler angles using IRVSP's eulang.f convention."""
+    mat = np.asarray(rot_cart, dtype=float)
+    tol = 5.0e-5
+    pi = float(np.pi)
+    two_pi = 2.0 * pi
+
+    c33 = _clip_unit(mat[2, 2])
+    beta = float(np.arccos(c33))
+
+    if abs(abs(c33) - 1.0) < tol:
+        alpha = float(np.arccos(_clip_unit(c33 * mat[0, 0])))
+        if mat[0, 1] < 0.0:
+            alpha = two_pi - alpha
+        gamma = 0.0
+    else:
+        sin_beta = float(np.sin(beta))
+        alpha = float(np.arccos(_clip_unit(-mat[0, 2] / sin_beta)))
+        if (mat[1, 2] / sin_beta) < 0.0:
+            alpha = two_pi - alpha
+        gamma = float(np.arccos(_clip_unit(mat[2, 0] / sin_beta)))
+        if (mat[2, 1] / sin_beta) < 0.0:
+            gamma = two_pi - gamma
+
+    beta = _snap_irvsp_angle(beta, pi)
+    alpha = _snap_irvsp_angle(alpha, two_pi)
+    gamma = _snap_irvsp_angle(gamma, two_pi)
+    return np.array([beta, alpha, gamma], dtype=float)
+
+
+def _canonicalize_irvsp_spin_sign(spin: np.ndarray, tol: float = 1.0e-3) -> np.ndarray:
+    """Select the same local SU(2) sign branch as IRVSP rmprop.f."""
+    out = np.asarray(spin, dtype=complex).copy()
+    trace = out[0, 0] + out[1, 1]
+    if float(np.real(trace)) < 0.0:
+        out = -out
+        trace = -trace
+
+    if float(np.real(trace)) < tol and float(np.real(out[0, 0])) < tol:
+        yy1 = abs(float(np.real(out[0, 0]))) + abs(float(np.imag(out[0, 0])))
+        yy2 = abs(float(np.real(out[0, 1]))) + yy1
+        flip = False
+        if float(np.real(out[0, 0])) < -tol:
+            flip = True
+        elif float(np.imag(out[0, 0])) < -tol:
+            flip = True
+        elif yy1 < tol and float(np.real(out[0, 1])) < -tol:
+            flip = True
+        elif yy2 < tol and float(np.imag(out[0, 1])) < -tol:
+            flip = True
+        if flip:
+            out = -out
+    return out
+
+
+def spin_half_matrix_irvsp_from_cartesian_rotation(rot_cart: np.ndarray) -> np.ndarray:
+    """
+    Build spin-1/2 matrix with IRVSP's SU2OP/EULANG/RMPROP local convention.
+
+    For improper operations, IRVSP first removes inversion and constructs the
+    spin matrix from the proper rotation part.
+    """
+    rot = np.asarray(rot_cart, dtype=float)
+    proper_rot = -rot if float(np.linalg.det(rot)) < 0.0 else rot
+    beta, alpha, gamma = irvsp_euler_angles_from_cartesian_rotation(proper_rot)
+
+    sip = np.sin(0.5 * beta)
+    cop = np.cos(0.5 * beta)
+    epp = 0.5 * (alpha + gamma)
+    enn = 0.5 * (alpha - gamma)
+
+    spin = np.array(
+        [
+            [cop * np.exp(1.0j * epp), sip * np.exp(1.0j * enn)],
+            [-sip * np.exp(-1.0j * enn), cop * np.exp(-1.0j * epp)],
+        ],
+        dtype=complex,
+    )
+    return _canonicalize_irvsp_spin_sign(spin)
+
+
+def canonicalize_irvsp_spin_group_signs(
+    rotations: list[np.ndarray] | tuple[np.ndarray, ...],
+    spin_matrices: list[np.ndarray] | tuple[np.ndarray, ...],
+    tol: float = 1.0e-3,
+) -> list[np.ndarray]:
+    """Apply IRVSP's group-wide unbarred-operation sign convention."""
+    rotations_i = [np.asarray(rot, dtype=int) for rot in rotations]
+    spins = [_canonicalize_irvsp_spin_sign(spin) for spin in spin_matrices]
+
+    for i, rot_i in enumerate(rotations_i):
+        for j, rot_j in enumerate(rotations_i):
+            inv_j = np.asarray(np.rint(np.linalg.inv(rot_j)).astype(int), dtype=int)
+            target = rot_j @ rot_i @ inv_j
+            k = None
+            for idx, rot_k in enumerate(rotations_i):
+                if np.array_equal(rot_k, target):
+                    k = idx
+                    break
+            if k is None:
+                raise ValueError("IRVSP spin convention failed: cannot find conjugated rotation.")
+            if k >= i:
+                continue
+
+            inv_spin_j = np.linalg.inv(spins[j])
+            transformed = spins[j] @ spins[i] @ inv_spin_j
+            diff_plus = float(np.sum(np.abs(transformed + spins[k])))
+            diff_minus = float(np.sum(np.abs(transformed - spins[k])))
+            if diff_plus > tol and diff_minus > tol:
+                raise ValueError("IRVSP spin convention failed: inconsistent SU(2) conjugation.")
+            if diff_plus < tol:
+                spins[i] = -spins[i]
+
+    return spins
+
+
 def spin_half_matrix_from_cartesian_rotation(rot_cart: np.ndarray) -> np.ndarray:
     """
     Build the spin-1/2 rotation matrix from a 3x3 Cartesian operation.
 
-    For improper operations, only the proper-rotation part contributes to spin.
+    The sign branch follows IRVSP's double-valued representation convention.
     """
-    axis, angle, _ = axis_angle_from_cartesian_rotation(rot_cart)
-    return spin_half_matrix_from_axis_angle(axis, angle)
+    return spin_half_matrix_irvsp_from_cartesian_rotation(rot_cart)
 
 
 def _complex_basis_operators(l: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

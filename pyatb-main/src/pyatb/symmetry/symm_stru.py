@@ -14,7 +14,11 @@ from ase.io import read as ase_read
 from pyatb import INPUT_PATH, RANK, RUNNING_LOG
 from pyatb.constants import Ang_to_Bohr
 from pyatb.io.abacus_read_stru import _wrap_fractional_coordinates
-from pyatb.symmetry.Dk_matrix import axis_angle_from_cartesian_rotation, spin_half_matrix_from_cartesian_rotation
+from pyatb.symmetry.Dk_matrix import (
+    axis_angle_from_cartesian_rotation,
+    canonicalize_irvsp_spin_group_signs,
+    spin_half_matrix_from_cartesian_rotation,
+)
 from pyatb.symmetry.hs_standardize import canonicalize_fractional_coordinates, map_target_r_vector
 from pyatb.symmetry.k_little_groups import KLittleGroupsDB
 from pyatb.symmetry.kpoint_little_group import KPointLittleGroupMixin
@@ -895,6 +899,14 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                 )
             )
 
+        if ops:
+            spin_matrices = canonicalize_irvsp_spin_group_signs(
+                [operation.rotation for operation in ops],
+                [operation.spin_matrix for operation in ops],
+            )
+            for operation, spin in zip(ops, spin_matrices, strict=True):
+                operation.spin_matrix = spin
+
         return ops
 
     @staticmethod
@@ -1230,6 +1242,15 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         reordered = [operations[i] for i in order]
         return reordered, warnings
 
+    @staticmethod
+    def _apply_database_spin_convention(operations: list[SymmetryOperation], db: KLittleGroupsDB) -> None:
+        n_target = min(len(operations), int(getattr(db, "doubnum", 0)) // 2, len(getattr(db, "symops", [])))
+        for idx in range(n_target):
+            spin = np.asarray(getattr(db.symops[idx], "spin", np.eye(2, dtype=complex)), dtype=complex)
+            if spin.shape != (2, 2) or float(np.linalg.norm(spin)) <= 1.0e-12:
+                continue
+            operations[idx].spin_matrix = spin.copy()
+
     def _database_alignment_summary(self, operations: list[SymmetryOperation], db: KLittleGroupsDB):
         n_target = min(len(operations), db.doubnum // 2)
         used: set[int] = set()
@@ -1517,6 +1538,9 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                 )
                 del source_align_error
                 match_summary_ok, match_summary_details = self._database_alignment_summary(database_aligned_operations, db)
+        self._apply_database_spin_convention(reordered_ops, db)
+        self._apply_database_spin_convention(aligned_source_ops, db)
+
         origin_redefined_for_report = self._origin_shift_applied(
             source_to_std_origin_shift,
             database_origin_shift,

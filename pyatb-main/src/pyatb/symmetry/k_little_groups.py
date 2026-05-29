@@ -219,7 +219,7 @@ class KLittleGroupsDB:
             ints = np.frombuffer(rec[:36], dtype=np.int32).reshape(3, 3)
             vals = np.frombuffer(rec[36:], dtype=np.float64)
             tau = vals[:3]
-            df = vals[3:].reshape(2, 4)
+            df = vals[3:].reshape((2, 4), order="F")
             spin = np.array(
                 [
                     [df[0, 0] * np.exp(1j * np.pi * df[1, 0]), df[0, 1] * np.exp(1j * np.pi * df[1, 1])],
