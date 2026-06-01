@@ -24,8 +24,7 @@ def _filter_irreps_by_spin(reolution_irreps, spinful: bool | None):
     filtered = []
     for irrep in irreps:
         raw_name = getattr(irrep, "raw_name", getattr(irrep, "name", ""))
-        reality = int(getattr(irrep, "reality", 1))
-        is_double_valued = str(raw_name).startswith("-") and reality == -1
+        is_double_valued = str(raw_name).startswith("-")
         if spinful and is_double_valued:
             filtered.append(irrep)
         if not spinful and not is_double_valued:

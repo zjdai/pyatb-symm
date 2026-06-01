@@ -108,6 +108,19 @@ class Character:
             return np.eye(2, dtype=complex)
         return spin_half_matrix_from_cartesian_rotation(np.asarray(cart_rotation, dtype=float))
 
+
+    @classmethod
+    def _operation_with_spin_override(cls, operation, spin_key: str):
+        spin = cls._operation_get(operation, spin_key)
+        if spin is None:
+            return operation
+        return {
+            "rotation": np.asarray(cls._operation_get(operation, "rotation", np.eye(3, dtype=int)), dtype=int),
+            "translation": np.asarray(cls._operation_get(operation, "translation", np.zeros(3, dtype=float)), dtype=float),
+            "cart_rotation": np.asarray(cls._operation_get(operation, "cart_rotation", np.eye(3, dtype=float)), dtype=float),
+            "spin_matrix": np.asarray(spin, dtype=complex),
+        }
+
     @staticmethod
     def _group_rows_by_k(rows: list[dict]) -> dict[int, list[dict]]:
         grouped: dict[int, list[dict]] = {}
@@ -419,15 +432,20 @@ class Character:
             character_k_direct = self._record_character_kpoint(record, kpoints_direct[k_index])
             active_operation_labels = [str(op_index + 1) for op_index in character_operation_indices]
 
-            op_matrices = [
-                build_dk_matrix(
-                    self._tb,
-                    character_k_direct,
-                    source_operations[op_index],
-                    map_tol=float(symm_prec),
+            use_factor_spin = int(getattr(self._tb, "nspin", 1)) == 4
+            op_matrices = []
+            for op_index in character_operation_indices:
+                operation = source_operations[op_index]
+                if use_factor_spin:
+                    operation = self._operation_with_spin_override(operation, "factor_spin_matrix")
+                op_matrices.append(
+                    build_dk_matrix(
+                        self._tb,
+                        character_k_direct,
+                        operation,
+                        map_tol=float(symm_prec),
+                    )
                 )
-                for op_index in character_operation_indices
-            ]
             groups = group_degenerate_bands(eigenvalues[local_pos], tol=5.0e-4)
 
             for group_start, group_stop in groups:

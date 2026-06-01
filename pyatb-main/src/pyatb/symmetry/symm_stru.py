@@ -17,6 +17,7 @@ from pyatb.io.abacus_read_stru import _wrap_fractional_coordinates
 from pyatb.symmetry.Dk_matrix import (
     axis_angle_from_cartesian_rotation,
     canonicalize_irvsp_spin_group_signs,
+    spin_half_matrix_from_axis_angle,
     spin_half_matrix_from_cartesian_rotation,
 )
 from pyatb.symmetry.hs_standardize import canonicalize_fractional_coordinates, map_target_r_vector
@@ -39,6 +40,7 @@ class SymmetryOperation:
     cart_rotation: np.ndarray
     euler_zyz: np.ndarray
     spin_matrix: np.ndarray
+    factor_spin_matrix: np.ndarray | None
     symbol: str
     description: str
     axis: np.ndarray
@@ -437,6 +439,11 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                     cart_rotation=np.asarray(op.cart_rotation, dtype=float),
                     euler_zyz=np.asarray(op.euler_zyz, dtype=float),
                     spin_matrix=np.asarray(op.spin_matrix, dtype=complex),
+                    factor_spin_matrix=(
+                        None
+                        if getattr(op, "factor_spin_matrix", None) is None
+                        else np.asarray(op.factor_spin_matrix, dtype=complex)
+                    ),
                     symbol=str(op.symbol),
                     description=str(op.description),
                     axis=np.asarray(op.axis, dtype=float),
@@ -861,6 +868,21 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         alpha = float(np.arctan2(mat[0, 1], mat[0, 0]))
         return np.array([alpha, np.pi, 0.0], dtype=float)
 
+
+    @staticmethod
+    def _irvsp_factor_spin_from_cartesian_rotation(cart_rotation: np.ndarray) -> np.ndarray:
+        rot = np.asarray(cart_rotation, dtype=float)
+        proper_rot = -rot if float(np.linalg.det(rot)) < 0.0 else rot
+        axis, angle, _ = axis_angle_from_cartesian_rotation(proper_rot)
+        canonical_axis = SymmStructureAnalyzer._canonicalize_axis(axis)
+        if abs(float(angle) - float(np.pi)) < 1.0e-6:
+            signed_angle = -float(angle)
+        elif float(np.dot(axis, canonical_axis)) < 0.0:
+            signed_angle = -float(angle)
+        else:
+            signed_angle = float(angle)
+        return spin_half_matrix_from_axis_angle(canonical_axis, signed_angle)
+
     @staticmethod
     def _build_symmetry_operations(std_atoms: Atoms, sym_data) -> list[SymmetryOperation]:
         lattice = np.asarray(std_atoms.cell.array, dtype=float)
@@ -881,6 +903,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             euler = SymmStructureAnalyzer._matrix_to_euler_zyz(proper_cart)
 
             spin = spin_half_matrix_from_cartesian_rotation(proper_cart)
+            factor_spin = SymmStructureAnalyzer._irvsp_factor_spin_from_cartesian_rotation(cart_rot)
             symbol, desc = SymmStructureAnalyzer._build_op_symbol_and_desc(rot_i)
             axis, _, _ = axis_angle_from_cartesian_rotation(proper_cart)
             axis = SymmStructureAnalyzer._canonicalize_axis(axis)
@@ -893,6 +916,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                     cart_rotation=cart_rot,
                     euler_zyz=euler,
                     spin_matrix=spin,
+                    factor_spin_matrix=factor_spin,
                     symbol=symbol,
                     description=desc,
                     axis=axis,
@@ -1243,13 +1267,191 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         return reordered, warnings
 
     @staticmethod
-    def _apply_database_spin_convention(operations: list[SymmetryOperation], db: KLittleGroupsDB) -> None:
-        n_target = min(len(operations), int(getattr(db, "doubnum", 0)) // 2, len(getattr(db, "symops", [])))
-        for idx in range(n_target):
-            spin = np.asarray(getattr(db.symops[idx], "spin", np.eye(2, dtype=complex)), dtype=complex)
-            if spin.shape != (2, 2) or float(np.linalg.norm(spin)) <= 1.0e-12:
+    def _find_spin_index(
+        spins: list[np.ndarray],
+        determinants: list[int],
+        matrix: np.ndarray,
+        determinant: int,
+        tol: float,
+    ) -> int:
+        matched = 0
+        for idx, (spin, det) in enumerate(zip(spins, determinants, strict=True), start=1):
+            if int(det) != int(determinant):
                 continue
-            operations[idx].spin_matrix = spin.copy()
+            diff = float(np.sum(np.abs(np.asarray(spin, dtype=complex) - np.asarray(matrix, dtype=complex))))
+            if diff < tol:
+                matched = idx
+        if matched == 0:
+            raise ValueError("IRVSP spin convention failed: cannot locate double-group product in spin table.")
+        return matched
+
+    @classmethod
+    def _signed_spin_multiplication_table(
+        cls,
+        rotations: list[np.ndarray],
+        spins: list[np.ndarray],
+        tol: float = 1.0e-3,
+    ) -> np.ndarray:
+        n_ops = len(spins)
+        full_spins = [np.asarray(spin, dtype=complex) for spin in spins]
+        full_spins.extend([-spin for spin in full_spins[:n_ops]])
+        determinants = [int(round(float(np.linalg.det(np.asarray(rot, dtype=float))))) for rot in rotations]
+        full_determinants = determinants + determinants
+
+        table = np.zeros((n_ops + 1, n_ops + 1), dtype=int)
+        for i in range(1, n_ops + 1):
+            for j in range(1, n_ops + 1):
+                product = full_spins[i - 1] @ full_spins[j - 1]
+                product_det = full_determinants[i - 1] * full_determinants[j - 1]
+                index = cls._find_spin_index(full_spins, full_determinants, product, product_det, tol)
+                table[i, j] = index if index <= n_ops else n_ops - index
+        return table
+
+    @staticmethod
+    def _irvsp_generator_flags(reference_table: np.ndarray) -> list[bool]:
+        n_ops = int(reference_table.shape[0]) - 1
+        is_generator = [False] + [True] * n_ops
+        by_generator = [False] * (n_ops + 1)
+
+        for op_index in range(2, n_ops + 1):
+            if not is_generator[op_index]:
+                continue
+            by_generator[op_index] = True
+            for generator_index in range(2, n_ops + 1):
+                if not by_generator[generator_index]:
+                    continue
+                current = op_index
+                for _ in range(n_ops + 1):
+                    current = abs(int(reference_table[generator_index, current]))
+                    if by_generator[current]:
+                        break
+                    is_generator[current] = False
+                    by_generator[current] = True
+                else:
+                    raise ValueError("IRVSP spin convention failed: generator search did not close.")
+        return is_generator
+
+    @classmethod
+    def _solve_database_spin_signs(
+        cls,
+        base_table: np.ndarray,
+        reference_table: np.ndarray,
+        reference_rotations: list[np.ndarray],
+    ) -> np.ndarray:
+        n_ops = int(reference_table.shape[0]) - 1
+        for i in range(1, n_ops + 1):
+            for j in range(1, n_ops + 1):
+                if abs(int(base_table[i, j])) != abs(int(reference_table[i, j])):
+                    raise ValueError(
+                        "IRVSP spin convention failed: local SU(2) and kLittleGroups multiplication tables "
+                        f"disagree at ({i}, {j})."
+                    )
+
+        inversion_index = 0
+        for idx, rotation in enumerate(reference_rotations, start=1):
+            if int(np.trace(np.asarray(rotation, dtype=int))) == -3:
+                inversion_index = idx
+                break
+
+        is_generator = cls._irvsp_generator_flags(reference_table)
+        generators = [
+            idx
+            for idx in range(2, n_ops + 1)
+            if is_generator[idx] and idx != inversion_index
+        ]
+
+        for assumption in range(2 ** len(generators)):
+            signs = [0] * (n_ops + 1)
+            signs[1] = 1
+            for gen_pos, op_index in enumerate(generators):
+                signs[op_index] = 1 if ((assumption >> gen_pos) & 1) else -1
+            if inversion_index:
+                signs[inversion_index] = 1
+
+            failed = False
+            for _ in range(n_ops * n_ops + 1):
+                changed = False
+                for i in range(1, n_ops + 1):
+                    if signs[i] == 0:
+                        continue
+                    for j in range(1, n_ops + 1):
+                        if signs[j] == 0:
+                            continue
+                        ref_value = int(reference_table[i, j])
+                        base_value = int(base_table[i, j])
+                        target = abs(ref_value)
+                        expected = signs[i] * signs[j]
+                        expected *= 1 if base_value > 0 else -1
+                        expected *= 1 if ref_value > 0 else -1
+                        if signs[target] == 0:
+                            signs[target] = expected
+                            changed = True
+                        elif signs[target] != expected:
+                            failed = True
+                            break
+                    if failed:
+                        break
+                if failed or all(sign != 0 for sign in signs[1:]):
+                    break
+                if not changed:
+                    break
+
+            if failed or not all(sign != 0 for sign in signs[1:]):
+                continue
+
+            for i in range(1, n_ops + 1):
+                for j in range(1, n_ops + 1):
+                    ref_value = int(reference_table[i, j])
+                    base_value = int(base_table[i, j])
+                    target = abs(ref_value)
+                    expected = signs[i] * signs[j]
+                    expected *= 1 if base_value > 0 else -1
+                    expected *= 1 if ref_value > 0 else -1
+                    if signs[target] != expected:
+                        failed = True
+                        break
+                if failed:
+                    break
+            if not failed:
+                return np.asarray(signs[1:], dtype=int)
+
+        raise ValueError("IRVSP spin convention failed: no double-group sign assignment matches kLittleGroups.")
+
+    @classmethod
+    def _apply_database_spin_convention(cls, operations: list[SymmetryOperation], db: KLittleGroupsDB) -> None:
+        n_target = min(len(operations), int(getattr(db, "doubnum", 0)) // 2, len(getattr(db, "symops", [])))
+        if n_target <= 0:
+            return
+
+        reference_rotations = [np.asarray(db.symops[idx].rotation, dtype=int) for idx in range(n_target)]
+        reference_spins = [np.asarray(db.symops[idx].spin, dtype=complex) for idx in range(n_target)]
+        base_rotations = [np.asarray(operations[idx].rotation, dtype=int) for idx in range(n_target)]
+        base_spins = [
+            spin_half_matrix_from_cartesian_rotation(np.asarray(operations[idx].cart_rotation, dtype=float))
+            for idx in range(n_target)
+        ]
+
+        reference_table = cls._signed_spin_multiplication_table(reference_rotations, reference_spins)
+        base_table = cls._signed_spin_multiplication_table(base_rotations, base_spins)
+        signs = cls._solve_database_spin_signs(base_table, reference_table, reference_rotations)
+
+        for operation, spin, sign in zip(operations[:n_target], base_spins, signs, strict=True):
+            aligned_spin = int(sign) * np.asarray(spin, dtype=complex)
+            operation.spin_matrix = aligned_spin.copy()
+            operation.factor_spin_matrix = aligned_spin.copy()
+
+
+
+    @staticmethod
+    def _apply_irvsp_spin_convention(operations: list[SymmetryOperation]) -> None:
+        if not operations:
+            return
+        spin_matrices = canonicalize_irvsp_spin_group_signs(
+            [operation.rotation for operation in operations],
+            [spin_half_matrix_from_cartesian_rotation(operation.cart_rotation) for operation in operations],
+        )
+        for operation, spin in zip(operations, spin_matrices, strict=True):
+            operation.spin_matrix = spin
 
     def _database_alignment_summary(self, operations: list[SymmetryOperation], db: KLittleGroupsDB):
         n_target = min(len(operations), db.doubnum // 2)
@@ -1955,6 +2157,9 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                 tol=max(1.0e-6, map_tol * 10.0),
             )
 
+        self._apply_database_spin_convention(reordered_ops, db)
+        self._apply_database_spin_convention(aligned_source_ops, db)
+
         canonical_kpoints = (
             np.zeros((0, 3), dtype=float)
             if kpoints_direct is None
@@ -2053,7 +2258,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                             f.write(f"  - reorder note: {warning}\n")
                     f.write("\n")
                 self._write_transformations(f, source_atoms, std_atoms, spgfile, standardization_result)
-                self._write_symmetry_operations(f, source_unitary_ops)
+                self._write_symmetry_operations(f, aligned_source_ops)
                 if canonical_kpoints.size > 0:
                     self._write_k_little_group_table(
                         f,
