@@ -74,10 +74,10 @@ def _resolve_data_file(base_dir: Path, raw_entry: str | Path) -> Path:
     return (base_dir / raw_path).resolve()
 
 
-def _wrap_fractional_coordinates(frac: np.ndarray, tol: float = 1.0e-6) -> np.ndarray:
+def _wrap_fractional_coordinates(frac: np.ndarray) -> np.ndarray:
+    # Match ABACUS UnitCell::check_dtau(): move fractional coordinates to [0, 1)
+    # without snapping near-boundary values to zero.
     wrapped = np.mod(np.asarray(frac, dtype=float), 1.0)
-    wrapped[np.abs(wrapped) <= tol] = 0.0
-    wrapped[np.abs(wrapped - 1.0) <= tol] = 0.0
     return wrapped
 
 def read_stru(stru_filename='STRU', pseudo_dir: str = './', orbital_dir: str = './'):

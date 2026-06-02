@@ -63,3 +63,19 @@ def test_read_stru_resolves_numerical_orbital_relative_to_stru(load_pyatb, tmp_p
     assert Path(atoms[0].orb_file) == orb_path
     assert atoms[0].l_max == 0
     assert atoms[0].mesh == 4
+
+
+def test_wrap_fractional_coordinates_matches_abacus_boundary(load_pyatb) -> None:
+    module = load_pyatb("pyatb.io.abacus_read_stru")
+
+    wrapped = module._wrap_fractional_coordinates(
+        module.np.array([-0.0000000500000006, -0.2500000500000006, 1.027989828221267])
+    )
+
+    module.np.testing.assert_allclose(
+        wrapped,
+        module.np.array([0.99999995, 0.74999995, 0.027989828221267]),
+        atol=1.0e-14,
+        rtol=0.0,
+    )
+
