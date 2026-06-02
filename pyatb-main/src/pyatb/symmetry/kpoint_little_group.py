@@ -552,28 +552,23 @@ class KPointLittleGroupMixin:
             fp.write(f"Primitive    basis  {k_star_prim[0]: .6f} {k_star_prim[1]: .6f} {k_star_prim[2]: .6f}\n")
             fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
             display_db_ops = list(record.get("database_operation_indices", table_db_ops))
-            cornwell_ok = bool(getattr(resolution, "cornwell_satisfied", True))
-            fp.write(f"Cornwell condition: {cornwell_ok}\n")
-            if match.irreps:
-                phase_tags = np.asarray(match.irreps[0].phase_kinds, dtype=int).reshape(-1)
-                fp.write("Phase_kind")
-                for idx in display_db_ops:
-                    value = 0
-                    if 0 <= int(idx) < phase_tags.size:
-                        value = 1 if int(phase_tags[int(idx)]) == 2 else 0
-                    fp.write(f"{value:4d}")
-                fp.write("\n")
+            antiunitary_text = "yes" if int(match.antisym) != 0 else "no"
+            fp.write(f"Existence of antiunitary symmetries： {antiunitary_text}\n")
+            character_col_width = 15
+            character_label_width = 14
+            band_table_prefix_width = 34
 
-            fp.write(
-                f"{len(display_db_ops)} symmetry operations (module lattice translations) "
-                f"in space group {db.path.stem.split('_')[-1]}\n"
-            )
-            fp.write(
-                f"{match.antisym:5d} : the existence of antiunitary symmetries. 1-exist; 0-no\n"
-            )
-            fp.write(" Reality")
+            def _operation_header_label(label, width):
+                label_text = str(label)
+                left_pad = max(0, (width - len(label_text)) // 2 + 1)
+                right_pad = max(0, width - len(label_text) - left_pad)
+                return " " * left_pad + label_text + " " * right_pad
+
+            # Keep operation columns aligned with the band-character table.
+            character_indent = " " * max(0, band_table_prefix_width - character_label_width)
+            fp.write(f"{character_indent}{'Reality':>8s}{'':6s}")
             for idx in display_db_ops:
-                fp.write(f"{idx + 1:12d}")
+                fp.write(_operation_header_label(idx + 1, character_col_width))
             fp.write("\n")
 
             table_operation_translations = record.get("table_operation_translations")
@@ -589,32 +584,15 @@ class KPointLittleGroupMixin:
                     phase_operations=table_phase_operations,
                     table_operation_translations=table_operation_translations,
                 )
-                fp.write(f"{ir.reality:5d}   {display_name:<6s}")
+                fp.write(f"{character_indent}{ir.reality:5d}   {display_name:<6s}")
                 for value in traces:
-                    fp.write(f"{self._format_complex(value):>12s}")
+                    fp.write(f"{self._format_complex(value):>{character_col_width}s}")
                 fp.write("\n")
 
                 next_is_double = ir_index + 1 < len(match.irreps) and match.irreps[ir_index + 1].raw_name.startswith("-")
                 current_is_single = not ir.raw_name.startswith("-")
                 if current_is_single and next_is_double:
-                    fp.write("        ")
-                    fp.write("-" * (12 * len(display_db_ops)))
+                    fp.write(" " * band_table_prefix_width)
+                    fp.write("-" * (character_col_width * len(display_db_ops)))
                     fp.write("\n")
 
-            fp.write("\n")
-            col_element = 10
-            col_ops = 14
-            col_axis = 32
-            fp.write(
-                f"{'element':^{col_element}s}"
-                f"{'symmetry ops':^{col_ops}s}"
-                f"{'main axes':^{col_axis}s}\n"
-            )
-            for idx in display_db_ops:
-                op = operations[idx]
-                axis_text = f"({op.axis[0]:7.3f}, {op.axis[1]:7.3f}, {op.axis[2]:7.3f})"
-                fp.write(
-                    f"{op.symbol:^{col_element}s}"
-                    f"{str(idx + 1):^{col_ops}s}"
-                    f"{axis_text:^{col_axis}s}\n"
-                )

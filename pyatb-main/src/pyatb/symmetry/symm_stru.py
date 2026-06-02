@@ -937,7 +937,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
     def _format_complex(z: complex, tol: float = 5.0e-6) -> str:
         real = 0.0 if abs(float(np.real(z))) < tol else float(np.real(z))
         imag = 0.0 if abs(float(np.imag(z))) < tol else float(np.imag(z))
-        return f"{real:.2f}{imag:+.2f}i"
+        return f"{real: .3f}{imag:+.3f}i"
 
     @staticmethod
     def _format_spin_row(u00: complex, u01: complex) -> str:

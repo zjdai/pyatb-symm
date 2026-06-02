@@ -280,7 +280,7 @@ def test_character_reads_original_stru_and_writes_trace_outputs(
     assert "CALCULATED BAND CHARACTERS" not in report_text
     assert report_text.index("band") > report_text.index("knum =  1")
     assert report_text.index("band") < report_text.rindex("********************************************************************************")
-    assert "=A" in report_text
+    assert "= A" in report_text
 
 
 def test_group_mismatch_raises_value_error(load_pyatb, tmp_path: Path) -> None:
@@ -1574,6 +1574,8 @@ def test_transformations_use_irvsp_column_vector_layout(load_pyatb) -> None:
     analyzer._write_transformations(buf, atoms, atoms, Path("/tmp/kLG_1.data"), {"need_rebuild_hs": False})
     text = buf.getvalue()
 
+    assert "Structure Standardization summary:" in text
+    assert "atom shift/changed: no" in text
     assert "a1       1.00000000      2.00000000      3.00000000" in text
     assert "a2       4.00000000      5.00000000      6.00000000" in text
     assert "a3       7.00000000      8.00000000     10.00000000" in text
@@ -1634,9 +1636,11 @@ def test_k_little_group_table_uses_star_resolution_and_irvsp_header(load_pyatb) 
     assert "knum =  1    kname=" in text
     assert "The k-point name is F" in text
     assert "    4    F  : kname      0.00 0.50 1.00 :  given in the conventional basis" in text
-    assert " Reality           1           5           7          11" in text
+    header_line = next(line for line in text.splitlines() if "Reality" in line)
+    assert header_line.startswith(" " * 20)
+    assert header_line.index("1", header_line.index("Reality")) == 42
     assert "F1+" in text
-    assert text.count("1.00+0.00i") >= 4
+    assert text.count("1.000+0.000i") >= 4
 
 
 
@@ -1672,9 +1676,11 @@ def test_k_little_group_table_omits_phase_factor_column(load_pyatb) -> None:
 
     assert "exp(-i*k*taui)" not in text
     assert "(+1.00 0.00i)" not in text
-    assert "element" in text
-    assert "symmetry ops" in text
-    assert "main axes" in text
+    assert "Existence of antiunitary symmetries： yes" in text
+    assert "Cornwell condition:" not in text
+    assert "Phase_kind" not in text
+    assert "module lattice translations" not in text
+    assert "symmetry ops" not in text
 
 
 

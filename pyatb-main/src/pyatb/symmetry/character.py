@@ -90,7 +90,73 @@ class Character:
 
     @classmethod
     def _format_report_complex(cls, value: complex) -> str:
-        return f"{cls._clean_real(value.real, tol=5.0e-3): .2f}{cls._clean_real(value.imag, tol=5.0e-3):+.2f}i"
+        return f"{cls._clean_real(value.real, tol=5.0e-4): .3f}{cls._clean_real(value.imag, tol=5.0e-4):+.3f}i"
+
+    @staticmethod
+    def _format_report_path(path_value) -> str:
+        try:
+            return str(Path(path_value).resolve())
+        except (OSError, RuntimeError, TypeError):
+            return str(path_value)
+
+    @staticmethod
+    def _format_covariance_summary_error(value, unit: str = "") -> str:
+        suffix = f" {unit}" if unit else ""
+        return f"{float(value):.6e}{suffix}"
+
+    @classmethod
+    def _update_character_report_runtime_summary(
+        cls,
+        report_path: Path,
+        *,
+        data_symmetrized: bool,
+        init_stru_path,
+        init_hr_path,
+        init_sr_path,
+        active_stru_path,
+        active_hr_path,
+        active_sr_path,
+        hr_stats: dict,
+        sr_stats: dict,
+    ) -> None:
+        path = Path(report_path)
+        if not path.exists():
+            return
+
+        replacements = {
+            "init stru file:": f"init stru file: {cls._format_report_path(init_stru_path)}",
+            "init hr file:": f"init hr file: {cls._format_report_path(init_hr_path)}",
+            "init sr file:": f"init sr file: {cls._format_report_path(init_sr_path)}",
+            "Structure standardized:": None,
+            "structure standardized:": None,
+            "Data symmetrized:": f"Data symmetrized: {'yes' if data_symmetrized else 'no'}",
+            "data symmetrized:": f"Data symmetrized: {'yes' if data_symmetrized else 'no'}",
+            "calculated stru:": f"calculated stru: {cls._format_report_path(active_stru_path)}",
+            "calculated hr file:": f"calculated hr file: {cls._format_report_path(active_hr_path)}",
+            "calculated sr file:": f"calculated sr file: {cls._format_report_path(active_sr_path)}",
+            "Symmetry operation Hamiltonian max error:": (
+                "Symmetry operation Hamiltonian max error: "
+                f"{cls._format_covariance_summary_error(hr_stats.get('global_max_abs', 0.0), 'eV')}"
+            ),
+            "Symmetry operation overlap max error:": (
+                "Symmetry operation overlap max error: "
+                f"{cls._format_covariance_summary_error(sr_stats.get('global_max_abs', 0.0))}"
+            ),
+        }
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        updated = []
+        for line in lines:
+            for prefix, replacement in replacements.items():
+                if line.startswith(prefix):
+                    if replacement is None:
+                        updated.append(f"Structure standardized: {line.split(':', 1)[1].strip()}")
+                    else:
+                        updated.append(replacement)
+                    break
+            else:
+                updated.append(line)
+        path.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
     @staticmethod
     def _operation_get(operation, key: str, default=None):
@@ -294,11 +360,22 @@ class Character:
         col_band = 8
         col_deg = 12
         col_eig = 14
-        col_widths = [max(13, len(str(label)) + 2) for label in header_labels]
+        character_col_width = 15
+        col_widths = [max(character_col_width, len(str(label)) + 2) for label in header_labels]
+
+        def _operation_header_label(label: object, width: int) -> str:
+            label_text = str(label)
+            left_pad = max(0, (width - len(label_text)) // 2 + 1)
+            right_pad = max(0, width - len(label_text) - left_pad)
+            return " " * left_pad + label_text + " " * right_pad
+
         lines = [
             "",
             f"{'band':^{col_band}s}{'degeneracy':^{col_deg}s}{'eigval':^{col_eig}s}"
-            + "".join(f"{str(label):^{width}s}" for label, width in zip(header_labels, col_widths, strict=True))
+            + "".join(
+                _operation_header_label(label, width)
+                for label, width in zip(header_labels, col_widths, strict=True)
+            )
             + " ",
         ]
         for row in rows:
@@ -309,7 +386,7 @@ class Character:
             )
             for character, width in zip(row["characters"], col_widths, strict=True):
                 text += f"{self._format_report_complex(character):>{width}s}"
-            text += f" ={row['irrep']}  "
+            text += f" = {row['irrep']}  "
             lines.append(text)
         return "\n".join(lines) + "\n"
 
@@ -740,7 +817,7 @@ class Character:
                     full_matrix_from_hermitian=full_matrix_from_hermitian,
                     symmetry_operations=hs_symmetry_operations,
                     symmetry_error_threshold=self._COVARIANCE_ERROR_ABORT_THRESHOLD,
-                    symmetry_report_path=Path(self.output_path) / "hs_standardize_symmetry_check.json",
+                    symmetry_report_path=None,
                     symmetry_map_tol=float(symm_prec),
                 )
 
@@ -800,6 +877,8 @@ class Character:
             stage_label="before data symmetrization",
             suggest_data_symmetrize=(data_symmetrize == 0),
         )
+        final_hr_stats = before_hr
+        final_sr_stats = before_sr
 
         if data_symmetrize == 1:
             operations = covariance_operations
@@ -839,6 +918,8 @@ class Character:
                 stage_label="after data symmetrization",
                 suggest_data_symmetrize=False,
             )
+            final_hr_stats = after_hr
+            final_sr_stats = after_sr
 
             cov_hr_path = Path(self.output_path) / f"{active_hr_path.stem}-covsymm.csr"
             cov_sr_path = Path(self.output_path) / f"{active_sr_path.stem}-covsymm.csr"
@@ -951,6 +1032,20 @@ class Character:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
                 fp.write("\nData Symmetrization (CHARACTER)\n")
                 fp.write("enabled = 0\n")
+
+        if RANK == 0:
+            self._update_character_report_runtime_summary(
+                Path(self.output_path) / "symmetry_character_report.txt",
+                data_symmetrized=bool(data_symmetrize == 1),
+                init_stru_path=Path(stru_file),
+                init_hr_path=Path(HR_route or "data-HR-sparse_SPIN0.csr"),
+                init_sr_path=Path(SR_route or "data-SR-sparse_SPIN0.csr"),
+                active_stru_path=active_stru_path,
+                active_hr_path=active_hr_path,
+                active_sr_path=active_sr_path,
+                hr_stats=final_hr_stats,
+                sr_stats=final_sr_stats,
+            )
 
         return {
             "analysis_result": analysis_result,
