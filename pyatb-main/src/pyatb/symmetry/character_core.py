@@ -41,6 +41,23 @@ def _current_operation_phase(k_direct, operation) -> complex:
     return np.exp(1j * angle)
 
 
+def _translation_phase_factors(k_direct, translations) -> np.ndarray:
+    arr = np.asarray(translations, dtype=float)
+    if arr.size == 0:
+        return np.ones(0, dtype=complex)
+    arr = np.atleast_2d(arr)
+    factors = np.ones(arr.shape[0], dtype=complex)
+    if k_direct is None or arr.shape[1] < 3:
+        return factors
+    k = np.asarray(k_direct, dtype=float).reshape(-1)
+    if k.size < 3:
+        return factors
+    for pos, tau in enumerate(arr):
+        angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
+        factors[pos] = np.exp(1j * angle)
+    return factors
+
+
 def _cornwell_satisfied(resolution) -> bool:
     return bool(getattr(resolution, "cornwell_satisfied", True))
 
