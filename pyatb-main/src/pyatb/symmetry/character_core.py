@@ -66,13 +66,23 @@ def _uses_nonsymmorphic_factor_system(resolution) -> bool:
     return not _cornwell_satisfied(resolution)
 
 
-def _should_use_coeff_phase(phase_kind: int, resolution) -> bool:
-    # phase_kind=2 stores a k-dependent table factor in coeff_uvw.  It is
-    # needed for general k-line irreps even when the Cornwell condition is
-    # satisfied; boundary entries with built-in phases use phase_kind=1.
+def _should_use_coeff_phase(phase_kind: int, resolution, *, force: bool = False) -> bool:
+    # Match the 5.29 kLittleGroups convention: phase_kind=2 entries carry
+    # the explicit coeff_uvw phase independent of the Cornwell branch.
     return int(phase_kind) == 2
 
 
+def _resolution_has_coeff_phase(resolution) -> bool:
+    entry = getattr(resolution, "entry", None)
+    for irrep in getattr(entry, "irreps", []):
+        phase_kinds = np.asarray(getattr(irrep, "phase_kinds", []), dtype=int).reshape(-1)
+        if np.any(phase_kinds == 2):
+            return True
+    return False
+
+
+def _uses_cornwell_star_phase(resolution) -> bool:
+    return _cornwell_satisfied(resolution) and int(getattr(resolution, "rotation_index", 0)) > 1
 
 
 def _comparison_character_candidates(
@@ -83,13 +93,26 @@ def _comparison_character_candidates(
     phase_k_direct=None,
     phase_operations=None,
     table_operation_translations=None,
-) -> list[tuple[np.ndarray, bool]]:
-    # The calculated band characters are compared directly with the same
-    # effective kLittleGroups table that is printed in the report.  Any Seitz
-    # representative mismatch is handled on the table side by the Delta-tau
-    # phase in _resolved_irrep_character_slice.
+) -> list[tuple[np.ndarray, bool, bool]]:
+    # Prefer the 5.29 kLittleGroups table convention: compare raw calculated
+    # band characters against tables with coeff_uvw phases applied.  Keep the
+    # no-coeff and operation-phase variants only as fallbacks for transformed
+    # source-operation conventions.
     raw = np.asarray(characters, dtype=complex).reshape(-1).copy()
-    return [(raw, True)]
+    has_coeff_phase = _resolution_has_coeff_phase(resolution)
+    preferred_operation_phase = (
+        phase_k_direct is not None
+        and phase_operations is not None
+        and table_operation_translations is not None
+    )
+    candidates = [(raw, preferred_operation_phase, has_coeff_phase)]
+    if preferred_operation_phase:
+        candidates.append((raw, False, has_coeff_phase))
+    if has_coeff_phase:
+        candidates.append((raw, preferred_operation_phase, False))
+        if preferred_operation_phase:
+            candidates.append((raw, False, False))
+    return candidates
 
 
 def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_operations=None) -> np.ndarray:
@@ -127,10 +150,14 @@ def _resolved_irrep_character_slice(
     phase_operations=None,
     table_operation_translations=None,
     apply_operation_phases: bool = True,
+    apply_coeff_phases: bool | None = None,
 ) -> np.ndarray:
     raw_table = np.asarray(getattr(irrep, "characters", []), dtype=complex).reshape(-1).copy()
     if raw_table.size == 0 or resolution is None:
         return raw_table
+
+    if apply_coeff_phases is None:
+        apply_coeff_phases = True
 
     if _uses_nonsymmorphic_factor_system(resolution):
         raw_table = np.conj(raw_table)
@@ -153,7 +180,8 @@ def _resolved_irrep_character_slice(
         phase_kind = int(phase_kinds[int(table_idx)]) if table_idx < phase_kinds.size else 1
         if table_idx < phase_kinds.size:
             if (
-                _should_use_coeff_phase(phase_kind, resolution)
+                bool(apply_coeff_phases)
+                and _should_use_coeff_phase(phase_kind, resolution)
                 and coeff_uvw.ndim == 2
                 and coeff_uvw.shape[1] >= 3
                 and k_conv.size >= 3
@@ -170,8 +198,8 @@ def _resolved_irrep_character_slice(
             ):
                 table_phase = _translation_phase_factors(phase_k_direct, table_translations[pos : pos + 1])[0]
                 active_phase = _current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-                if abs(active_phase) > 1.0e-14:
-                    value *= table_phase / active_phase
+                if abs(table_phase) > 1.0e-14:
+                    value *= active_phase / table_phase
         values.append(value)
     return np.asarray(values, dtype=complex)
 
@@ -221,7 +249,7 @@ def assign_irrep_from_characters(
 
     best_name = None
     best_error = np.inf
-    for target, apply_operation_phases in targets:
+    for target, apply_operation_phases, apply_coeff_phases in targets:
         for irrep in _filter_irreps_by_spin(resolution.entry.irreps, spinful):
             table = _resolved_irrep_character_slice(
                 irrep,
@@ -232,6 +260,7 @@ def assign_irrep_from_characters(
                 phase_operations=phase_operations,
                 table_operation_translations=table_operation_translations,
                 apply_operation_phases=apply_operation_phases,
+                apply_coeff_phases=apply_coeff_phases,
             )
             if table.size != target.size:
                 continue
@@ -298,7 +327,7 @@ def assign_irrep_combination(
 
     best = None
     accepted = None
-    for target_rank, (target, apply_operation_phases) in enumerate(targets):
+    for target_rank, (target, apply_operation_phases, apply_coeff_phases) in enumerate(targets):
         sliced_tables = []
         irrep_labels = []
         irrep_is_prefixed = []
@@ -312,6 +341,7 @@ def assign_irrep_combination(
                 phase_operations=phase_operations,
                 table_operation_translations=table_operation_translations,
                 apply_operation_phases=apply_operation_phases,
+                apply_coeff_phases=apply_coeff_phases,
             )
             if table.size != target.size:
                 continue

@@ -246,7 +246,89 @@ def test_assign_irrep_combination_does_not_double_count_table_phase(load_pyatb) 
     assert matched == "Z1 + Z3"
 
 
-def test_assign_irrep_combination_applies_coeff_phase_on_cornwell_line(load_pyatb) -> None:
+def test_cornwell_phase_kind_prefers_raw_table_before_coeff_fallback(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+
+    class _Op:
+        def __init__(self, translation):
+            self.translation = np.array(translation, dtype=float)
+
+    phase_kinds = [1, 2, 2, 1]
+    coeff_uvw = [
+        [0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
+    resolution = _FakeResolution(
+        _FakeEntry(
+            [
+                _FakeIrrep("DT1", [1.0 + 0.0j, 1.0 + 0.0j, 1.0 + 0.0j, 1.0 + 0.0j], phase_kinds=phase_kinds, coeff_uvw=coeff_uvw),
+                _FakeIrrep("DT2", [1.0 + 0.0j, 1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j], phase_kinds=phase_kinds, coeff_uvw=coeff_uvw),
+                _FakeIrrep("DT3", [1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j], phase_kinds=phase_kinds, coeff_uvw=coeff_uvw),
+                _FakeIrrep("DT4", [1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j, -1.0 + 0.0j], phase_kinds=phase_kinds, coeff_uvw=coeff_uvw),
+            ]
+        ),
+        k_conv=[0.0, 0.5, 0.0],
+        cornwell_satisfied=True,
+    )
+
+    matched = module.assign_irrep_combination(
+        np.array([1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j], dtype=complex),
+        resolution,
+        active_operation_indices=[0, 1, 2, 3],
+        table_operation_indices=[0, 1, 2, 3],
+        phase_k_direct=np.array([0.0, 0.5, 0.0], dtype=float),
+        phase_operations=[_Op([0.0, 0.0, 0.0]), _Op([0.0, 0.5, 0.0]), _Op([0.0, 0.5, 0.0]), _Op([0.0, 0.0, 0.0])],
+        table_operation_translations=np.zeros((4, 3), dtype=float),
+        max_terms=1,
+        tol=1.0e-8,
+        spinful=False,
+    )
+
+    assert matched == "DT3"
+
+
+def test_cornwell_star_operation_uses_inverse_representative_phase(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+
+    class _Op:
+        def __init__(self, translation):
+            self.translation = np.array(translation, dtype=float)
+
+    phase = np.exp(-0.2j)
+    tau = 0.2 / (2.0 * np.pi)
+    resolution = _FakeResolution(
+        _FakeEntry(
+            [
+                _FakeIrrep("SM1", [1.0 + 0.0j, 1.0 + 0.0j, 1.0 + 0.0j, 1.0 + 0.0j]),
+                _FakeIrrep("SM2", [1.0 + 0.0j, 1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j]),
+                _FakeIrrep("SM3", [1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j, -1.0 + 0.0j]),
+                _FakeIrrep("SM4", [1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j]),
+            ]
+        ),
+        k_conv=[0.9, 0.0, 0.0],
+        cornwell_satisfied=True,
+    )
+    resolution.rotation_index = 2
+
+    matched = module.assign_irrep_combination(
+        np.array([1.0 + 0.0j, -1.0 + 0.0j, -phase, phase], dtype=complex),
+        resolution,
+        active_operation_indices=[0, 1, 2, 3],
+        table_operation_indices=[0, 1, 2, 3],
+        phase_k_direct=np.array([1.0, 0.0, 0.0], dtype=float),
+        phase_operations=[_Op([0.0, 0.0, 0.0]), _Op([0.0, 0.0, 0.0]), _Op([tau, 0.0, 0.0]), _Op([tau, 0.0, 0.0])],
+        table_operation_translations=np.zeros((4, 3), dtype=float),
+        max_terms=1,
+        tol=1.0e-8,
+        spinful=False,
+    )
+
+    assert matched == "SM4"
+
+
+def test_assign_irrep_combination_falls_back_to_coeff_phase_on_cornwell_line(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.character_core")
     coeff_uvw = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.5]]
     phase_kinds = [1, 2, 2, 2]

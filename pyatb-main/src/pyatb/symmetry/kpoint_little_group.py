@@ -556,9 +556,7 @@ class KPointLittleGroupMixin:
             fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
             display_db_ops = list(record.get("database_operation_indices", table_db_ops))
             antiunitary_text = "yes" if int(match.antisym) != 0 else "no"
-            cornwell_ok = bool(getattr(resolution, "cornwell_satisfied", True))
-            fp.write(f"Cornwell condition: {cornwell_ok}\n")
-            fp.write(f"Existence of antiunitary symmetries： {antiunitary_text}\n")
+            fp.write(f"Existence of antiunitary symmetries: {antiunitary_text}\n")
             character_col_width = 15
             character_label_width = 14
             band_table_prefix_width = 34

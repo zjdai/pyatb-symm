@@ -1676,7 +1676,7 @@ def test_k_little_group_table_omits_phase_factor_column(load_pyatb) -> None:
 
     assert "exp(-i*k*taui)" not in text
     assert "(+1.00 0.00i)" not in text
-    assert "Existence of antiunitary symmetries： yes" in text
+    assert "Existence of antiunitary symmetries: yes" in text
     assert "Cornwell condition:" not in text
     assert "Phase_kind" not in text
     assert "module lattice translations" not in text

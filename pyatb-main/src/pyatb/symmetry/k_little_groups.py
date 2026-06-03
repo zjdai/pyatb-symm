@@ -540,10 +540,13 @@ class KLittleGroupsDB:
 
     @classmethod
     def _should_use_coeff_phase(cls, phase_kind: int, resolution: KPointResolution) -> bool:
-        # phase_kind=2 stores a k-dependent table factor in coeff_uvw.  It is
-        # needed for general k-line irreps even when the Cornwell condition is
-        # satisfied; boundary entries with built-in phases use phase_kind=1.
+        # Match the 5.29 kLittleGroups convention: phase_kind=2 entries carry
+        # the explicit coeff_uvw phase independent of the Cornwell branch.
         return int(phase_kind) == 2
+
+    @staticmethod
+    def _uses_cornwell_star_phase(resolution: KPointResolution) -> bool:
+        return bool(getattr(resolution, "cornwell_satisfied", True)) and int(getattr(resolution, "rotation_index", 0)) > 1
 
     def irrep_table_character_slice(
         self,
@@ -588,8 +591,8 @@ class KLittleGroupsDB:
             ):
                 table_phase = self._translation_phase(phase_k_direct, table_translations[pos])
                 active_phase = self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-                if abs(active_phase) > 1.0e-14:
-                    value *= table_phase / active_phase
+                if abs(table_phase) > 1.0e-14:
+                    value *= active_phase / table_phase
             values.append(value)
         return np.asarray(values, dtype=complex)
 
