@@ -540,10 +540,10 @@ class KLittleGroupsDB:
 
     @classmethod
     def _should_use_coeff_phase(cls, phase_kind: int, resolution: KPointResolution) -> bool:
-        # coeff_uvw is applied only in the nonsymmorphic kLittleGroups table
-        # branch.  Cornwell-satisfied k points are handled as ordinary
-        # point-group irreps, so phase_kind=2 is not an extra table phase there.
-        return int(phase_kind) == 2 and cls._uses_nonsymmorphic_factor_system(resolution)
+        # phase_kind=2 stores a k-dependent table factor in coeff_uvw.  It is
+        # needed for general k-line irreps even when the Cornwell condition is
+        # satisfied; boundary entries with built-in phases use phase_kind=1.
+        return int(phase_kind) == 2
 
     def irrep_table_character_slice(
         self,
@@ -583,21 +583,13 @@ class KLittleGroupsDB:
                 phase_k_direct is not None
                 and phase_operations is not None
                 and table_translations is not None
-                and self._uses_nonsymmorphic_factor_system(resolution)
                 and pos < table_translations.shape[0]
                 and 0 <= int(active_idx) < len(phase_operations)
             ):
                 table_phase = self._translation_phase(phase_k_direct, table_translations[pos])
                 active_phase = self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
-                if abs(table_phase) > 1.0e-14:
-                    value *= active_phase / table_phase
-            elif (
-                phase_k_direct is not None
-                and phase_operations is not None
-                and not self._uses_nonsymmorphic_factor_system(resolution)
-                and 0 <= int(active_idx) < len(phase_operations)
-            ):
-                value *= self._current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+                if abs(active_phase) > 1.0e-14:
+                    value *= table_phase / active_phase
             values.append(value)
         return np.asarray(values, dtype=complex)
 

@@ -23,6 +23,7 @@ class StructureMappingResult:
     max_atom_error: float
     mean_atom_error: float
     max_fractional_error: float
+    boundary_tol: float = 1.0e-6
     matrix_relation: str = _ROW_VECTOR_RELATION
 
 
@@ -37,6 +38,12 @@ def _canonical_shift(shift: np.ndarray, tol: float = 1.0e-9) -> np.ndarray:
     value = _wrap_fractional(np.asarray(shift, dtype=float), tol=tol)
     value[np.abs(value) <= tol] = 0.0
     return value
+
+
+def _canonicalize_boundary_fractional(frac: np.ndarray, boundary_tol: float) -> np.ndarray:
+    # Positions are periodic, but image shifts are discrete.  Canonicalize only
+    # cell-boundary numerical noise before choosing integer images.
+    return _wrap_fractional(np.asarray(frac, dtype=float), tol=max(float(boundary_tol), 0.0))
 
 
 def _integer_matrix(matrix: np.ndarray, tol: float) -> np.ndarray:
@@ -147,7 +154,9 @@ def _score_global_shift(
         cart_residual = frac_residual @ target_lattice
         cart_err = float(np.max(np.abs(cart_residual)))
         frac_err = float(np.max(np.abs(frac_residual)))
-        return shift, cart_err, frac_err
+        shift_l1 = int(np.sum(np.abs(shift)))
+        shift_linf = int(np.max(np.abs(shift))) if shift.size else 0
+        return shift, cart_err, frac_err, shift_l1, shift_linf
 
     if n_source == n_target:
         cost = np.full((n_source, n_target), big, dtype=float)
@@ -158,7 +167,7 @@ def _score_global_shift(
                 data = pair_data(old_idx, new_idx)
                 if data is None:
                     continue
-                shift, cart_err, frac_err = data
+                shift, cart_err, frac_err, shift_l1, shift_linf = data
                 cost[old_idx, new_idx] = cart_err
                 shift_table[(old_idx, new_idx)] = shift
                 frac_error_table[(old_idx, new_idx)] = frac_err
@@ -172,6 +181,8 @@ def _score_global_shift(
         mapping = []
         cart_errors = []
         frac_errors = []
+        shift_l1_values = []
+        shift_linf_values = []
         for old_idx, new_idx in zip(row_ind.tolist(), col_ind.tolist(), strict=True):
             shift = np.asarray(shift_table[(int(old_idx), int(new_idx))], dtype=int)
             mapping.append(
@@ -184,10 +195,14 @@ def _score_global_shift(
             )
             cart_errors.append(float(cost[int(old_idx), int(new_idx)]))
             frac_errors.append(float(frac_error_table[(int(old_idx), int(new_idx))]))
+            shift_l1_values.append(int(np.sum(np.abs(shift))))
+            shift_linf_values.append(int(np.max(np.abs(shift))) if shift.size else 0)
     else:
         mapping = []
         cart_errors = []
         frac_errors = []
+        shift_l1_values = []
+        shift_linf_values = []
         used_images: set[tuple[int, tuple[int, int, int]]] = set()
         for old_idx in range(n_source):
             best = None
@@ -195,25 +210,28 @@ def _score_global_shift(
                 data = pair_data(old_idx, new_idx)
                 if data is None:
                     continue
-                shift, cart_err, frac_err = data
+                shift, cart_err, frac_err, shift_l1, shift_linf = data
                 image_key = (int(new_idx), tuple(int(value) for value in shift.tolist()))
                 if image_key in used_images:
                     continue
-                if best is None or cart_err < best[0]:
-                    best = (cart_err, frac_err, int(new_idx), shift, image_key)
+                key = (float(cart_err), float(frac_err), int(shift_l1), int(shift_linf))
+                if best is None or key < best[0]:
+                    best = (key, cart_err, frac_err, int(new_idx), shift, image_key, shift_l1, shift_linf)
             if best is None:
                 return None
-            used_images.add(best[4])
+            used_images.add(best[5])
             mapping.append(
                 {
                     "old_atom": int(old_idx),
-                    "new_atom": int(best[2]),
-                    "shift": np.asarray(best[3], dtype=int),
+                    "new_atom": int(best[3]),
+                    "shift": np.asarray(best[4], dtype=int),
                     "species": str(source_symbols[int(old_idx)]),
                 }
             )
-            cart_errors.append(float(best[0]))
-            frac_errors.append(float(best[1]))
+            cart_errors.append(float(best[1]))
+            frac_errors.append(float(best[2]))
+            shift_l1_values.append(int(best[6]))
+            shift_linf_values.append(int(best[7]))
 
     return {
         "global_shift": np.asarray(global_shift, dtype=float),
@@ -221,6 +239,8 @@ def _score_global_shift(
         "max_atom_error": float(max(cart_errors) if cart_errors else 0.0),
         "mean_atom_error": float(np.mean(cart_errors) if cart_errors else 0.0),
         "max_fractional_error": float(max(frac_errors) if frac_errors else 0.0),
+        "total_abs_shift": int(sum(shift_l1_values) if shift_l1_values else 0),
+        "max_abs_shift": int(max(shift_linf_values) if shift_linf_values else 0),
     }
 
 
@@ -232,6 +252,7 @@ def build_structure_mapping(
     fractional_translation: np.ndarray | None = None,
     tol: float = 1.0e-5,
     lattice_tol: float | None = None,
+    boundary_tol: float = 1.0e-6,
 ) -> StructureMappingResult:
     """Build and validate source-atom to target-atom mapping for HS standardization."""
 
@@ -247,10 +268,14 @@ def build_structure_mapping(
         tol=float(lattice_tol if lattice_tol is not None else tol),
     )
 
-    source_frac = np.asarray(source_atoms.get_scaled_positions(wrap=False), dtype=float)
-    target_frac = _wrap_fractional(
+    boundary_tol = max(float(boundary_tol), 0.0)
+    source_frac = _canonicalize_boundary_fractional(
+        np.asarray(source_atoms.get_scaled_positions(wrap=False), dtype=float),
+        boundary_tol=boundary_tol,
+    )
+    target_frac = _canonicalize_boundary_fractional(
         np.asarray(target_atoms.get_scaled_positions(wrap=False), dtype=float),
-        tol=1.0e-9,
+        boundary_tol=boundary_tol,
     )
     source_numbers = np.asarray(source_atoms.get_atomic_numbers(), dtype=int)
     target_numbers = np.asarray(target_atoms.get_atomic_numbers(), dtype=int)
@@ -271,6 +296,7 @@ def build_structure_mapping(
             max_atom_error=0.0,
             mean_atom_error=0.0,
             max_fractional_error=0.0,
+            boundary_tol=float(boundary_tol),
         )
 
     source_frac_in_target = source_frac @ supercell
@@ -285,7 +311,7 @@ def build_structure_mapping(
         source_numbers,
         target_numbers,
         frac_shift,
-        tol=max(float(tol), 1.0e-9),
+        tol=max(float(tol), float(boundary_tol), 1.0e-9),
     )
 
     best = None
@@ -305,6 +331,8 @@ def build_structure_mapping(
             float(score["max_atom_error"]),
             float(score["mean_atom_error"]),
             float(score["max_fractional_error"]),
+            int(score.get("total_abs_shift", 0)),
+            int(score.get("max_abs_shift", 0)),
         )
         if best is None or key < best[0]:
             best = (key, score)
@@ -333,6 +361,7 @@ def build_structure_mapping(
         max_atom_error=float(score["max_atom_error"]),
         mean_atom_error=float(score["mean_atom_error"]),
         max_fractional_error=float(score["max_fractional_error"]),
+        boundary_tol=float(boundary_tol),
     )
 
 
@@ -368,6 +397,7 @@ def structure_mapping_summary(mapping_result: StructureMappingResult) -> dict:
         "max_atom_error": float(mapping_result.max_atom_error),
         "mean_atom_error": float(mapping_result.mean_atom_error),
         "max_fractional_error": float(mapping_result.max_fractional_error),
+        "boundary_tol": float(mapping_result.boundary_tol),
         "global_shift": np.asarray(mapping_result.global_shift, dtype=float).tolist(),
         "fractional_translation": np.asarray(mapping_result.fractional_translation, dtype=float).tolist(),
         "supercell_matrix": np.asarray(mapping_result.supercell_matrix, dtype=int).tolist(),

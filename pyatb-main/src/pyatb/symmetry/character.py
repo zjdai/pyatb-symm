@@ -507,9 +507,12 @@ class Character:
             if not character_operation_indices:
                 continue
             character_k_direct = self._record_character_kpoint(record, kpoints_direct[k_index])
+            phase_k_direct = np.asarray(record.get("phase_k_direct", character_k_direct), dtype=float)
             active_operation_labels = [str(op_index + 1) for op_index in character_operation_indices]
 
-            use_factor_spin = int(getattr(self._tb, "nspin", 1)) == 4
+            nspin = int(getattr(self._tb, "nspin", 1))
+            use_factor_spin = nspin in (1, 4)
+            spinful_filter = True if nspin == 4 else False
             op_matrices = []
             for op_index in character_operation_indices:
                 operation = source_operations[op_index]
@@ -542,9 +545,9 @@ class Character:
                         character_operation_indices,
                         max_terms=max_irrep_terms,
                         tol=5.0e-2,
-                        spinful=int(getattr(self._tb, "nspin", 1)) == 4,
-                        table_operation_indices=character_operation_indices,
-                        phase_k_direct=record.get("phase_k_direct", kpoints_direct[k_index]),
+                        spinful=spinful_filter,
+                        table_operation_indices=table_operation_indices,
+                        phase_k_direct=phase_k_direct,
                         phase_operations=source_operations,
                         table_operation_translations=record.get("table_operation_translations"),
                     )
@@ -556,9 +559,9 @@ class Character:
                             character_operation_indices,
                             max_terms=max_irrep_terms,
                             tol=1.0e-1,
-                            spinful=int(getattr(self._tb, "nspin", 1)) == 4,
-                            table_operation_indices=character_operation_indices,
-                            phase_k_direct=record.get("phase_k_direct", kpoints_direct[k_index]),
+                            spinful=spinful_filter,
+                            table_operation_indices=table_operation_indices,
+                            phase_k_direct=phase_k_direct,
                             phase_operations=source_operations,
                             table_operation_translations=record.get("table_operation_translations"),
                         )
@@ -573,7 +576,7 @@ class Character:
                         "degeneracy": group_stop - group_start + 1,
                         "energy": float(np.mean(eigenvalues[local_pos, group_start : group_stop + 1])),
                         "active_operation_indices": character_operation_indices,
-                        "table_operation_indices": character_operation_indices,
+                        "table_operation_indices": table_operation_indices,
                         "active_operation_labels": active_operation_labels,
                         "characters": characters,
                         "irrep": irrep,

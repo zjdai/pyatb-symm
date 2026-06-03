@@ -5,12 +5,41 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from ase import Atoms
 
 
 def _op(rotation, translation):
     return SimpleNamespace(
         rotation=np.array(rotation, dtype=int),
         translation=np.array(translation, dtype=float),
+    )
+
+
+def test_load_input_stru_canonicalizes_near_boundary_positions_for_mapping(
+    load_pyatb,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_pyatb("pyatb.symmetry.symm_stru")
+    (tmp_path / "STRU").write_text("ATOMIC_POSITIONS\n", encoding="utf-8")
+    atoms = Atoms(
+        "H",
+        cell=np.eye(3, dtype=float),
+        scaled_positions=[[-5.00000006e-8, 0.99999995, 0.25]],
+        pbc=True,
+    )
+    monkeypatch.setattr(module, "INPUT_PATH", str(tmp_path))
+    monkeypatch.setattr(module, "ase_read", lambda *args, **kwargs: atoms.copy())
+
+    analyzer = module.SymmStructureAnalyzer(tb=None, output_path=str(tmp_path))
+    loaded, source_path = analyzer._load_input_stru()
+
+    assert source_path == tmp_path / "STRU"
+    np.testing.assert_allclose(
+        loaded.get_scaled_positions(wrap=False),
+        np.array([[0.0, 0.0, 0.25]], dtype=float),
+        atol=1.0e-14,
+        rtol=0.0,
     )
 
 

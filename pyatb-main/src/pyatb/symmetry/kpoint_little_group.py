@@ -227,10 +227,12 @@ class KPointLittleGroupMixin:
         kpoints_direct: np.ndarray,
         current_to_db_prim: np.ndarray | None = None,
         phase_from_source_operations: bool = False,
+        phase_operations: list[SymmetryOperation] | None = None,
     ):
         records = []
         inverse_rotations = [np.asarray(op.inverse_rotation, dtype=int) for op in operations]
         has_inversion = any(op.symbol == "I" for op in operations)
+        cornwell_operations = operations if phase_operations is None else phase_operations
 
         for ik, k in enumerate(np.asarray(kpoints_direct, dtype=float), start=1):
             lkg = self._little_group_operation_indices(k, operations)
@@ -300,7 +302,7 @@ class KPointLittleGroupMixin:
                 character_operation_indices = list(active_db_ops)
                 resolution.cornwell_satisfied = self._cornwell_condition_satisfied(
                     character_k_direct,
-                    operations,
+                    cornwell_operations,
                     [int(idx) + 1 for idx in character_operation_indices],
                 )
                 resolution.phase_from_source_operations = bool(phase_from_source_operations)
@@ -460,7 +462,7 @@ class KPointLittleGroupMixin:
             character_operation_indices = list(active_db_ops)
             resolution.cornwell_satisfied = self._cornwell_condition_satisfied(
                 character_k_direct,
-                operations,
+                cornwell_operations,
                 [int(idx) + 1 for idx in character_operation_indices],
             )
             resolution.phase_from_source_operations = bool(phase_from_source_operations)
@@ -507,6 +509,7 @@ class KPointLittleGroupMixin:
             kpoints_direct,
             current_to_db_prim=current_to_db_prim,
             phase_from_source_operations=phase_from_source_operations,
+            phase_operations=phase_operations,
         ):
             ik = int(record["k_index"])
             k = np.asarray(record["k_direct"], dtype=float)
@@ -553,6 +556,8 @@ class KPointLittleGroupMixin:
             fp.write(f"Conventional basis  {k_star_conv[0]: .6f} {k_star_conv[1]: .6f} {k_star_conv[2]: .6f}\n")
             display_db_ops = list(record.get("database_operation_indices", table_db_ops))
             antiunitary_text = "yes" if int(match.antisym) != 0 else "no"
+            cornwell_ok = bool(getattr(resolution, "cornwell_satisfied", True))
+            fp.write(f"Cornwell condition: {cornwell_ok}\n")
             fp.write(f"Existence of antiunitary symmetries： {antiunitary_text}\n")
             character_col_width = 15
             character_label_width = 14
@@ -572,7 +577,7 @@ class KPointLittleGroupMixin:
             fp.write("\n")
 
             table_operation_translations = record.get("table_operation_translations")
-            table_phase_k_direct = record.get("phase_k_direct", k_star_prim)
+            table_phase_k_direct = np.asarray(record.get("phase_k_direct", k_star_prim), dtype=float)
             for ir_index, ir in enumerate(match.irreps):
                 display_name = ir.raw_name[1:] if ir.raw_name.startswith("-") else ir.raw_name
                 traces = db.irrep_table_character_slice(

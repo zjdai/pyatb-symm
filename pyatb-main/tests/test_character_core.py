@@ -169,3 +169,132 @@ def test_nonsymmorphic_boundary_table_conjugates_raw_characters_for_direct_match
     )
 
     assert matched == "T5 + T5"
+
+
+def test_assign_irrep_combination_applies_delta_tau_phase_to_table(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+
+    class _Op:
+        def __init__(self, translation):
+            self.translation = np.array(translation, dtype=float)
+
+    resolution = _FakeResolution(
+        _FakeEntry(
+            [
+                _FakeIrrep("Y3", [1.0 + 0.0j, 1.0 + 0.0j], raw_name="-Y3"),
+                _FakeIrrep("Y4", [1.0 + 0.0j, -1.0 + 0.0j], raw_name="-Y4"),
+            ]
+        ),
+        k_conv=[0.0, 0.5, 0.0],
+        cornwell_satisfied=False,
+    )
+    phase_operations = [_Op([0.0, 0.0, 0.0]), _Op([0.0, 0.5, 0.0])]
+
+    matched = module.assign_irrep_combination(
+        np.array([1.0 + 0.0j, 0.0 + 1.0j], dtype=complex),
+        resolution,
+        active_operation_indices=[0, 1],
+        table_operation_indices=[0, 1],
+        phase_k_direct=np.array([0.0, 0.5, 0.0], dtype=float),
+        phase_operations=phase_operations,
+        table_operation_translations=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float),
+        max_terms=1,
+        tol=1.0e-8,
+        spinful=False,
+    )
+
+    assert matched == "Y3"
+
+
+def test_assign_irrep_combination_does_not_double_count_table_phase(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+
+    class _Op:
+        def __init__(self, translation):
+            self.translation = np.array(translation, dtype=float)
+
+    phase = np.exp(0.25j * np.pi)
+    resolution = _FakeResolution(
+        _FakeEntry(
+            [
+                _FakeIrrep("Z1", [1.0 + 0.0j, 0.0 + 1.0j, phase, phase**3]),
+                _FakeIrrep("Z3", [1.0 + 0.0j, 0.0 - 1.0j, np.conj(phase), np.conj(phase**3)]),
+            ]
+        ),
+        k_conv=[0.0, 0.0, 0.5],
+        cornwell_satisfied=True,
+    )
+    translations = np.array(
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.5], [0.0, 0.0, 0.25], [0.0, 0.0, 0.75]],
+        dtype=float,
+    )
+    phase_operations = [_Op(tau) for tau in translations]
+
+    matched = module.assign_irrep_combination(
+        np.array([2.0 + 0.0j, 0.0 + 0.0j, 2.0**0.5 + 0.0j, -(2.0**0.5) + 0.0j], dtype=complex),
+        resolution,
+        active_operation_indices=[0, 1, 2, 3],
+        table_operation_indices=[0, 1, 2, 3],
+        phase_k_direct=np.array([0.0, 0.0, 0.5], dtype=float),
+        phase_operations=phase_operations,
+        table_operation_translations=translations,
+        max_terms=2,
+        tol=1.0e-8,
+        spinful=False,
+    )
+
+    assert matched == "Z1 + Z3"
+
+
+def test_assign_irrep_combination_applies_coeff_phase_on_cornwell_line(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+    coeff_uvw = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.5], [0.0, 0.0, 1.5]]
+    phase_kinds = [1, 2, 2, 2]
+    resolution = _FakeResolution(
+        _FakeEntry(
+            [
+                _FakeIrrep("LD5", [1.0 + 0.0j, 0.0 - 1.0j, -(2.0**-0.5) + (2.0**-0.5) * 1.0j, -(2.0**-0.5) - (2.0**-0.5) * 1.0j], phase_kinds=phase_kinds, coeff_uvw=coeff_uvw),
+                _FakeIrrep("LD6", [1.0 + 0.0j, 0.0 - 1.0j, (2.0**-0.5) - (2.0**-0.5) * 1.0j, (2.0**-0.5) + (2.0**-0.5) * 1.0j], phase_kinds=phase_kinds, coeff_uvw=coeff_uvw),
+            ]
+        ),
+        k_conv=[0.0, 0.0, 1.0 / 12.0],
+        cornwell_satisfied=True,
+    )
+
+    matched = module.assign_irrep_combination(
+        np.array([1.0 + 0.0j, -0.258819 - 0.965926j, 0.608761 - 0.793353j, 0.923880 + 0.382683j], dtype=complex),
+        resolution,
+        active_operation_indices=[0, 1, 2, 3],
+        table_operation_indices=[0, 1, 2, 3],
+        max_terms=1,
+        tol=1.0e-5,
+        spinful=True,
+    )
+
+    assert matched == "LD6"
+
+
+def test_spinless_assignment_prefers_irvsp_single_valued_decomposition(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character_core")
+    resolution = _FakeResolution(
+        _FakeEntry(
+            [
+                _FakeIrrep("R1", [1.0 + 0.0j, 1.0 + 0.0j, 1.0 + 0.0j, 1.0 + 0.0j]),
+                _FakeIrrep("R2", [1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j, -1.0 + 0.0j]),
+                _FakeIrrep("R3", [1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j, 1.0 + 0.0j]),
+                _FakeIrrep("R4", [1.0 + 0.0j, 1.0 + 0.0j, -1.0 + 0.0j, -1.0 + 0.0j]),
+                _FakeIrrep("R5", [2.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j], raw_name="-R5"),
+            ]
+        )
+    )
+
+    matched = module.assign_irrep_combination(
+        np.array([4.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j], dtype=complex),
+        resolution,
+        active_operation_indices=[0, 1, 2, 3],
+        max_terms=4,
+        tol=1.0e-8,
+        spinful=False,
+    )
+
+    assert matched == "R1 + R2 + R3 + R4"

@@ -27,7 +27,7 @@ def _filter_irreps_by_spin(reolution_irreps, spinful: bool | None):
         is_double_valued = str(raw_name).startswith("-")
         if spinful and is_double_valued:
             filtered.append(irrep)
-        if not spinful and not is_double_valued:
+        if not spinful:
             filtered.append(irrep)
     return filtered or irreps
 
@@ -50,133 +50,12 @@ def _uses_nonsymmorphic_factor_system(resolution) -> bool:
 
 
 def _should_use_coeff_phase(phase_kind: int, resolution) -> bool:
-    # IRVSP applies coeff_uvw only in its nonsymmorphic kLG-table branch
-    # (FGT=.FALSE.).  Cornwell-satisfied k points are classified by the
-    # ordinary point-group branch, so phase_kind=2 must not force an
-    # additional table phase there.
-    return int(phase_kind) == 2 and _uses_nonsymmorphic_factor_system(resolution)
+    # phase_kind=2 stores a k-dependent table factor in coeff_uvw.  It is
+    # needed for general k-line irreps even when the Cornwell condition is
+    # satisfied; boundary entries with built-in phases use phase_kind=1.
+    return int(phase_kind) == 2
 
 
-
-def _operation_phase_factors(k_direct, operations, operation_indices) -> np.ndarray:
-    indices = np.asarray(operation_indices, dtype=int).reshape(-1)
-    factors = np.ones(indices.size, dtype=complex)
-    if k_direct is None or operations is None:
-        return factors
-    for pos, op_idx in enumerate(indices):
-        if 0 <= int(op_idx) < len(operations):
-            factors[pos] = _current_operation_phase(k_direct, operations[int(op_idx)])
-    return factors
-
-
-def _translation_phase_factors(k_direct, translations) -> np.ndarray:
-    arr = np.asarray(translations, dtype=float)
-    if arr.size == 0:
-        return np.ones(0, dtype=complex)
-    arr = np.atleast_2d(arr)
-    factors = np.ones(arr.shape[0], dtype=complex)
-    if k_direct is None or arr.shape[1] < 3:
-        return factors
-    k = np.asarray(k_direct, dtype=float).reshape(-1)
-    if k.size < 3:
-        return factors
-    for pos, tau in enumerate(arr):
-        angle = -2.0 * np.pi * float(np.dot(k[:3], tau[:3]))
-        factors[pos] = np.exp(1j * angle)
-    return factors
-
-
-def _table_phase_factors(
-    resolution,
-    table_operation_indices,
-    phase_k_direct=None,
-    table_operation_translations=None,
-) -> np.ndarray:
-    table_active = np.asarray(table_operation_indices, dtype=int).reshape(-1)
-    factors = np.ones(table_active.size, dtype=complex)
-    if resolution is None or not _uses_nonsymmorphic_factor_system(resolution):
-        return factors
-
-    if table_operation_translations is not None and phase_k_direct is not None:
-        representative_phases = _translation_phase_factors(phase_k_direct, table_operation_translations)
-        if representative_phases.size == table_active.size:
-            return representative_phases
-
-    irreps = list(getattr(getattr(resolution, "entry", None), "irreps", []))
-    if not irreps:
-        return factors
-    ref_irrep = irreps[0]
-    phase_kinds = np.asarray(getattr(ref_irrep, "phase_kinds", []), dtype=int).reshape(-1)
-    coeff_uvw = np.asarray(getattr(ref_irrep, "coeff_uvw", []), dtype=float)
-    k_conv = np.asarray(getattr(resolution, "k_conv", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
-    if coeff_uvw.ndim != 2 or coeff_uvw.shape[1] < 3 or k_conv.size < 3:
-        return factors
-
-    for pos, table_idx in enumerate(table_active):
-        idx = int(table_idx)
-        if idx < 0 or idx >= phase_kinds.size or idx >= coeff_uvw.shape[0]:
-            continue
-        if _should_use_coeff_phase(int(phase_kinds[idx]), resolution):
-            angle = -np.pi * float(np.dot(coeff_uvw[idx, :3], k_conv[:3]))
-            factors[pos] = np.exp(1j * angle)
-    return factors
-
-
-def _representative_corrected_characters(
-    characters: np.ndarray,
-    resolution,
-    active_operation_indices,
-    table_operation_indices,
-    phase_k_direct=None,
-    phase_operations=None,
-    table_operation_translations=None,
-) -> np.ndarray:
-    target = np.asarray(characters, dtype=complex).reshape(-1).copy()
-    if not _uses_nonsymmorphic_factor_system(resolution):
-        return target
-
-    active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
-    table_active = np.asarray(table_operation_indices, dtype=int).reshape(-1)
-    if target.size != active.size or active.size != table_active.size:
-        return target
-    if phase_k_direct is None or phase_operations is None:
-        return target
-
-    active_phases = _operation_phase_factors(phase_k_direct, phase_operations, active)
-    table_phases = _table_phase_factors(
-        resolution,
-        table_active,
-        phase_k_direct=phase_k_direct,
-        table_operation_translations=table_operation_translations,
-    )
-    correction = np.ones(target.size, dtype=complex)
-    mask = np.abs(active_phases) > 1.0e-14
-    correction[mask] = table_phases[mask] / active_phases[mask]
-    return target * correction
-
-def _comparison_characters(
-    characters: np.ndarray,
-    resolution,
-    active_operation_indices,
-    table_operation_indices=None,
-    phase_k_direct=None,
-    phase_operations=None,
-) -> np.ndarray:
-    target = np.asarray(characters, dtype=complex).reshape(-1).copy()
-    active = np.asarray(active_operation_indices, dtype=int).reshape(-1)
-
-    if _uses_nonsymmorphic_factor_system(resolution):
-        return target
-
-    # When Cornwell is satisfied, the space-group character is a point-group
-    # character times KPH({R|tau}) = exp(-2*pi*i*k_prim.tau).  Remove KPH before
-    # comparing with ordinary point-group characters.
-    if phase_k_direct is not None and phase_operations is not None:
-        for pos, active_idx in enumerate(active):
-            if pos >= target.size or int(active_idx) < 0 or int(active_idx) >= len(phase_operations):
-                continue
-            target[pos] *= np.conj(_current_operation_phase(phase_k_direct, phase_operations[int(active_idx)]))
-    return target
 
 
 def _comparison_character_candidates(
@@ -187,37 +66,13 @@ def _comparison_character_candidates(
     phase_k_direct=None,
     phase_operations=None,
     table_operation_translations=None,
-) -> list[np.ndarray]:
+) -> list[tuple[np.ndarray, bool]]:
+    # The calculated band characters are compared directly with the same
+    # effective kLittleGroups table that is printed in the report.  Any Seitz
+    # representative mismatch is handled on the table side by the Delta-tau
+    # phase in _resolved_irrep_character_slice.
     raw = np.asarray(characters, dtype=complex).reshape(-1).copy()
-    table_active = active_operation_indices if table_operation_indices is None else table_operation_indices
-    if _uses_nonsymmorphic_factor_system(resolution):
-        corrected = _representative_corrected_characters(
-            raw,
-            resolution,
-            active_operation_indices,
-            table_active,
-            phase_k_direct=phase_k_direct,
-            phase_operations=phase_operations,
-            table_operation_translations=table_operation_translations,
-        )
-        if np.allclose(corrected, raw, atol=1.0e-10):
-            return [corrected]
-        return [corrected, raw]
-
-    normalized = _comparison_characters(
-        raw,
-        resolution,
-        active_operation_indices,
-        table_operation_indices=table_operation_indices,
-        phase_k_direct=phase_k_direct,
-        phase_operations=phase_operations,
-    )
-    if np.allclose(normalized, raw, atol=1.0e-10):
-        return [normalized]
-    # Keep the IRVSP-style KPH-normalized convention first, but fall back to
-    # the raw Dk characters for source-origin conventions where the calculated
-    # traces already match the kLittleGroups table.
-    return [normalized, raw]
+    return [(raw, True)]
 
 
 def _resolved_irrep_characters(irrep, resolution, phase_k_direct=None, phase_operations=None) -> np.ndarray:
@@ -253,6 +108,8 @@ def _resolved_irrep_character_slice(
     table_operation_indices,
     phase_k_direct=None,
     phase_operations=None,
+    table_operation_translations=None,
+    apply_operation_phases: bool = True,
 ) -> np.ndarray:
     raw_table = np.asarray(getattr(irrep, "characters", []), dtype=complex).reshape(-1).copy()
     if raw_table.size == 0 or resolution is None:
@@ -266,9 +123,12 @@ def _resolved_irrep_character_slice(
     phase_kinds = np.asarray(getattr(irrep, "phase_kinds", []), dtype=int).reshape(-1)
     coeff_uvw = np.asarray(getattr(irrep, "coeff_uvw", []), dtype=float)
     k_conv = np.asarray(getattr(resolution, "k_conv", np.zeros(3, dtype=float)), dtype=float).reshape(-1)
+    table_translations = None
+    if table_operation_translations is not None:
+        table_translations = np.atleast_2d(np.asarray(table_operation_translations, dtype=float))
 
     values: list[complex] = []
-    for active_idx, table_idx in zip(active, table_active):
+    for pos, (active_idx, table_idx) in enumerate(zip(active, table_active)):
         if table_idx < 0 or table_idx >= raw_table.size:
             values.append(np.nan + 0.0j)
             continue
@@ -283,6 +143,18 @@ def _resolved_irrep_character_slice(
             ):
                 angle = -np.pi * float(np.dot(coeff_uvw[int(table_idx), :3], k_conv[:3]))
                 value *= np.exp(1j * angle)
+        if apply_operation_phases:
+            if (
+                phase_k_direct is not None
+                and phase_operations is not None
+                and table_translations is not None
+                and pos < table_translations.shape[0]
+                and 0 <= int(active_idx) < len(phase_operations)
+            ):
+                table_phase = _translation_phase_factors(phase_k_direct, table_translations[pos : pos + 1])[0]
+                active_phase = _current_operation_phase(phase_k_direct, phase_operations[int(active_idx)])
+                if abs(active_phase) > 1.0e-14:
+                    value *= table_phase / active_phase
         values.append(value)
     return np.asarray(values, dtype=complex)
 
@@ -332,7 +204,7 @@ def assign_irrep_from_characters(
 
     best_name = None
     best_error = np.inf
-    for target in targets:
+    for target, apply_operation_phases in targets:
         for irrep in _filter_irreps_by_spin(resolution.entry.irreps, spinful):
             table = _resolved_irrep_character_slice(
                 irrep,
@@ -341,6 +213,8 @@ def assign_irrep_from_characters(
                 table_active,
                 phase_k_direct=phase_k_direct,
                 phase_operations=phase_operations,
+                table_operation_translations=table_operation_translations,
+                apply_operation_phases=apply_operation_phases,
             )
             if table.size != target.size:
                 continue
@@ -404,37 +278,51 @@ def assign_irrep_combination(
         table_operation_translations=table_operation_translations,
     )
     irreps = _filter_irreps_by_spin(resolution.entry.irreps, spinful)
-    sliced_tables = []
-    irrep_labels = []
-    for idx, irrep in enumerate(irreps):
-        table = _resolved_irrep_character_slice(
-            irrep,
-            resolution,
-            active,
-            table_active,
-            phase_k_direct=phase_k_direct,
-            phase_operations=phase_operations,
-        )
-        if not targets or table.size != targets[0].size:
-            continue
-        sliced_tables.append(table)
-        irrep_labels.append(getattr(irrep, "name", getattr(irrep, "raw_name", f"irrep{idx + 1}")))
 
     best = None
-    for target in targets:
+    accepted = None
+    for target_rank, (target, apply_operation_phases) in enumerate(targets):
+        sliced_tables = []
+        irrep_labels = []
+        irrep_is_prefixed = []
+        for idx, irrep in enumerate(irreps):
+            table = _resolved_irrep_character_slice(
+                irrep,
+                resolution,
+                active,
+                table_active,
+                phase_k_direct=phase_k_direct,
+                phase_operations=phase_operations,
+                table_operation_translations=table_operation_translations,
+                apply_operation_phases=apply_operation_phases,
+            )
+            if table.size != target.size:
+                continue
+            sliced_tables.append(table)
+            irrep_labels.append(getattr(irrep, "name", getattr(irrep, "raw_name", f"irrep{idx + 1}")))
+            raw_name = str(getattr(irrep, "raw_name", getattr(irrep, "name", "")))
+            irrep_is_prefixed.append(raw_name.startswith("-"))
+
         for term_count in range(1, max_terms + 1):
             for combo in _cached_combinations_with_replacement(len(sliced_tables), term_count):
                 trial = np.zeros_like(target)
                 labels = []
+                prefixed_count = 0
                 for idx in combo:
                     trial = trial + sliced_tables[idx]
                     labels.append(irrep_labels[idx])
+                    prefixed_count += int(irrep_is_prefixed[idx])
                 err = float(np.max(np.abs(trial - target))) if target.size else 0.0
                 if best is None or err < best[0]:
                     best = (err, labels)
                 if err <= tol:
-                    return " + ".join(labels)
+                    prefixed_score = prefixed_count if spinful is False else 0
+                    score = (target_rank, prefixed_score, term_count, err)
+                    if accepted is None or score < accepted[0]:
+                        accepted = (score, labels)
 
+    if accepted is not None:
+        return " + ".join(accepted[1])
     if best is None:
         raise ValueError("Failed to assign irreps from character combination.")
     if best[0] <= tol * max(1, len(best[1])):
