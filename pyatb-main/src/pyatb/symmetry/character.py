@@ -10,7 +10,7 @@ import traceback
 
 import numpy as np
 
-from pyatb import OUTPUT_PATH, RANK, RUNNING_LOG
+from pyatb import INPUT_PATH, OUTPUT_PATH, RANK, RUNNING_LOG
 from pyatb.parallel import COMM, SIZE
 from pyatb.kpt import kpoint_generator
 from pyatb.tb.tb import tb as TBModel
@@ -803,10 +803,18 @@ class Character:
             sr_source = SR_route or analysis_result.get("source_sr", "data-SR-sparse_SPIN0.csr")
             full_matrix_from_hermitian = bool(analysis_result.get("full_matrix_from_hermitian", True))
             hs_symmetry_operations = analysis_result.get("source_operations") or analysis_result.get("operations") or []
+            target_stru_path = Path(analysis_result["target_stru"])
+            if not target_stru_path.is_absolute():
+                target_stru_path = Path(INPUT_PATH) / target_stru_path
+            if RANK == 0 and not target_stru_path.exists():
+                raise FileNotFoundError(
+                    "CHARACTER structure standardization requested H/S rebuild, "
+                    f"but standardized STRU was not written: {target_stru_path}"
+                )
             if RANK == 0:
                 canonicalize_abacus_hs(
                     tb=self._tb,
-                    target_stru_path=Path(analysis_result["target_stru"]),
+                    target_stru_path=target_stru_path,
                     hr_route=hr_source,
                     sr_route=sr_source,
                     hr_unit=HR_unit,
@@ -824,7 +832,7 @@ class Character:
                     symmetry_map_tol=float(symm_prec),
                 )
 
-            active_stru_path = Path(analysis_result["target_stru"])
+            active_stru_path = target_stru_path
             active_lattice_vector = np.asarray(analysis_result["lattice_new"], dtype=float) / active_lattice_constant
             active_hr_path = Path(analysis_result["target_hr"])
             active_sr_path = Path(analysis_result["target_sr"])

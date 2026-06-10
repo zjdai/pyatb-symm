@@ -222,6 +222,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             raise ValueError(
                 f"Magnetic moments must have shape ({len(atoms)}, 3), got {mag.shape}."
             )
+        atoms.set_array("pyatb_magnetic_moments", np.asarray(mag, dtype=float).copy())
 
         cell = (lattice, scaled_positions, numbers)
         mag_cell = (lattice, scaled_positions, numbers, mag)
@@ -290,6 +291,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             std_mag[int(atom_idx), :] = np.asarray(vec, dtype=float)
         std_mag = std_mag @ np.asarray(q23_row, dtype=float)
 
+        std_atoms.set_array("pyatb_magnetic_moments", np.asarray(std_mag, dtype=float).copy())
         std_unitary_sym_data, _ = self._get_magnetic_unitary_symmetry_data(
             std_atoms,
             std_mag,
@@ -697,7 +699,13 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         raise ValueError("Unexpected end of STRU file while parsing section.")
 
     @classmethod
-    def _write_standardized_stru(cls, source_stru_path: Path, std_atoms: Atoms, target_stru_path: Path) -> None:
+    def _write_standardized_stru(
+        cls,
+        source_stru_path: Path,
+        std_atoms: Atoms,
+        target_stru_path: Path,
+        magnetic_moments: np.ndarray | None = None,
+    ) -> None:
         lines = source_stru_path.read_text(encoding="utf-8").splitlines()
         headers = ["ATOMIC_SPECIES", "NUMERICAL_ORBITAL", "LATTICE_CONSTANT", "LATTICE_VECTORS", "ATOMIC_POSITIONS"]
 
@@ -747,6 +755,20 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         scaled_positions[np.isclose(scaled_positions, 0.0, atol=1.0e-8)] = 0.0
         symbols = list(std_atoms.get_chemical_symbols())
         lattice_vectors = np.asarray(std_atoms.cell.array, dtype=float) / lattice_scale_ang
+        mag_array = None
+        if magnetic_moments is not None:
+            mag_array = np.asarray(magnetic_moments, dtype=float)
+            if mag_array.shape != (len(symbols), 3):
+                raise ValueError(
+                    f"Standardized magnetic moments must have shape ({len(symbols)}, 3), got {mag_array.shape}."
+                )
+
+        def _format_mag_component(value: float) -> str:
+            raw = float(value)
+            rounded = round(raw)
+            if abs(raw - rounded) <= 1.0e-10:
+                return str(int(rounded))
+            return f"{raw:.10g}"
 
         with target_stru_path.open("w", encoding="utf-8") as handle:
             handle.write("ATOMIC_SPECIES\n")
@@ -772,9 +794,11 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                 handle.write(f"{len(indices)}\n")
                 for atom_index in indices:
                     frac = scaled_positions[atom_index]
-                    handle.write(
-                        f"{frac[0]:16.10f}{frac[1]:16.10f}{frac[2]:16.10f} 0 0 0\n"
-                    )
+                    line = f"{frac[0]:16.10f}{frac[1]:16.10f}{frac[2]:16.10f} 0 0 0"
+                    if mag_array is not None:
+                        mag_text = " ".join(_format_mag_component(value) for value in mag_array[atom_index])
+                        line += f" mag {mag_text}"
+                    handle.write(f"{line}\n")
                 handle.write("\n")
 
     def _finalize_standardization_result(
@@ -2210,6 +2234,15 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             force_rebuild_hs=bool(origin_shift_only or origin_shift_applied),
         )
         standardization_result["structure_mapping"] = structure_mapping_summary(mapping_result)
+
+        if RANK == 0 and bool(standardization_result["need_rebuild_hs"]):
+            target_stru_path = Path(INPUT_PATH) / str(standardization_result["target_stru"])
+            self._write_standardized_stru(
+                source_path,
+                std_atoms,
+                target_stru_path,
+                magnetic_moments=std_mag,
+            )
 
         if RANK == 0:
             report_path = self._output_path / "symmetry_character_report.txt"
