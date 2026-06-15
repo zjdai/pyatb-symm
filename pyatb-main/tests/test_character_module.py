@@ -78,6 +78,28 @@ class _FakeDB:
         return self._traces.copy()
 
 
+def test_character_uses_active_structure_operations(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.character")
+    cal = module.Character(_FakeTB())
+    source_ops = [{"name": "source"}]
+    target_ops = [{"name": "target"}]
+
+    assert cal._active_structure_operations(
+        {
+            "need_rebuild_hs": True,
+            "operations": target_ops,
+            "source_operations": source_ops,
+        }
+    ) is target_ops
+    assert cal._active_structure_operations(
+        {
+            "need_rebuild_hs": False,
+            "operations": target_ops,
+            "source_operations": source_ops,
+        }
+    ) is source_ops
+
+
 
 def test_character_creates_output_dir_and_runs_symmetry_stage(
     load_pyatb, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1327,6 +1349,37 @@ def test_dk_find_atom_mapping_canonicalizes_boundary_equivalent_positions(load_p
     mapping = module.find_atom_mapping(metadata, operation)
 
     assert len(mapping) == 1
+    np.testing.assert_array_equal(mapping[0]["cell_shift"], np.array([0, 0, 0], dtype=int))
+
+
+def test_dk_find_atom_mapping_snaps_cartesian_roundtrip_boundary_noise(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.Dk_matrix")
+
+    metadata = module.BasisMetadata(
+        basis_num=2,
+        spinless_basis_num=2,
+        spin_factor=1,
+        lattice_vector=np.eye(3, dtype=float),
+        positions_frac=np.array(
+            [
+                [0.0, 0.5, 0.0],
+                [0.9999999999967046, 0.0, 0.500000000013205],
+            ],
+            dtype=float,
+        ),
+        species_by_atom=["W", "W"],
+        shells=[],
+        atom_ranges={0: (0, 1), 1: (1, 1)},
+    )
+    operation = {
+        "rotation": np.array([[1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=int),
+        "translation": np.array([0.0, 0.5, 0.5], dtype=float),
+        "cart_rotation": np.diag([1.0, -1.0, 1.0]),
+    }
+
+    mapping = module.find_atom_mapping(metadata, operation)
+
+    assert int(mapping[0]["target_atom"]) == 1
     np.testing.assert_array_equal(mapping[0]["cell_shift"], np.array([0, 0, 0], dtype=int))
 
 

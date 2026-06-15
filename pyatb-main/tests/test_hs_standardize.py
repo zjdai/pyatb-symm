@@ -4,12 +4,12 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 
-def test_canonicalize_fractional_coordinates_wraps_boundary_points(load_pyatb) -> None:
+def test_canonicalize_fractional_coordinates_snaps_generated_boundary_roundoff(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.hs_standardize")
 
     frac = np.array(
         [
-            [1.0, -1.0e-12, 0.5],
+            [1.0, -1.0e-12, 0.99999995],
             [0.999999999999, 1.000000000001, -0.25],
         ],
         dtype=float,
@@ -21,12 +21,13 @@ def test_canonicalize_fractional_coordinates_wraps_boundary_points(load_pyatb) -
         wrapped,
         np.array(
             [
-                [0.0, 0.0, 0.5],
+                [0.0, 0.0, 0.99999995],
                 [0.0, 0.0, 0.75],
             ],
             dtype=float,
         ),
-        atol=1.0e-12,
+        atol=1.0e-15,
+        rtol=0.0,
     )
 
 

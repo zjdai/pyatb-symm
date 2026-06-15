@@ -69,10 +69,96 @@ class StandardizationResult:
 
 
 _STRUCTURE_FRACTIONAL_BOUNDARY_TOL = 1.0e-6
+_GENERATED_FRACTIONAL_ROUNDOFF_TOL = 1.0e-14
+_FRACTIONAL_POSITIONS_INFO_KEY = "_pyatb_fractional_positions"
 
 
 def _canonicalize_structure_fractional_coordinates(frac: np.ndarray) -> np.ndarray:
-    return canonicalize_fractional_coordinates(frac, tol=_STRUCTURE_FRACTIONAL_BOUNDARY_TOL)
+    values = np.asarray(frac, dtype=float)
+    return values - np.floor(values)
+
+
+def _canonicalize_generated_fractional_coordinates(frac: np.ndarray) -> np.ndarray:
+    wrapped = _canonicalize_structure_fractional_coordinates(frac)
+    wrapped[np.abs(wrapped) <= _GENERATED_FRACTIONAL_ROUNDOFF_TOL] = 0.0
+    wrapped[np.abs(wrapped - 1.0) <= _GENERATED_FRACTIONAL_ROUNDOFF_TOL] = 0.0
+    return wrapped
+
+
+def _set_fractional_positions(atoms: Atoms, frac: np.ndarray) -> None:
+    values = np.asarray(frac, dtype=float)
+    atoms.set_scaled_positions(values)
+    atoms.info[_FRACTIONAL_POSITIONS_INFO_KEY] = np.array(values, dtype=float, copy=True)
+
+
+def _get_fractional_positions(atoms: Atoms, wrap: bool = False) -> np.ndarray:
+    stored = getattr(atoms, "info", {}).get(_FRACTIONAL_POSITIONS_INFO_KEY)
+    if stored is not None:
+        values = np.asarray(stored, dtype=float)
+        if values.shape == (len(atoms), 3):
+            out = np.array(values, dtype=float, copy=True)
+            return _canonicalize_structure_fractional_coordinates(out) if wrap else out
+    values = np.asarray(atoms.get_scaled_positions(wrap=False), dtype=float)
+    return _canonicalize_structure_fractional_coordinates(values) if wrap else values
+
+
+def _strip_stru_comment(line: str) -> str:
+    text = str(line)
+    for marker in ("#", "//"):
+        text = text.split(marker, 1)[0]
+    return text.strip()
+
+
+def _read_raw_direct_fractional_positions(stru_path: Path) -> np.ndarray | None:
+    raw_lines = [
+        cleaned
+        for line in Path(stru_path).read_text(encoding="utf-8").splitlines()
+        if (cleaned := _strip_stru_comment(line))
+    ]
+    try:
+        positions_index = next(
+            idx for idx, line in enumerate(raw_lines) if line.strip().upper() == "ATOMIC_POSITIONS"
+        )
+    except StopIteration:
+        return None
+
+    idx = positions_index + 1
+    if idx >= len(raw_lines):
+        return None
+
+    mode = raw_lines[idx].split()[0].lower()
+    if mode not in {"direct", "crystal"}:
+        return None
+
+    idx += 1
+    positions: list[list[float]] = []
+    while idx < len(raw_lines):
+        species_line = raw_lines[idx].split()
+        idx += 1
+        if not species_line:
+            continue
+        if idx >= len(raw_lines):
+            raise ValueError(f"Malformed STRU Direct coordinate block in {stru_path}: missing species magnetization line.")
+        idx += 1
+        if idx >= len(raw_lines):
+            raise ValueError(f"Malformed STRU Direct coordinate block in {stru_path}: missing atom count line.")
+        try:
+            atom_count = int(raw_lines[idx].split()[0])
+        except (IndexError, ValueError) as exc:
+            raise ValueError(f"Malformed STRU Direct coordinate block in {stru_path}: invalid atom count.") from exc
+        idx += 1
+        for _ in range(atom_count):
+            if idx >= len(raw_lines):
+                raise ValueError(f"Malformed STRU Direct coordinate block in {stru_path}: missing atom coordinate line.")
+            tokens = raw_lines[idx].split()
+            if len(tokens) < 3:
+                raise ValueError(f"Malformed STRU Direct coordinate block in {stru_path}: invalid atom coordinate line.")
+            positions.append([float(tokens[0]), float(tokens[1]), float(tokens[2])])
+            idx += 1
+
+    if not positions:
+        return None
+    return np.asarray(positions, dtype=float)
 
 
 class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
@@ -111,7 +197,19 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         atoms = ase_read(str(stru_path), format="abacus")
         if not isinstance(atoms, Atoms):
             raise ValueError(f"Failed to parse ABACUS STRU via ase: {stru_path}")
-        atoms.set_scaled_positions(_canonicalize_structure_fractional_coordinates(atoms.get_scaled_positions(wrap=False)))
+        raw_direct_positions = _read_raw_direct_fractional_positions(stru_path)
+        if raw_direct_positions is not None:
+            if int(raw_direct_positions.shape[0]) != len(atoms):
+                raise ValueError(
+                    "Raw STRU Direct coordinates and ASE atom count disagree: "
+                    f"raw={raw_direct_positions.shape[0]}, ase={len(atoms)}."
+                )
+            _set_fractional_positions(atoms, _canonicalize_structure_fractional_coordinates(raw_direct_positions))
+        else:
+            _set_fractional_positions(
+                atoms,
+                _canonicalize_structure_fractional_coordinates(atoms.get_scaled_positions(wrap=False)),
+            )
         return atoms, stru_path
 
     def _standardize_nonmagnetic_cell(self, atoms: Atoms, symm_prec: float):
@@ -121,7 +219,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             raise ImportError("spglib is required for CHARACTER symmetry detection.") from exc
 
         lattice = np.asarray(atoms.cell.array, dtype=float)
-        scaled_positions = np.asarray(atoms.get_scaled_positions(), dtype=float)
+        scaled_positions = _get_fractional_positions(atoms, wrap=True)
         numbers = np.asarray(atoms.get_atomic_numbers(), dtype=int)
         cell = (lattice, scaled_positions, numbers)
 
@@ -180,15 +278,22 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             scaled_positions=np.asarray(conv_positions, dtype=float),
             pbc=True,
         )
-        mapping_atoms.set_scaled_positions(
-            _canonicalize_structure_fractional_coordinates(mapping_atoms.get_scaled_positions(wrap=False))
+        _set_fractional_positions(
+            mapping_atoms,
+            _canonicalize_generated_fractional_coordinates(np.asarray(mapping_positions, dtype=float)),
         )
-        std_atoms.set_scaled_positions(_canonicalize_structure_fractional_coordinates(std_atoms.get_scaled_positions(wrap=False)))
-        conv_atoms.set_scaled_positions(_canonicalize_structure_fractional_coordinates(conv_atoms.get_scaled_positions(wrap=False)))
+        _set_fractional_positions(
+            std_atoms,
+            _canonicalize_generated_fractional_coordinates(np.asarray(std_positions, dtype=float)),
+        )
+        _set_fractional_positions(
+            conv_atoms,
+            _canonicalize_generated_fractional_coordinates(np.asarray(conv_positions, dtype=float)),
+        )
 
         std_cell_for_sym = (
             np.asarray(std_lattice, dtype=float),
-            np.asarray(std_positions, dtype=float),
+            _get_fractional_positions(std_atoms, wrap=True),
             np.asarray(std_numbers, dtype=int),
         )
         sym_dataset = spglib.get_symmetry_dataset(std_cell_for_sym, symprec=symm_prec, _throw=True)
@@ -198,7 +303,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
 
         conv_cell_for_sym = (
             np.asarray(conv_lattice, dtype=float),
-            np.asarray(conv_positions, dtype=float),
+            _get_fractional_positions(conv_atoms, wrap=True),
             np.asarray(conv_numbers, dtype=int),
         )
         conv_sym_dataset = spglib.get_symmetry_dataset(conv_cell_for_sym, symprec=symm_prec, _throw=True)
@@ -215,7 +320,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             raise ImportError("spglib is required for CHARACTER magnetic symmetry detection.") from exc
 
         lattice = np.asarray(atoms.cell.array, dtype=float)
-        scaled_positions = np.asarray(atoms.get_scaled_positions(), dtype=float)
+        scaled_positions = _get_fractional_positions(atoms, wrap=True)
         numbers = np.asarray(atoms.get_atomic_numbers(), dtype=int)
         mag = np.asarray(magnetic_moments, dtype=float)
         if mag.shape != (len(atoms), 3):
@@ -267,10 +372,14 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             scaled_positions=np.asarray(std_positions, dtype=float),
             pbc=True,
         )
-        mapping_atoms.set_scaled_positions(
-            _canonicalize_structure_fractional_coordinates(mapping_atoms.get_scaled_positions(wrap=False))
+        _set_fractional_positions(
+            mapping_atoms,
+            _canonicalize_generated_fractional_coordinates(np.asarray(mapping_positions, dtype=float)),
         )
-        std_atoms.set_scaled_positions(_canonicalize_structure_fractional_coordinates(std_atoms.get_scaled_positions(wrap=False)))
+        _set_fractional_positions(
+            std_atoms,
+            _canonicalize_generated_fractional_coordinates(np.asarray(std_positions, dtype=float)),
+        )
 
         map_tol = max(1e-6, float(symm_prec) * 10.0)
         mapping12 = self._build_atom_mapping(atoms, mapping_atoms, map_tol)
@@ -350,7 +459,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             )
         cell = (
             np.asarray(atoms.cell.array, dtype=float),
-            np.asarray(atoms.get_scaled_positions(), dtype=float),
+            _get_fractional_positions(atoms, wrap=True),
             np.asarray(atoms.get_atomic_numbers(), dtype=int),
             mag,
         )
@@ -387,7 +496,7 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
 
         cell = (
             np.asarray(atoms.cell.array, dtype=float),
-            np.asarray(atoms.get_scaled_positions(), dtype=float),
+            _get_fractional_positions(atoms, wrap=True),
             np.asarray(atoms.get_atomic_numbers(), dtype=int),
         )
         sym_dataset = spglib.get_symmetry_dataset(cell, symprec=symm_prec, _throw=True)
@@ -462,13 +571,13 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
     @staticmethod
     def _build_atom_mapping(original_atoms: Atoms, std_atoms: Atoms, tol: float):
         original_pos = canonicalize_fractional_coordinates(
-            np.asarray(original_atoms.get_scaled_positions(wrap=False), dtype=float),
+            _get_fractional_positions(original_atoms, wrap=False),
             tol=tol,
         )
         original_num = np.asarray(original_atoms.get_atomic_numbers(), dtype=int)
         original_lattice = np.asarray(original_atoms.cell.array, dtype=float)
         std_pos = canonicalize_fractional_coordinates(
-            np.asarray(std_atoms.get_scaled_positions(wrap=False), dtype=float),
+            _get_fractional_positions(std_atoms, wrap=False),
             tol=tol,
         )
         std_num = np.asarray(std_atoms.get_atomic_numbers(), dtype=int)
@@ -639,11 +748,11 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         source_numbers = np.asarray(source_atoms.get_atomic_numbers(), dtype=int)
         target_numbers = np.asarray(target_atoms.get_atomic_numbers(), dtype=int)
         source_pos = canonicalize_fractional_coordinates(
-            np.asarray(source_atoms.get_scaled_positions(wrap=True), dtype=float),
+            _get_fractional_positions(source_atoms, wrap=True),
             tol=tol,
         )
         target_pos = canonicalize_fractional_coordinates(
-            np.asarray(target_atoms.get_scaled_positions(wrap=True), dtype=float),
+            _get_fractional_positions(target_atoms, wrap=True),
             tol=tol,
         )
         if len(source_numbers) == 0:
@@ -750,9 +859,9 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             position_meta[species_name] = mag_line
             idx += atom_count + 1
 
-        scaled_positions = _canonicalize_structure_fractional_coordinates(np.asarray(std_atoms.get_scaled_positions(wrap=False), dtype=float))
-        scaled_positions[np.isclose(scaled_positions, 1.0, atol=1.0e-8)] = 0.0
-        scaled_positions[np.isclose(scaled_positions, 0.0, atol=1.0e-8)] = 0.0
+        scaled_positions = _canonicalize_generated_fractional_coordinates(
+            _get_fractional_positions(std_atoms, wrap=False)
+        )
         symbols = list(std_atoms.get_chemical_symbols())
         lattice_vectors = np.asarray(std_atoms.cell.array, dtype=float) / lattice_scale_ang
         mag_array = None
@@ -769,6 +878,10 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             if abs(raw - rounded) <= 1.0e-10:
                 return str(int(rounded))
             return f"{raw:.10g}"
+
+        def _format_fractional_component(value: float) -> str:
+            wrapped = _canonicalize_generated_fractional_coordinates(np.array([float(value)], dtype=float))[0]
+            return f"{wrapped:.17g}"
 
         with target_stru_path.open("w", encoding="utf-8") as handle:
             handle.write("ATOMIC_SPECIES\n")
@@ -794,7 +907,11 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
                 handle.write(f"{len(indices)}\n")
                 for atom_index in indices:
                     frac = scaled_positions[atom_index]
-                    line = f"{frac[0]:16.10f}{frac[1]:16.10f}{frac[2]:16.10f} 0 0 0"
+                    line = (
+                        f"{_format_fractional_component(frac[0])} "
+                        f"{_format_fractional_component(frac[1])} "
+                        f"{_format_fractional_component(frac[2])} 0 0 0"
+                    )
                     if mag_array is not None:
                         mag_text = " ".join(_format_mag_component(value) for value in mag_array[atom_index])
                         line += f" mag {mag_text}"
@@ -1676,10 +1793,10 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
             expected_shifted_operations = self._operations_after_origin_shift(operations, database_origin_shift)
             shifted_std_atoms = std_atoms.copy()
             shifted_pos = (
-                np.asarray(shifted_std_atoms.get_scaled_positions(wrap=False), dtype=float)
+                _get_fractional_positions(shifted_std_atoms, wrap=False)
                 + database_origin_shift
             )
-            shifted_std_atoms.set_scaled_positions(_canonicalize_structure_fractional_coordinates(shifted_pos))
+            _set_fractional_positions(shifted_std_atoms, _canonicalize_generated_fractional_coordinates(shifted_pos))
             shifted_sym_data = self._get_symmetry_data(shifted_std_atoms, symm_prec)
             shifted_operations = self._sort_operations_irvsp_like(
                 self._build_symmetry_operations(shifted_std_atoms, shifted_sym_data)
@@ -2093,8 +2210,8 @@ class SymmStructureAnalyzer(KPointLittleGroupMixin, SymmetryReportMixin):
         )
         if origin_shift_applied:
             shifted_std_atoms = std_atoms.copy()
-            shifted_pos = np.asarray(shifted_std_atoms.get_scaled_positions(wrap=False), dtype=float) + np.asarray(origin_shift, dtype=float)
-            shifted_std_atoms.set_scaled_positions(_canonicalize_structure_fractional_coordinates(shifted_pos))
+            shifted_pos = _get_fractional_positions(shifted_std_atoms, wrap=False) + np.asarray(origin_shift, dtype=float)
+            _set_fractional_positions(shifted_std_atoms, _canonicalize_generated_fractional_coordinates(shifted_pos))
             std_atoms = shifted_std_atoms
             std_unitary_sym_data, _ = self._get_magnetic_unitary_symmetry_data(
                 std_atoms,

@@ -29,9 +29,14 @@ class BasisMetadata:
 
 
 def _canonicalize_fractional_coordinates(frac: np.ndarray, tol: float = 1.0e-9) -> np.ndarray:
-    wrapped = np.asarray(frac, dtype=float) - np.floor(np.asarray(frac, dtype=float))
-    wrapped[np.abs(wrapped) <= tol] = 0.0
-    wrapped[np.abs(wrapped - 1.0) <= tol] = 0.0
+    values = np.asarray(frac, dtype=float)
+    wrapped = values - np.floor(values)
+    # These coordinates are reconstructed from Cartesian positions and can
+    # contain machine-level boundary roundoff.  Raw STRU Direct coordinates are
+    # canonicalized before this path, so only generated 0/1 noise is snapped.
+    boundary_tol = max(float(tol), 0.0)
+    wrapped[np.abs(wrapped) <= boundary_tol] = 0.0
+    wrapped[np.abs(wrapped - 1.0) <= boundary_tol] = 0.0
     return wrapped
 
 

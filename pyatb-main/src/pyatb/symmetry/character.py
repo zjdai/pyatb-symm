@@ -231,6 +231,12 @@ class Character:
             )
         return converted
 
+    @staticmethod
+    def _active_structure_operations(analysis_result: dict) -> list:
+        if bool(analysis_result.get("need_rebuild_hs")):
+            return analysis_result.get("operations") or analysis_result.get("source_operations") or []
+        return analysis_result.get("source_operations") or analysis_result.get("operations") or []
+
     @classmethod
     def _max_covariance_error(cls, hr_stats: dict, sr_stats: dict) -> float:
         return float(
@@ -278,7 +284,7 @@ class Character:
 
     def _write_trace_output(self, analysis_result: dict, rows: list[dict], occ_band: int) -> None:
         trace_path = Path(self.output_path) / "trace.txt"
-        source_operations = analysis_result.get("source_operations") or analysis_result.get("operations") or []
+        source_operations = self._active_structure_operations(analysis_result)
         kpoint_records = analysis_result.get("kpoint_records") or []
         rows_by_k = self._group_rows_by_k(rows)
 
@@ -464,7 +470,7 @@ class Character:
         if kpoints_direct.size == 0:
             return []
 
-        source_operations = analysis_result.get("source_operations") or analysis_result.get("operations") or []
+        source_operations = self._active_structure_operations(analysis_result)
         kpoint_records = analysis_result.get("kpoint_records") or []
         if not source_operations or not kpoint_records:
             return []
@@ -802,7 +808,7 @@ class Character:
             hr_source = HR_route or analysis_result.get("source_hr", "data-HR-sparse_SPIN0.csr")
             sr_source = SR_route or analysis_result.get("source_sr", "data-SR-sparse_SPIN0.csr")
             full_matrix_from_hermitian = bool(analysis_result.get("full_matrix_from_hermitian", True))
-            hs_symmetry_operations = analysis_result.get("source_operations") or analysis_result.get("operations") or []
+            hs_symmetry_operations = self._active_structure_operations(analysis_result)
             target_stru_path = Path(analysis_result["target_stru"])
             if not target_stru_path.is_absolute():
                 target_stru_path = Path(INPUT_PATH) / target_stru_path
@@ -855,7 +861,7 @@ class Character:
             nspin=int(self._tb.nspin),
             hr_unit=str(HR_unit),
         )
-        analysis_source_operations = analysis_result.get("source_operations") or analysis_result.get("operations") or []
+        analysis_source_operations = self._active_structure_operations(analysis_result)
         if mag_tag == 1 and analysis_source_operations:
             covariance_operations = self._analysis_operations_to_covariance_operations(analysis_source_operations)
         else:

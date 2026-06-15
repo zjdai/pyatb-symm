@@ -8,6 +8,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 _ROW_VECTOR_RELATION = "source_lattice @ rotation_matrix = supercell_matrix @ target_lattice"
+_FRACTIONAL_POSITIONS_INFO_KEY = "_pyatb_fractional_positions"
 
 
 @dataclass
@@ -41,9 +42,20 @@ def _canonical_shift(shift: np.ndarray, tol: float = 1.0e-9) -> np.ndarray:
 
 
 def _canonicalize_boundary_fractional(frac: np.ndarray, boundary_tol: float) -> np.ndarray:
-    # Positions are periodic, but image shifts are discrete.  Canonicalize only
-    # cell-boundary numerical noise before choosing integer images.
-    return _wrap_fractional(np.asarray(frac, dtype=float), tol=max(float(boundary_tol), 0.0))
+    # Preserve double precision and only wrap into [0, 1).  Do not classify
+    # near-boundary coordinates as numerical noise here: integer image shifts
+    # are derived from these wrapped positions.
+    values = np.asarray(frac, dtype=float)
+    return values - np.floor(values)
+
+
+def _get_fractional_positions(atoms: Atoms) -> np.ndarray:
+    stored = getattr(atoms, "info", {}).get(_FRACTIONAL_POSITIONS_INFO_KEY)
+    if stored is not None:
+        values = np.asarray(stored, dtype=float)
+        if values.shape == (len(atoms), 3):
+            return np.array(values, dtype=float, copy=True)
+    return np.asarray(atoms.get_scaled_positions(wrap=False), dtype=float)
 
 
 def _integer_matrix(matrix: np.ndarray, tol: float) -> np.ndarray:
@@ -270,11 +282,11 @@ def build_structure_mapping(
 
     boundary_tol = max(float(boundary_tol), 0.0)
     source_frac = _canonicalize_boundary_fractional(
-        np.asarray(source_atoms.get_scaled_positions(wrap=False), dtype=float),
+        _get_fractional_positions(source_atoms),
         boundary_tol=boundary_tol,
     )
     target_frac = _canonicalize_boundary_fractional(
-        np.asarray(target_atoms.get_scaled_positions(wrap=False), dtype=float),
+        _get_fractional_positions(target_atoms),
         boundary_tol=boundary_tol,
     )
     source_numbers = np.asarray(source_atoms.get_atomic_numbers(), dtype=int)
