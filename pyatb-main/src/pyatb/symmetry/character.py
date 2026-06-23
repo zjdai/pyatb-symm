@@ -15,7 +15,11 @@ from pyatb.parallel import COMM, SIZE
 from pyatb.kpt import kpoint_generator
 from pyatb.tb.tb import tb as TBModel
 from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR
-from pyatb.symmetry.Dk_matrix import build_dk_matrix, spin_half_matrix_from_cartesian_rotation
+from pyatb.symmetry.Dk_matrix import (
+    build_dk_matrix,
+    extract_abacus_basis_metadata,
+    spin_half_matrix_from_cartesian_rotation,
+)
 from pyatb.symmetry.character_core import (
     assign_irrep_combination,
     calculate_subspace_characters,
@@ -186,6 +190,25 @@ class Character:
             "cart_rotation": np.asarray(cls._operation_get(operation, "cart_rotation", np.eye(3, dtype=float)), dtype=float),
             "spin_matrix": np.asarray(spin, dtype=complex),
         }
+
+    @staticmethod
+    def _time_reversal_basis_matrix(tb) -> np.ndarray | None:
+        try:
+            metadata = extract_abacus_basis_metadata(tb)
+        except Exception:
+            return None
+        if int(metadata.spin_factor) == 1:
+            return np.eye(int(metadata.basis_num), dtype=complex)
+        if int(metadata.spin_factor) != 2:
+            return None
+        spin_time_reversal = np.array(
+            [
+                [0.0, -1.0j],
+                [1.0j, 0.0],
+            ],
+            dtype=complex,
+        )
+        return np.kron(np.eye(int(metadata.spinless_basis_num), dtype=complex), spin_time_reversal)
 
     @staticmethod
     def _group_rows_by_k(rows: list[dict]) -> dict[int, list[dict]]:
@@ -532,6 +555,27 @@ class Character:
                         map_tol=float(symm_prec),
                     )
                 )
+            target_subspace = np.asarray(
+                eigenvectors[local_pos][:, requested_start : requested_stop + 1],
+                dtype=complex,
+            )
+            overlap = np.asarray(overlaps[local_pos], dtype=complex)
+            target_representation_matrices = [
+                target_subspace.conj().T @ overlap @ np.asarray(op_matrix, dtype=complex) @ target_subspace
+                for op_matrix in op_matrices
+            ]
+            target_representation_characters = [
+                complex(np.trace(matrix)) for matrix in target_representation_matrices
+            ]
+            time_reversal_matrix = self._time_reversal_basis_matrix(self._tb)
+            target_time_reversal_matrix = None
+            if time_reversal_matrix is not None:
+                target_time_reversal_matrix = (
+                    target_subspace.conj().T
+                    @ overlap
+                    @ np.asarray(time_reversal_matrix, dtype=complex)
+                    @ target_subspace.conj()
+                )
             groups = group_degenerate_bands(eigenvalues[local_pos], tol=5.0e-4)
 
             for group_start, group_stop in groups:
@@ -586,6 +630,14 @@ class Character:
                         "active_operation_labels": active_operation_labels,
                         "characters": characters,
                         "irrep": irrep,
+                        "target_band_range": [requested_start + 1, requested_stop + 1],
+                        "target_operation_indices": [int(index) + 1 for index in character_operation_indices],
+                        "target_representation_matrices": target_representation_matrices,
+                        "target_representation_characters": target_representation_characters,
+                        "target_time_reversal_matrix": target_time_reversal_matrix,
+                        "target_eigenvalues_full": np.asarray(eigenvalues[local_pos], dtype=float),
+                        "target_eigenvectors_full": np.asarray(eigenvectors[local_pos], dtype=complex),
+                        "target_overlap": overlap,
                     }
                 )
 
@@ -1072,6 +1124,7 @@ class Character:
             "active_sr_path": str(active_sr_path.resolve()),
             "lattice_constant": float(active_lattice_constant),
             "lattice_vector": np.asarray(active_lattice_vector, dtype=float),
+            "HR_unit": str(HR_unit),
         }
 
     def calculate_character(
@@ -1093,7 +1146,7 @@ class Character:
         data_symm_nonzero_block_tol=1.0e-9,
         data_symm_verbose=0,
         **kwargs,
-    ) -> None:
+    ) -> dict:
         data_symmetrize = int(data_symmetrize)
         if data_symmetrize not in (0, 1):
             raise ValueError("CHARACTER.data_symmetrize must be 0 or 1.")
@@ -1187,3 +1240,6 @@ class Character:
             self._write_trace_output(analysis_result, character_rows, occ_band)
             self._write_band_irrep_output(character_rows)
             self._append_character_report(character_rows)
+
+        preprocess_payload["character_rows"] = character_rows if RANK == 0 else []
+        return preprocess_payload

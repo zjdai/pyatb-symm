@@ -34,6 +34,12 @@ def _ensure_fake_mpi4py() -> None:
         def reduce(self, value, root=0, op=None):
             return value
 
+        def bcast(self, value, root=0):
+            return value
+
+        def gather(self, value, root=0):
+            return [value]
+
     class _FakeOpFactory:
         @staticmethod
         def Create(func, commute=False):

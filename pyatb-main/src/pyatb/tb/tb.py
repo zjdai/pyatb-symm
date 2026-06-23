@@ -11,6 +11,7 @@ class tb:
         self.unit_cell_volume = np.linalg.det(lattice_vector) * lattice_constant**3
         self.read_atom_position = False
         self.read_atom_orb = False
+        self.has_rR = False
         
         # The maximum k-point number that can be calculated.
         if max_kpoint_num is None:
@@ -118,6 +119,7 @@ class tb:
             else:
                 self.tb_solver_up.set_rR(temp_rR_x, temp_rR_y, temp_rR_z)
                 self.tb_solver_dn.set_rR(temp_rR_x, temp_rR_y, temp_rR_z)
+        self.has_rR = True
 
     def direct_to_cartesian_kspace(self, k_direct_coor):
         """

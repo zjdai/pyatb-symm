@@ -56,6 +56,13 @@ def main():
     package = input_parameters['package']
     sparse_format = input_parameters['sparse_format']
     max_kpoint_num = input_parameters['max_kpoint_num']
+    rr_route = input_parameters.get('rR_route', [])
+    try:
+        has_rr_route = len(rr_route) > 0
+    except TypeError:
+        has_rr_route = bool(rr_route)
+    if function_switch.get('KP', False) and has_rr_route:
+        bool_need_rR = True
 
     # initialize the tb class
     m_tb = tb(nspin, lattice_constant, lattice_vector, max_kpoint_num)
@@ -222,6 +229,8 @@ def main():
             HR_route=input_parameters.get('HR_route'),
             SR_route=input_parameters.get('SR_route'),
             HR_unit=input_parameters.get('HR_unit'),
+            rR_route=input_parameters.get('rR_route'),
+            rR_unit=input_parameters.get('rR_unit'),
         )
 
     if function_switch['SURFACE_STATE']:

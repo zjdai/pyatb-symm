@@ -63,6 +63,32 @@ def parse_character_mag(raw_tokens):
     return mag
 
 
+def normalize_kp_block_aliases(block_data):
+    normalized = []
+    index = 0
+    while index < len(block_data):
+        if (
+            block_data[index] == 'zeeman'
+            and index + 1 < len(block_data)
+            and block_data[index + 1] == 'term'
+        ):
+            normalized.append('zeeman_term')
+            index += 2
+            continue
+        normalized.append(block_data[index])
+        index += 1
+    return normalized
+
+
+def parse_kp_zeeman_term(raw_value):
+    value = str(raw_value).strip().lower()
+    if value in ['yes', 'y', 'true', '1']:
+        return 'yes'
+    if value in ['no', 'n', 'false', '0']:
+        return 'no'
+    raise ValueError("KP.zeeman_term must be yes or no.")
+
+
 def operate_character_special_parameters(block_parameters, block_data):
     known_parameter_names = set(block_parameters.keys())
     block_parameters['group'][-1] = parse_character_group(block_parameters['group'][-1])
@@ -72,6 +98,7 @@ def operate_character_special_parameters(block_parameters, block_data):
 
 
 def operate_kp_special_parameters(block_parameters, block_data):
+    block_data = normalize_kp_block_aliases(block_data)
     known_parameter_names = set(block_parameters.keys())
     block_parameters['group'][-1] = parse_character_group(block_parameters['group'][-1])
 
@@ -87,6 +114,14 @@ def operate_kp_special_parameters(block_parameters, block_data):
 
     raw_mag = get_variable_length_parameter('mag', block_data, known_parameter_names)
     block_parameters['mag'][-1] = parse_character_mag(raw_mag)
+
+    raw_zeeman = get_variable_length_parameter('zeeman_term', block_data, known_parameter_names)
+    if raw_zeeman is not None:
+        if len(raw_zeeman) != 1:
+            raise ValueError("KP.zeeman_term must be yes or no.")
+        block_parameters['zeeman_term'][-1] = parse_kp_zeeman_term(raw_zeeman[0])
+    else:
+        block_parameters['zeeman_term'][-1] = parse_kp_zeeman_term(block_parameters['zeeman_term'][-1])
 
 
 def get_file_block(input_filename: str) -> dict:
@@ -360,6 +395,11 @@ def check():
         occ_band = int(kp_parameters['occ_band'])
         if occ_band != -1 and occ_band <= 0:
             raise ValueError('KP.occ_band must be -1 or a positive integer.')
+
+        if int(kp_parameters['korder']) < 0:
+            raise ValueError('KP.korder must be zero or a positive integer.')
+
+        kp_parameters['zeeman_term'] = parse_kp_zeeman_term(kp_parameters['zeeman_term'])
 
         if kp_parameters['mag_tag'] not in [0, 1]:
             raise ValueError('KP.mag_tag must be 0 or 1.')

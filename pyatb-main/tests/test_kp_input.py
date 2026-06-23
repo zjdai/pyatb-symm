@@ -51,6 +51,11 @@ def test_kp_block_accepts_direct_kpoints_with_per_kpoint_bands(load_pyatb, tmp_p
                 "    band 77 78 79 80",
                 "    group 166",
                 "    symm_prec 1e-6",
+                "    data_symmetrize 1",
+                "    data_symm_target_max_abs_ry 1e-9",
+                "    data_symm_max_iter_per_operation 7",
+                "    data_symm_nonzero_block_tol 1e-10",
+                "    data_symm_verbose 1",
                 "    occ_band 80",
                 "    mag_tag 0",
                 "    mag auto",
@@ -67,8 +72,59 @@ def test_kp_block_accepts_direct_kpoints_with_per_kpoint_bands(load_pyatb, tmp_p
     assert input_data["KP"]["band"].tolist() == [[77, 78], [79, 80]]
     assert input_data["KP"]["group"] == 166
     assert input_data["KP"]["symm_prec"] == pytest.approx(1.0e-6)
+    assert input_data["KP"]["data_symmetrize"] == 1
+    assert input_data["KP"]["data_symm_target_max_abs_ry"] == pytest.approx(1.0e-9)
+    assert input_data["KP"]["data_symm_max_iter_per_operation"] == 7
+    assert input_data["KP"]["data_symm_nonzero_block_tol"] == pytest.approx(1.0e-10)
+    assert input_data["KP"]["data_symm_verbose"] == 1
     assert input_data["KP"]["occ_band"] == 80
     assert input_data["KP"]["mag"] == "auto"
+    assert input_data["KP"]["korder"] == 2
+    assert input_data["KP"]["zeeman_term"] == "yes"
+
+
+def test_kp_block_accepts_korder_and_zeeman_term(load_pyatb, tmp_path: Path) -> None:
+    input_mod = load_pyatb("pyatb.io.input")
+    input_file = tmp_path / "Input"
+    _write_kp_input(
+        input_file,
+        "\n".join(
+            [
+                "    kpoint_mode direct",
+                "    kpoint_num 1",
+                "    kpoint_direct_coor 0.0 0.0 0.0",
+                "    band 77 80",
+                "    korder 3",
+                "    zeeman_term no",
+            ]
+        ),
+    )
+
+    input_data, _function_switch, _ = input_mod.read_input(str(input_file))
+
+    assert input_data["KP"]["korder"] == 3
+    assert input_data["KP"]["zeeman_term"] == "no"
+
+
+def test_kp_block_accepts_spaced_zeeman_term_alias(load_pyatb, tmp_path: Path) -> None:
+    input_mod = load_pyatb("pyatb.io.input")
+    input_file = tmp_path / "Input"
+    _write_kp_input(
+        input_file,
+        "\n".join(
+            [
+                "    kpoint_mode direct",
+                "    kpoint_num 1",
+                "    kpoint_direct_coor 0.0 0.0 0.0",
+                "    band 77 80",
+                "    zeeman term no",
+            ]
+        ),
+    )
+
+    input_data, _function_switch, _ = input_mod.read_input(str(input_file))
+
+    assert input_data["KP"]["zeeman_term"] == "no"
 
 
 def test_kp_block_rejects_band_count_not_matching_kpoints(load_pyatb, tmp_path: Path) -> None:

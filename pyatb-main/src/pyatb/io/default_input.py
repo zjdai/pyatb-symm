@@ -380,7 +380,14 @@ INPUT = {
         'occ_band'                    : [int, 1, -1],
         'band'                        : [int, 1, None],
         'mag_tag'                     : [int, 1, 0],
-        'mag'                         : [str, 1, 'auto']
+        'mag'                         : [str, 1, 'auto'],
+        'korder'                      : [int, 1, 2],
+        'zeeman_term'                 : [str, 1, 'yes'],
+        'data_symmetrize'             : [int, 1, 0],
+        'data_symm_target_max_abs_ry' : [float, 1, 1e-8],
+        'data_symm_max_iter_per_operation' : [int, 1, 5],
+        'data_symm_nonzero_block_tol' : [float, 1, 1e-9],
+        'data_symm_verbose'           : [int, 1, 0]
     },
 
     'BERRY_CURVATURE_DIPOLE':
