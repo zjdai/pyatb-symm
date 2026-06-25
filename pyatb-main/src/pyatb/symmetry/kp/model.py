@@ -5861,7 +5861,7 @@ def _infer_model_dimension(analyses: Sequence[Mapping[str, Any]] | None) -> int:
             indices = [int(value) for value in re.findall(r"\d+", label)]
             if indices:
                 dimension = max(dimension, max(indices))
-    return max(4, dimension)
+    return dimension
 
 
 def _symbolic_factor_product(factors: Sequence[str]) -> str:

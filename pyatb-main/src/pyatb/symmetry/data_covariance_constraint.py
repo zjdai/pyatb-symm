@@ -14,6 +14,9 @@ from pyatb.symmetry.hs_covariance import _dense_blocks_by_r_with_optional_full_r
 from pyatb.symmetry.hs_standardize import (
     _atom_slice,
     _build_metadata_from_stru,
+    _dense_blocks_by_r,
+    _full_dense_blocks_by_r_from_hermitian_partners,
+    _full_vector_dense_blocks_by_r_from_position_partners,
     _unit_scale_from_hr_unit,
     _write_abacus_sparse_xr,
     _write_abacus_sparse_rR,
@@ -130,14 +133,22 @@ def load_abacus_rR_blocks(
     rR_path: str | Path,
     rR_unit: str = "Angstrom",
     full_matrix_from_hermitian: bool = True,
+    overlap_blocks: dict[tuple[int, int, int], np.ndarray] | None = None,
+    lattice_vector: np.ndarray | None = None,
 ) -> list[dict[tuple[int, int, int], np.ndarray]]:
     rR_components = abacus_readrR(str(rR_path), str(rR_unit))
-    return [
-        _dense_blocks_by_r_with_optional_full_reconstruction(
-            component,
-            full_matrix_from_hermitian=bool(full_matrix_from_hermitian),
+    component_upper = [_dense_blocks_by_r(component) for component in rR_components]
+    if not bool(full_matrix_from_hermitian):
+        return component_upper
+    if overlap_blocks is not None and lattice_vector is not None:
+        return _full_vector_dense_blocks_by_r_from_position_partners(
+            component_upper,
+            overlap_blocks,
+            np.asarray(lattice_vector, dtype=float),
         )
-        for component in rR_components
+    return [
+        _full_dense_blocks_by_r_from_hermitian_partners(component)
+        for component in component_upper
     ]
 
 
@@ -304,6 +315,8 @@ def _prepare_operation_context(
                     "target_slice_a": row_a["target_slice"],
                     "target_slice_b": row_b["target_slice"],
                     "shift_diff": np.asarray(row_b["cell_shift"] - row_a["cell_shift"], dtype=int),
+                    "left_cell_shift": np.asarray(row_a["cell_shift"], dtype=int),
+                    "right_cell_shift": np.asarray(row_b["cell_shift"], dtype=int),
                     "d_left": row_a["d"],
                     "d_right_dag": row_b["d_dag"],
                 }
@@ -395,42 +408,91 @@ def transform_vector_blocks_with_context(
     vector_blocks: list[dict[tuple[int, int, int], np.ndarray]] | tuple[dict[tuple[int, int, int], np.ndarray], ...],
     metadata,
     context: dict,
+    overlap_blocks: dict[tuple[int, int, int], np.ndarray] | None = None,
     zero_tol: float = 1.0e-14,
     nonzero_block_tol: float = 1.0e-9,
 ) -> list[dict[tuple[int, int, int], np.ndarray]]:
     if len(vector_blocks) != 3:
         raise ValueError("rR covariance expects exactly three Cartesian component block dictionaries.")
 
-    scalar_transformed = [
-        transform_blocks_with_context(
-            source_blocks=component_blocks,
-            metadata=metadata,
-            context=context,
-            zero_tol=float(zero_tol),
-            nonzero_block_tol=float(nonzero_block_tol),
-        )
-        for component_blocks in vector_blocks
-    ]
-
+    rot = np.asarray(context["rotation"], dtype=int)
     cart_rotation = np.asarray(context["cart_rotation"], dtype=float)
     if cart_rotation.shape != (3, 3):
         raise ValueError(f"cart_rotation must have shape (3, 3), got {cart_rotation.shape}.")
+    pair_rows = context.get("pair_rows")
+    if pair_rows is None:
+        raise ValueError("Operation context missing pair_rows cache.")
+    translation = np.asarray(context.get("translation", np.zeros(3, dtype=float)), dtype=float)
+    lattice = None
+    if overlap_blocks is not None:
+        lattice = np.asarray(metadata.lattice_vector, dtype=float)
+    block_tol = max(float(zero_tol), float(nonzero_block_tol))
 
-    all_keys = sorted(set().union(*(set(blocks.keys()) for blocks in scalar_transformed)))
     basis_num = int(metadata.basis_num)
-    zero = np.zeros((basis_num, basis_num), dtype=complex)
-    mixed: list[dict[tuple[int, int, int], np.ndarray]] = []
-    for alpha in range(3):
-        component: dict[tuple[int, int, int], np.ndarray] = {}
-        for r_key in all_keys:
-            value = np.zeros_like(zero, dtype=complex)
-            for beta in range(3):
-                coeff = float(cart_rotation[alpha, beta])
-                if abs(coeff) <= 1.0e-14:
-                    continue
-                value += coeff * np.asarray(scalar_transformed[beta].get(r_key, zero), dtype=complex)
-            component[r_key] = value
-        mixed.append(component)
+    mixed: list[dict[tuple[int, int, int], np.ndarray]] = [{}, {}, {}]
+    all_source_keys = set().union(*(set(blocks.keys()) for blocks in vector_blocks))
+    if overlap_blocks is not None:
+        all_source_keys.update(overlap_blocks.keys())
+
+    for r_old in sorted(all_source_keys):
+        r_old_vec = np.asarray(r_old, dtype=int)
+        dense_components = [
+            np.asarray(component_blocks.get(r_old, np.zeros((basis_num, basis_num), dtype=complex)), dtype=complex)
+            for component_blocks in vector_blocks
+        ]
+        overlap_dense = None
+        if overlap_blocks is not None:
+            overlap_dense = np.asarray(
+                overlap_blocks.get(r_old, np.zeros((basis_num, basis_num), dtype=complex)),
+                dtype=complex,
+            )
+
+        for pair in pair_rows:
+            sl_a = pair["source_slice_a"]
+            sl_b = pair["source_slice_b"]
+            local_components = [dense[sl_a, sl_b] for dense in dense_components]
+            local_overlap = None if overlap_dense is None else overlap_dense[sl_a, sl_b]
+            has_vector = any(float(np.max(np.abs(block))) >= block_tol for block in local_components)
+            has_overlap = local_overlap is not None and float(np.max(np.abs(local_overlap))) >= block_tol
+            if not has_vector and not has_overlap:
+                continue
+
+            r_new = _integral_r(rot @ r_old_vec + pair["shift_diff"])
+            r_new_key = tuple(int(x) for x in r_new.tolist())
+            sl_ap = pair["target_slice_a"]
+            sl_bp = pair["target_slice_b"]
+            rotated_components = [
+                pair["d_left"] @ np.asarray(block, dtype=complex) @ pair["d_right_dag"]
+                for block in local_components
+            ]
+            rotated_overlap = None
+            if local_overlap is not None:
+                rotated_overlap = pair["d_left"] @ np.asarray(local_overlap, dtype=complex) @ pair["d_right_dag"]
+
+            delta_cart = None
+            if rotated_overlap is not None:
+                # Position is an affine vector operator.  The R-dependent
+                # Hermitian partner shift is handled when rR is reconstructed;
+                # the covariance operation itself only adds the symmetry
+                # translation and removes the mapped bra-cell image.
+                delta_frac = (
+                    translation
+                    - np.asarray(pair["left_cell_shift"], dtype=float)
+                )
+                delta_cart = delta_frac @ np.asarray(lattice, dtype=float)
+            for alpha in range(3):
+                target = mixed[alpha].setdefault(
+                    r_new_key,
+                    np.zeros((basis_num, basis_num), dtype=complex),
+                )
+                value = np.zeros((sl_ap.stop - sl_ap.start, sl_bp.stop - sl_bp.start), dtype=complex)
+                for beta in range(3):
+                    coeff = float(cart_rotation[alpha, beta])
+                    if abs(coeff) > 1.0e-14:
+                        value += coeff * rotated_components[beta]
+                if rotated_overlap is not None and delta_cart is not None:
+                    value += float(delta_cart[alpha]) * rotated_overlap
+                target[sl_ap, sl_bp] += value
     return mixed
 
 
@@ -715,8 +777,8 @@ def compare_vector_block_sets(
     rms_sq_sum = 0.0
     rel_fro_max = 0.0
     for name, ref, pred in zip(component_names, reference_vector_blocks, predicted_vector_blocks, strict=True):
-        summary = compare_block_sets(ref, pred, int(basis_num))
-        components.append({"component": name, **summary.to_dict()})
+        summary, detail = compare_block_sets_with_detail(ref, pred, int(basis_num))
+        components.append({"component": name, **summary.to_dict(), "worst_error_element": detail})
         max_abs = max(max_abs, float(summary.max_abs))
         mean_abs_sum += float(summary.mean_abs)
         rms_sq_sum += float(summary.rms_abs ** 2)
@@ -865,6 +927,7 @@ def _vector_self_covariance_statistics_with_contexts(
     vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
     metadata,
     operation_contexts: list[tuple[dict, dict]],
+    overlap_blocks: dict[tuple[int, int, int], np.ndarray] | None = None,
     nonzero_block_tol: float = 1.0e-9,
 ) -> dict:
     per_op = []
@@ -878,6 +941,7 @@ def _vector_self_covariance_statistics_with_contexts(
             vector_blocks,
             metadata,
             context,
+            overlap_blocks=overlap_blocks,
             nonzero_block_tol=float(nonzero_block_tol),
         )
         summary = compare_vector_block_sets(vector_blocks, transformed, int(metadata.basis_num))
@@ -936,6 +1000,7 @@ def vector_self_covariance_statistics(
     map_tol: float = 1.0e-5,
     nonzero_block_tol: float = 1.0e-9,
     operation_contexts: list[tuple[dict, dict]] | None = None,
+    overlap_blocks: dict[tuple[int, int, int], np.ndarray] | None = None,
 ) -> dict:
     if operation_contexts is None:
         operation_contexts = prepare_operation_contexts(
@@ -947,6 +1012,7 @@ def vector_self_covariance_statistics(
         vector_blocks,
         metadata,
         operation_contexts,
+        overlap_blocks=overlap_blocks,
         nonzero_block_tol=float(nonzero_block_tol),
     )
 
@@ -1142,6 +1208,7 @@ def sequential_symmetrize_rR(
     vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
     metadata,
     operations: list[dict],
+    overlap_blocks: dict[tuple[int, int, int], np.ndarray] | None = None,
     operation_target_max_abs: float = 1.0e-8,
     max_iter_per_operation: int | None = 5,
     map_tol: float = 1.0e-5,
@@ -1193,6 +1260,7 @@ def sequential_symmetrize_rR(
                 cur,
                 metadata,
                 context,
+                overlap_blocks=overlap_blocks,
                 nonzero_block_tol=float(nonzero_block_tol),
             )
             stat = compare_vector_block_sets(cur, transformed, int(metadata.basis_num))
@@ -1224,6 +1292,7 @@ def sequential_symmetrize_rR(
         cur,
         metadata,
         operation_contexts,
+        overlap_blocks=overlap_blocks,
         nonzero_block_tol=float(nonzero_block_tol),
     )
     history.append({"final_symmetry_error": {"rR": final_rR}})

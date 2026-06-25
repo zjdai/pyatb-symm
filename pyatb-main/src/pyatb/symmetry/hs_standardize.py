@@ -184,6 +184,38 @@ def _full_dense_blocks_by_r_from_hermitian_partners(
     return full_by_r
 
 
+def _full_vector_dense_blocks_by_r_from_position_partners(
+    component_dense_by_r: list[dict[tuple[int, int, int], np.ndarray]],
+    overlap_dense_by_r: dict[tuple[int, int, int], np.ndarray],
+    lattice_vector: np.ndarray,
+) -> list[dict[tuple[int, int, int], np.ndarray]]:
+    if len(component_dense_by_r) != 3:
+        raise ValueError("rR position reconstruction expects exactly three Cartesian components.")
+
+    lattice = np.asarray(lattice_vector, dtype=float)
+    full_components: list[dict[tuple[int, int, int], np.ndarray]] = []
+    for direction, dense_by_r in enumerate(component_dense_by_r):
+        full_by_r: dict[tuple[int, int, int], np.ndarray] = {}
+        for r_key, upper_dense in dense_by_r.items():
+            partner_key = tuple(int(-value) for value in r_key)
+            partner_upper = dense_by_r.get(partner_key)
+            full_dense = np.asarray(upper_dense, dtype=complex).copy()
+            if partner_upper is None:
+                full_by_r[r_key] = full_dense
+                continue
+
+            nrow = full_dense.shape[0]
+            lower_indices = np.tril_indices(nrow, k=-1)
+            partner_full = np.conj(np.asarray(partner_upper, dtype=complex).T)
+            overlap = np.asarray(overlap_dense_by_r.get(r_key, np.zeros_like(full_dense)), dtype=complex)
+            r_cart = np.asarray(r_key, dtype=float) @ lattice
+            partner_full = partner_full + float(r_cart[direction]) * overlap
+            full_dense[lower_indices] = partner_full[lower_indices]
+            full_by_r[r_key] = full_dense
+        full_components.append(full_by_r)
+    return full_components
+
+
 def _dense_blocks_by_r_with_optional_full_reconstruction(
     xr,
     full_matrix_from_hermitian: bool = False,
@@ -558,6 +590,129 @@ def _mix_cartesian_vector_blocks(
     return mixed
 
 
+def _assemble_target_vector_dense_blocks(
+    source_component_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    source_overlap_blocks: dict[tuple[int, int, int], np.ndarray] | None,
+    source_metadata,
+    target_metadata,
+    atom_mapping: list[dict],
+    lattice_transform_fractional: np.ndarray,
+    xyz_axis_transform_cartesian: np.ndarray,
+    global_fractional_shift: np.ndarray | None = None,
+):
+    if len(source_component_blocks) != 3:
+        raise ValueError("rR standardization expects exactly three Cartesian components.")
+
+    orbital_rotations = {
+        item["old_atom"]: _local_rotation(source_metadata, item["old_atom"], xyz_axis_transform_cartesian)
+        for item in atom_mapping
+    }
+    atom_mapping_by_old = {item["old_atom"]: item for item in atom_mapping}
+    cart_transform = np.asarray(xyz_axis_transform_cartesian, dtype=float)
+    target_lattice = np.asarray(target_metadata.lattice_vector, dtype=float)
+    global_shift = (
+        np.zeros(3, dtype=float)
+        if global_fractional_shift is None
+        else np.asarray(global_fractional_shift, dtype=float).reshape(3)
+    )
+
+    target_components = [
+        {} for _ in range(3)
+    ]
+    mapping_lines: list[str] = []
+    image_normalization = _mapping_image_normalization(atom_mapping, len(target_metadata.atom_ranges))
+    all_r_keys = set().union(*(set(component.keys()) for component in source_component_blocks))
+    if source_overlap_blocks is not None:
+        all_r_keys.update(source_overlap_blocks.keys())
+
+    for r_old in sorted(all_r_keys):
+        dense_components = [
+            np.asarray(component.get(r_old, np.zeros((source_metadata.basis_num, source_metadata.basis_num), dtype=complex)), dtype=complex)
+            for component in source_component_blocks
+        ]
+        overlap_dense = None
+        if source_overlap_blocks is not None:
+            overlap_dense = np.asarray(
+                source_overlap_blocks.get(
+                    r_old,
+                    np.zeros((source_metadata.basis_num, source_metadata.basis_num), dtype=complex),
+                ),
+                dtype=complex,
+            )
+
+        for map_a in atom_mapping:
+            old_a = int(map_a["old_atom"])
+            source_slice_a = _atom_slice(source_metadata, old_a)
+            d_a = orbital_rotations[old_a]
+            target_a = int(map_a["new_atom"])
+            target_slice_a = _atom_slice(target_metadata, target_a)
+
+            for old_b, map_b in atom_mapping_by_old.items():
+                source_slice_b = _atom_slice(source_metadata, old_b)
+                d_b = orbital_rotations[old_b]
+                target_b = int(map_b["new_atom"])
+                target_slice_b = _atom_slice(target_metadata, target_b)
+
+                local_components = [dense[source_slice_a, source_slice_b] for dense in dense_components]
+                local_overlap = None if overlap_dense is None else overlap_dense[source_slice_a, source_slice_b]
+                has_vector = any(np.any(np.abs(block) > 1.0e-14) for block in local_components)
+                has_overlap = local_overlap is not None and np.any(np.abs(local_overlap) > 1.0e-14)
+                if not has_vector and not has_overlap:
+                    continue
+
+                r_new = map_target_r_vector(
+                    lattice_transform_fractional,
+                    r_old,
+                    np.asarray(map_a["shift"], dtype=int),
+                    np.asarray(map_b["shift"], dtype=int),
+                )
+                key = tuple(int(value) for value in r_new.tolist())
+                rotated_components = [
+                    image_normalization * (d_a.conj().T @ local_block @ d_b)
+                    for local_block in local_components
+                ]
+                rotated_overlap = None
+                if local_overlap is not None:
+                    rotated_overlap = image_normalization * (d_a.conj().T @ local_overlap @ d_b)
+                delta_cart = None
+                if rotated_overlap is not None:
+                    delta_cart = (-(global_shift + np.asarray(map_a["shift"], dtype=float))) @ target_lattice
+
+                for alpha in range(3):
+                    target_dense = target_components[alpha].setdefault(
+                        key,
+                        np.zeros((target_metadata.basis_num, target_metadata.basis_num), dtype=complex),
+                    )
+                    value = np.zeros(
+                        (target_slice_a.stop - target_slice_a.start, target_slice_b.stop - target_slice_b.start),
+                        dtype=complex,
+                    )
+                    for beta in range(3):
+                        coeff = float(cart_transform[alpha, beta])
+                        if abs(coeff) > 1.0e-14:
+                            value += coeff * rotated_components[beta]
+                    if rotated_overlap is not None and delta_cart is not None:
+                        value += float(delta_cart[alpha]) * rotated_overlap
+                    target_dense[target_slice_a, target_slice_b] += value
+
+                if len(mapping_lines) < 100000:
+                    mapping_lines.append(
+                        "R %4d %4d %4d atom%d ------> R %4d %4d %4d atom%d\n"
+                        % (
+                            int(r_old[0]),
+                            int(r_old[1]),
+                            int(r_old[2]),
+                            old_a + 1,
+                            int(r_new[0]),
+                            int(r_new[1]),
+                            int(r_new[2]),
+                            target_a + 1,
+                        )
+                    )
+
+    return target_components, mapping_lines
+
+
 def canonicalize_abacus_rR(
     tb,
     target_stru_path,
@@ -570,6 +725,8 @@ def canonicalize_abacus_rR(
     output_rR_path,
     full_matrix_from_hermitian: bool = True,
     reference_r_keys=None,
+    sr_route=None,
+    global_fractional_shift=None,
 ):
     source_metadata = extract_abacus_basis_metadata(tb)
     target_metadata = _build_metadata_from_stru(Path(target_stru_path), np.asarray(lattice_new, dtype=float), int(tb.nspin))
@@ -579,26 +736,40 @@ def canonicalize_abacus_rR(
         atom_mapping = _normalize_standardization_atom_mapping(atom_mapping, source_metadata)
 
     source_rR = abacus_readrR(str(rR_route), str(rR_unit))
-    component_blocks: list[dict[tuple[int, int, int], np.ndarray]] = []
-    mapping_lines: list[str] = []
-    for direction, source_component in enumerate(source_rR):
-        blocks, lines = _assemble_target_dense_blocks(
-            source_component,
-            source_metadata,
-            target_metadata,
-            atom_mapping,
-            np.asarray(lattice_transform_fractional, dtype=float),
-            np.asarray(xyz_axis_transform_cartesian, dtype=float),
-            full_matrix_from_hermitian=full_matrix_from_hermitian,
+    source_component_upper = [_dense_blocks_by_r(component) for component in source_rR]
+    source_overlap_blocks = None
+    if sr_route is not None:
+        source_sr = abacus_readSR(int(tb.nspin), str(sr_route))
+        source_overlap_upper = _dense_blocks_by_r(source_sr)
+        source_overlap_blocks = (
+            _full_dense_blocks_by_r_from_hermitian_partners(source_overlap_upper)
+            if bool(full_matrix_from_hermitian)
+            else source_overlap_upper
         )
-        component_blocks.append(blocks)
-        if direction == 0:
-            mapping_lines = lines
+    if bool(full_matrix_from_hermitian):
+        if source_overlap_blocks is not None:
+            source_component_blocks = _full_vector_dense_blocks_by_r_from_position_partners(
+                source_component_upper,
+                source_overlap_blocks,
+                np.asarray(source_metadata.lattice_vector, dtype=float),
+            )
+        else:
+            source_component_blocks = [
+                _full_dense_blocks_by_r_from_hermitian_partners(component)
+                for component in source_component_upper
+            ]
+    else:
+        source_component_blocks = source_component_upper
 
-    mixed_blocks = _mix_cartesian_vector_blocks(
-        component_blocks,
+    mixed_blocks, mapping_lines = _assemble_target_vector_dense_blocks(
+        source_component_blocks,
+        source_overlap_blocks,
+        source_metadata,
+        target_metadata,
+        atom_mapping,
+        np.asarray(lattice_transform_fractional, dtype=float),
         np.asarray(xyz_axis_transform_cartesian, dtype=float),
-        int(target_metadata.basis_num),
+        global_fractional_shift=global_fractional_shift,
     )
     _write_abacus_sparse_rR(
         Path(output_rR_path),

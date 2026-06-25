@@ -139,6 +139,8 @@ class Character:
         active_sr_path,
         hr_stats: dict,
         sr_stats: dict,
+        active_rR_path=None,
+        rR_stats: dict | None = None,
     ) -> None:
         path = Path(report_path)
         if not path.exists():
@@ -164,12 +166,32 @@ class Character:
                 f"{cls._format_covariance_summary_error(sr_stats.get('global_max_abs', 0.0))}"
             ),
         }
+        if active_rR_path is not None:
+            replacements["calculated rR file:"] = f"calculated rR file: {cls._format_report_path(active_rR_path)}"
+        if rR_stats is not None:
+            replacements["Symmetry operation rR max error:"] = (
+                "Symmetry operation rR max error: "
+                f"{cls._format_covariance_summary_error(rR_stats.get('global_max_abs', 0.0))}"
+            )
+            replacements["Symmetry operation rR mean error:"] = (
+                "Symmetry operation rR mean error: "
+                f"{cls._format_covariance_summary_error(rR_stats.get('mean_abs_over_operations', 0.0))}"
+            )
 
         lines = path.read_text(encoding="utf-8").splitlines()
         updated = []
+        seen_rR_path = False
+        seen_rR_max = False
+        seen_rR_mean = False
         for line in lines:
             for prefix, replacement in replacements.items():
                 if line.startswith(prefix):
+                    if prefix == "calculated rR file:":
+                        seen_rR_path = True
+                    elif prefix == "Symmetry operation rR max error:":
+                        seen_rR_max = True
+                    elif prefix == "Symmetry operation rR mean error:":
+                        seen_rR_mean = True
                     if replacement is None:
                         updated.append(f"Structure standardized: {line.split(':', 1)[1].strip()}")
                     else:
@@ -177,6 +199,35 @@ class Character:
                     break
             else:
                 updated.append(line)
+
+        if active_rR_path is not None and not seen_rR_path:
+            insert_at = next(
+                (idx + 1 for idx, line in enumerate(updated) if line.startswith("calculated sr file:")),
+                len(updated),
+            )
+            updated.insert(insert_at, f"calculated rR file: {cls._format_report_path(active_rR_path)}")
+        if rR_stats is not None:
+            insert_at = next(
+                (
+                    idx + 1
+                    for idx, line in enumerate(updated)
+                    if line.startswith("Symmetry operation overlap max error:")
+                ),
+                len(updated),
+            )
+            if not seen_rR_max:
+                updated.insert(
+                    insert_at,
+                    "Symmetry operation rR max error: "
+                    f"{cls._format_covariance_summary_error(rR_stats.get('global_max_abs', 0.0))}",
+                )
+                insert_at += 1
+            if not seen_rR_mean:
+                updated.insert(
+                    insert_at,
+                    "Symmetry operation rR mean error: "
+                    f"{cls._format_covariance_summary_error(rR_stats.get('mean_abs_over_operations', 0.0))}",
+                )
         path.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
     @staticmethod
@@ -295,6 +346,7 @@ class Character:
         running_log_path: str | Path,
         stage_label: str,
         suggest_data_symmetrize: bool = True,
+        rR_stats: dict | None = None,
     ) -> None:
         max_error = cls._max_covariance_error(hr_stats, sr_stats)
         hr_max = float(hr_stats.get("global_max_abs", 0.0))
@@ -307,6 +359,16 @@ class Character:
                 fp.write(f"\nData Covariance Check ({stage_label})\n")
                 fp.write(f"HR max/mean = {hr_max:.6e}/{hr_mean:.6e}\n")
                 fp.write(f"SR max/mean = {sr_max:.6e}/{sr_mean:.6e}\n")
+                if rR_stats is not None:
+                    rR_max = float(rR_stats.get("global_max_abs", 0.0))
+                    rR_mean = float(rR_stats.get("mean_abs_over_operations", 0.0))
+                    rR_rms = float(rR_stats.get("rms_abs_over_operations", 0.0))
+                    rR_rel = float(rR_stats.get("max_rel_fro_over_operations", 0.0))
+                    fp.write(f"rR max/mean = {rR_max:.6e}/{rR_mean:.6e}\n")
+                    fp.write(f"rR rms/max_rel_fro = {rR_rms:.6e}/{rR_rel:.6e}\n")
+                    component_max = cls._format_rR_component_maxima(rR_stats)
+                    if component_max:
+                        fp.write(f"rR component max (x/y/z) = {component_max}\n")
                 fp.write(f"combined_max = {max_error:.6e}\n")
 
         if max_error > cls._COVARIANCE_ERROR_ABORT_THRESHOLD:
@@ -321,6 +383,48 @@ class Character:
                 with open(running_log_path, "a", encoding="utf-8") as fp:
                     fp.write(f"{message}\n")
             warnings.warn(message, UserWarning, stacklevel=2)
+
+    @staticmethod
+    def _format_rR_component_maxima(rR_stats: dict) -> str:
+        component_names = ("x", "y", "z")
+        maxima = {name: 0.0 for name in component_names}
+        for operation in rR_stats.get("operations", []) or []:
+            for component in operation.get("components", []) or []:
+                name = str(component.get("component", ""))
+                if name in maxima:
+                    maxima[name] = max(maxima[name], float(component.get("max_abs", 0.0)))
+        return "/".join(f"{maxima[name]:.6e}" for name in component_names)
+
+    @classmethod
+    def _write_rR_covariance_report(
+        cls,
+        report_path: Path,
+        *,
+        rR_path,
+        rR_unit: str,
+        stage_label: str,
+        stats: dict,
+    ) -> None:
+        payload = {
+            "stage": str(stage_label),
+            "rR_path": cls._format_report_path(rR_path),
+            "rR_unit": str(rR_unit),
+            "convention": (
+                "For each symmetry operation, every Cartesian rR component is first transformed "
+                "with the same atom/R/local-basis mapping as H/S, then x/y/z components are mixed "
+                "by the operation Cartesian O(3) matrix before comparing with the original rR."
+            ),
+            "summary": {
+                "operation_count": int(stats.get("operation_count", 0)),
+                "global_max_abs": float(stats.get("global_max_abs", 0.0)),
+                "mean_abs_over_operations": float(stats.get("mean_abs_over_operations", 0.0)),
+                "rms_abs_over_operations": float(stats.get("rms_abs_over_operations", 0.0)),
+                "max_rel_fro_over_operations": float(stats.get("max_rel_fro_over_operations", 0.0)),
+                "component_max_abs_xyz": cls._format_rR_component_maxima(stats),
+            },
+            "operations": stats.get("operations", []),
+        }
+        Path(report_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _write_trace_output(self, analysis_result: dict, rows: list[dict], occ_band: int) -> None:
         trace_path = Path(self.output_path) / "trace.txt"
@@ -916,6 +1020,11 @@ class Character:
                     reference_r_keys = None
                     if isinstance(standardized_hs, dict) and standardized_hs.get("hr") is not None:
                         reference_r_keys = getattr(standardized_hs["hr"], "R_direct_coor", None)
+                    structure_mapping = analysis_result.get("structure_mapping") or {}
+                    rR_global_shift = np.asarray(
+                        structure_mapping.get("global_shift", np.zeros(3, dtype=float)),
+                        dtype=float,
+                    ).reshape(3)
                     canonicalize_abacus_rR(
                         tb=self._tb,
                         target_stru_path=target_stru_path,
@@ -928,6 +1037,8 @@ class Character:
                         output_rR_path=standardized_rR_path,
                         full_matrix_from_hermitian=full_matrix_from_hermitian,
                         reference_r_keys=reference_r_keys,
+                        sr_route=sr_source,
+                        global_fractional_shift=rR_global_shift,
                     )
 
             active_stru_path = target_stru_path
@@ -965,6 +1076,8 @@ class Character:
                 active_rR_path,
                 rR_unit=str(rR_unit),
                 full_matrix_from_hermitian=True,
+                overlap_blocks=sr_blocks,
+                lattice_vector=np.asarray(metadata.lattice_vector, dtype=float),
             )
         analysis_source_operations = self._active_structure_operations(analysis_result)
         if mag_tag == 1 and analysis_source_operations:
@@ -992,13 +1105,6 @@ class Character:
             nonzero_block_tol=float(data_symm_nonzero_block_tol),
             operation_contexts=operation_contexts,
         )
-        self._validate_covariance_statistics(
-            before_hr,
-            before_sr,
-            running_log_path=RUNNING_LOG,
-            stage_label="before data symmetrization",
-            suggest_data_symmetrize=(data_symmetrize == 0),
-        )
         before_rR = None
         if rR_blocks is not None:
             before_rR = vector_self_covariance_statistics(
@@ -1008,6 +1114,23 @@ class Character:
                 map_tol=float(symm_prec),
                 nonzero_block_tol=float(data_symm_nonzero_block_tol),
                 operation_contexts=operation_contexts,
+                overlap_blocks=sr_blocks,
+            )
+        self._validate_covariance_statistics(
+            before_hr,
+            before_sr,
+            running_log_path=RUNNING_LOG,
+            stage_label="before data symmetrization",
+            suggest_data_symmetrize=(data_symmetrize == 0),
+            rR_stats=before_rR,
+        )
+        if RANK == 0 and before_rR is not None and active_rR_path is not None:
+            self._write_rR_covariance_report(
+                Path(self.output_path) / "rR_covariance_report.json",
+                rR_path=active_rR_path,
+                rR_unit=str(rR_unit),
+                stage_label="before data symmetrization",
+                stats=before_rR,
             )
         final_hr_stats = before_hr
         final_sr_stats = before_sr
@@ -1044,15 +1167,28 @@ class Character:
                 nonzero_block_tol=float(data_symm_nonzero_block_tol),
                 operation_contexts=operation_contexts,
             )
+            after_rR = None
+            if rR_blocks is not None:
+                after_rR = vector_self_covariance_statistics(
+                    rR_blocks,
+                    metadata,
+                    operations,
+                    map_tol=float(symm_prec),
+                    nonzero_block_tol=float(data_symm_nonzero_block_tol),
+                    operation_contexts=operation_contexts,
+                    overlap_blocks=sr_symm,
+                )
             self._validate_covariance_statistics(
                 after_hr,
                 after_sr,
                 running_log_path=RUNNING_LOG,
                 stage_label="after data symmetrization",
                 suggest_data_symmetrize=False,
+                rR_stats=after_rR,
             )
             final_hr_stats = after_hr
             final_sr_stats = after_sr
+            final_rR_stats = after_rR
 
             cov_hr_path = Path(self.output_path) / f"{active_hr_path.stem}-covsymm.csr"
             cov_sr_path = Path(self.output_path) / f"{active_sr_path.stem}-covsymm.csr"
@@ -1199,6 +1335,8 @@ class Character:
                 active_sr_path=active_sr_path,
                 hr_stats=final_hr_stats,
                 sr_stats=final_sr_stats,
+                active_rR_path=active_rR_path,
+                rR_stats=final_rR_stats,
             )
 
         return {
