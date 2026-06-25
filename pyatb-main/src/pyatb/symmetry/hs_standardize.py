@@ -8,7 +8,8 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from pyatb.io.abacus_read_stru import read_stru
-from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR
+from pyatb.constants import Ang_to_Bohr
+from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR, abacus_readrR
 from pyatb.symmetry.Dk_matrix import (
     build_atom_local_rotation,
     extract_abacus_basis_metadata,
@@ -320,6 +321,14 @@ def _unit_scale_from_hr_unit(hr_unit: str) -> float:
     raise ValueError(f"Unsupported HR unit: {hr_unit}")
 
 
+def _unit_scale_from_rR_unit(rR_unit: str) -> float:
+    if rR_unit == "Angstrom":
+        return 1.0
+    if rR_unit == "Bohr":
+        return 1.0 / float(Ang_to_Bohr)
+    raise ValueError(f"Unsupported rR unit: {rR_unit}")
+
+
 def _write_abacus_sparse_xr(path: Path, matrices_by_r: dict, basis_num: int, nspin: int, unit_scale: float = 1.0) -> None:
     r_keys = sorted(matrices_by_r.keys())
     with path.open("w", encoding="utf-8") as handle:
@@ -342,6 +351,44 @@ def _write_abacus_sparse_xr(path: Path, matrices_by_r: dict, basis_num: int, nsp
                 handle.write(" ".join(f"{float(value):.16e}" for value in csr.data) + "\n")
             handle.write(" ".join(str(int(value)) for value in csr.indices) + "\n")
             handle.write(" ".join(str(int(value)) for value in csr.indptr) + "\n")
+
+
+def _write_abacus_sparse_rR(
+    path: Path,
+    vector_matrices_by_r: list[dict[tuple[int, int, int], np.ndarray]],
+    basis_num: int,
+    nspin: int,
+    rR_unit: str = "Angstrom",
+) -> None:
+    if len(vector_matrices_by_r) != 3:
+        raise ValueError("rR writer expects exactly three Cartesian component block dictionaries.")
+
+    r_keys = sorted(set().union(*(set(component.keys()) for component in vector_matrices_by_r)))
+    unit_scale = _unit_scale_from_rR_unit(str(rR_unit))
+    zero = np.zeros((int(basis_num), int(basis_num)), dtype=complex)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("STEP: 0\n")
+        handle.write(f"Matrix Dimension of r(R): {int(basis_num)}\n")
+        handle.write(f"Matrix number of r(R): {len(r_keys)}\n")
+
+        for r_key in r_keys:
+            handle.write(f"{r_key[0]} {r_key[1]} {r_key[2]}\n")
+            for component_blocks in vector_matrices_by_r:
+                dense = np.asarray(component_blocks.get(r_key, zero), dtype=complex) / float(unit_scale)
+                if int(nspin) != 4:
+                    if np.max(np.abs(dense.imag)) > 1.0e-8:
+                        raise ValueError("Non-spinor rR writer received complex values beyond tolerance.")
+                    dense = dense.real
+                csr = csr_matrix(dense)
+                handle.write(f"{csr.nnz}\n")
+                if csr.nnz == 0:
+                    continue
+                if int(nspin) == 4:
+                    handle.write(" ".join(f"({value.real:.16e},{value.imag:.16e})" for value in csr.data) + "\n")
+                else:
+                    handle.write(" ".join(f"{float(value):.16e}" for value in csr.data) + "\n")
+                handle.write(" ".join(str(int(value)) for value in csr.indices) + "\n")
+                handle.write(" ".join(str(int(value)) for value in csr.indptr) + "\n")
 
 
 def _synchronize_block_keys(
@@ -467,6 +514,105 @@ def _validate_standardized_hs_symmetry(
     return report
 
 
+def _normalize_standardization_atom_mapping(atom_mapping, source_metadata):
+    return [
+        {
+            "old_atom": int(item["old_atom"]),
+            "new_atom": int(item["new_atom"]),
+            "shift": np.asarray(item["shift"], dtype=int),
+            "species": str(item.get("species", source_metadata.species_by_atom[int(item["old_atom"])])),
+        }
+        for item in atom_mapping
+    ]
+
+
+def _mix_cartesian_vector_blocks(
+    component_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    cart_transform: np.ndarray,
+    basis_num: int,
+) -> list[dict[tuple[int, int, int], np.ndarray]]:
+    if len(component_blocks) != 3:
+        raise ValueError("Cartesian vector block mixing expects exactly three components.")
+    rotation = np.asarray(cart_transform, dtype=float)
+    if rotation.shape != (3, 3):
+        raise ValueError(f"Cartesian transform must have shape (3, 3), got {rotation.shape}.")
+
+    all_keys = sorted(set().union(*(set(blocks.keys()) for blocks in component_blocks)))
+    zero = np.zeros((int(basis_num), int(basis_num)), dtype=complex)
+    mixed: list[dict[tuple[int, int, int], np.ndarray]] = []
+    for alpha in range(3):
+        out: dict[tuple[int, int, int], np.ndarray] = {}
+        for r_key in all_keys:
+            value = np.zeros_like(zero, dtype=complex)
+            for beta in range(3):
+                coeff = float(rotation[alpha, beta])
+                if abs(coeff) <= 1.0e-14:
+                    continue
+                value += coeff * np.asarray(component_blocks[beta].get(r_key, zero), dtype=complex)
+            out[r_key] = value
+        mixed.append(out)
+    return mixed
+
+
+def canonicalize_abacus_rR(
+    tb,
+    target_stru_path,
+    rR_route,
+    rR_unit,
+    atom_mapping,
+    lattice_new,
+    lattice_transform_fractional,
+    xyz_axis_transform_cartesian,
+    output_rR_path,
+    full_matrix_from_hermitian: bool = True,
+):
+    source_metadata = extract_abacus_basis_metadata(tb)
+    target_metadata = _build_metadata_from_stru(Path(target_stru_path), np.asarray(lattice_new, dtype=float), int(tb.nspin))
+    if atom_mapping is None:
+        atom_mapping = build_standardization_atom_mapping(source_metadata, target_metadata)
+    else:
+        atom_mapping = _normalize_standardization_atom_mapping(atom_mapping, source_metadata)
+
+    source_rR = abacus_readrR(str(rR_route), str(rR_unit))
+    component_blocks: list[dict[tuple[int, int, int], np.ndarray]] = []
+    mapping_lines: list[str] = []
+    for direction, source_component in enumerate(source_rR):
+        blocks, lines = _assemble_target_dense_blocks(
+            source_component,
+            source_metadata,
+            target_metadata,
+            atom_mapping,
+            np.asarray(lattice_transform_fractional, dtype=float),
+            np.asarray(xyz_axis_transform_cartesian, dtype=float),
+            full_matrix_from_hermitian=full_matrix_from_hermitian,
+        )
+        component_blocks.append(blocks)
+        if direction == 0:
+            mapping_lines = lines
+
+    mixed_blocks = _mix_cartesian_vector_blocks(
+        component_blocks,
+        np.asarray(xyz_axis_transform_cartesian, dtype=float),
+        int(target_metadata.basis_num),
+    )
+    _write_abacus_sparse_rR(
+        Path(output_rR_path),
+        mixed_blocks,
+        int(target_metadata.basis_num),
+        int(tb.nspin),
+        rR_unit=str(rR_unit),
+    )
+
+    canonical_rR = abacus_readrR(str(output_rR_path), str(rR_unit))
+    return {
+        "rR": canonical_rR,
+        "atom_mapping": atom_mapping,
+        "target_basis_num": int(target_metadata.basis_num),
+        "r_block_mapping_lines": mapping_lines,
+        "full_matrix_from_hermitian": bool(full_matrix_from_hermitian),
+    }
+
+
 def canonicalize_abacus_hs(
     tb,
     target_stru_path,
@@ -492,15 +638,7 @@ def canonicalize_abacus_hs(
     if atom_mapping is None:
         atom_mapping = build_standardization_atom_mapping(source_metadata, target_metadata)
     else:
-        atom_mapping = [
-            {
-                "old_atom": int(item["old_atom"]),
-                "new_atom": int(item["new_atom"]),
-                "shift": np.asarray(item["shift"], dtype=int),
-                "species": str(item.get("species", source_metadata.species_by_atom[int(item["old_atom"])])),
-            }
-            for item in atom_mapping
-        ]
+        atom_mapping = _normalize_standardization_atom_mapping(atom_mapping, source_metadata)
 
     source_hr = abacus_readHR(int(tb.nspin), str(hr_route), hr_unit)
     source_sr = abacus_readSR(int(tb.nspin), str(sr_route))

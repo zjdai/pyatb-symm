@@ -128,3 +128,93 @@ def test_full_dense_blocks_are_completed_from_minus_r_partner(load_pyatb) -> Non
     assert r_neg in dense_full
     np.testing.assert_allclose(dense_full[r_pos][1, 0], np.conj(dense_full[r_neg][0, 1]))
     np.testing.assert_allclose(dense_full[r_neg][1, 0], np.conj(dense_full[r_pos][0, 1]))
+
+
+def test_vector_rR_covariance_mixes_cartesian_components(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.data_covariance_constraint")
+
+    metadata = type("Meta", (), {"basis_num": 1})()
+    rot_z_90 = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    context = {
+        "rotation": np.eye(3, dtype=int),
+        "cart_rotation": rot_z_90,
+        "pair_rows": [
+            {
+                "source_slice_a": slice(0, 1),
+                "source_slice_b": slice(0, 1),
+                "target_slice_a": slice(0, 1),
+                "target_slice_b": slice(0, 1),
+                "target_a": 0,
+                "target_b": 0,
+                "shift_diff": np.zeros(3, dtype=int),
+                "d_left": np.eye(1, dtype=complex),
+                "d_right_dag": np.eye(1, dtype=complex),
+            }
+        ],
+        "pair_row_by_source": {
+            (0, 0): {
+                "source_slice_a": slice(0, 1),
+                "source_slice_b": slice(0, 1),
+                "target_slice_a": slice(0, 1),
+                "target_slice_b": slice(0, 1),
+                "target_a": 0,
+                "target_b": 0,
+                "shift_diff": np.zeros(3, dtype=int),
+                "d_left": np.eye(1, dtype=complex),
+                "d_right_dag": np.eye(1, dtype=complex),
+            }
+        },
+    }
+    vector_blocks = [
+        {(0, 0, 0): np.array([[1.0 + 0.0j]], dtype=complex)},
+        {(0, 0, 0): np.array([[2.0 + 0.0j]], dtype=complex)},
+        {(0, 0, 0): np.array([[3.0 + 0.0j]], dtype=complex)},
+    ]
+
+    transformed = module.transform_vector_blocks_with_context(
+        vector_blocks,
+        metadata,
+        context,
+        nonzero_block_tol=1.0e-12,
+    )
+
+    np.testing.assert_allclose(transformed[0][(0, 0, 0)], np.array([[-2.0 + 0.0j]]))
+    np.testing.assert_allclose(transformed[1][(0, 0, 0)], np.array([[1.0 + 0.0j]]))
+    np.testing.assert_allclose(transformed[2][(0, 0, 0)], np.array([[3.0 + 0.0j]]))
+
+
+def test_write_symmetrized_rR_roundtrips_with_abacus_reader(load_pyatb, tmp_path) -> None:
+    covariance = load_pyatb("pyatb.symmetry.data_covariance_constraint")
+    hs_covariance = load_pyatb("pyatb.symmetry.hs_covariance")
+    reader = load_pyatb("pyatb.io.abacus_read_xr")
+
+    path = tmp_path / "data-rR-sparse-covsymm.csr"
+    vector_blocks = [
+        {(0, 0, 0): np.array([[1.25 + 0.0j]], dtype=complex)},
+        {(0, 0, 0): np.array([[2.50 + 0.0j]], dtype=complex)},
+        {(0, 0, 0): np.array([[3.75 + 0.0j]], dtype=complex)},
+    ]
+
+    covariance.write_symmetrized_rR(
+        vector_blocks,
+        path,
+        basis_num=1,
+        nspin=1,
+        rR_unit="Angstrom",
+    )
+
+    roundtrip = reader.abacus_readrR(str(path), "Angstrom")
+    dense = [
+        hs_covariance._dense_blocks_by_r_with_optional_full_reconstruction(component, full_matrix_from_hermitian=True)
+        for component in roundtrip
+    ]
+    np.testing.assert_allclose(dense[0][(0, 0, 0)], np.array([[1.25 + 0.0j]]))
+    np.testing.assert_allclose(dense[1][(0, 0, 0)], np.array([[2.50 + 0.0j]]))
+    np.testing.assert_allclose(dense[2][(0, 0, 0)], np.array([[3.75 + 0.0j]]))

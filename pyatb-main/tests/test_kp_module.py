@@ -181,8 +181,9 @@ def test_calculate_kp_irreps_honors_korder_and_zeeman_toggle(load_pyatb, monkeyp
                 "analysis_result": {},
             }
 
-    def _fake_k_polynomial(_spgrep_info, _character_table, *, orders, lattice=None):
+    def _fake_k_polynomial(_spgrep_info, _character_table, *, orders, lattice=None, k_direction=None):
         del lattice
+        del k_direction
         calls["orders"] = tuple(orders)
         return []
 
@@ -214,6 +215,64 @@ def test_calculate_kp_irreps_honors_korder_and_zeeman_toggle(load_pyatb, monkeyp
     assert calls["orders"] == (0, 1)
 
 
+def test_calculate_kp_irreps_passes_k_direction_to_polynomial_analysis(
+    load_pyatb, monkeypatch, tmp_path: Path
+) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    calls: dict[str, object] = {}
+
+    class _FakeCharacter:
+        def __init__(self, tb):
+            self.tb = tb
+            self.output_path = str(tmp_path / "Out" / "CHARACTER")
+
+        def calculate_character(self, **kwargs):
+            output_path = Path(self.output_path)
+            output_path.mkdir(parents=True, exist_ok=True)
+            output_path.joinpath("band_irrep.txt").write_text(
+                "knum=  1   kname=GM\n"
+                "band    degency   energy          irrrp\n"
+                "77      2         9.117456        A\n",
+                encoding="utf-8",
+            )
+            return {
+                "active_stru_path": str(tmp_path / "STRU"),
+                "active_hr_path": str(tmp_path / "HR.csr"),
+                "active_sr_path": str(tmp_path / "SR.csr"),
+                "analysis_result": {},
+            }
+
+    def _fake_k_polynomial(_spgrep_info, _character_table, *, orders, lattice=None, k_direction=None):
+        del lattice
+        calls["orders"] = tuple(orders)
+        calls["k_direction"] = k_direction
+        return []
+
+    monkeypatch.setattr(module, "Character", _FakeCharacter)
+    monkeypatch.setattr(module, "_collect_kp_symmetry_info", lambda *args, **kwargs: {"spgrep_operations": {}, "character_table": {}})
+    monkeypatch.setattr(module, "_operator_irrep_analyses_for_results", lambda *args, **kwargs: [])
+    monkeypatch.setattr(module, "_k_polynomial_irrep_analyses", _fake_k_polynomial)
+    monkeypatch.setattr(module, "_zeeman_field_irrep_analyses", lambda *args, **kwargs: [])
+    monkeypatch.setattr(module, "_representation_alignment_analyses_for_results", lambda *args, **kwargs: [])
+
+    class _NoRR:
+        has_rR = False
+
+    monkeypatch.setattr(module, "_lowdin_tb_from_character_payload", lambda *args, **kwargs: _NoRR())
+
+    module.calculate_kp_irreps(
+        _FakeTB(),
+        kpoint_direct_coor=[[0.0, 0.0, 0.0]],
+        band=[[77, 80]],
+        output_path=tmp_path / "Out" / "KP",
+        korder=2,
+        k_direction="xy",
+        zeeman_term="no",
+    )
+
+    assert calls == {"orders": (0, 1, 2), "k_direction": "xy"}
+
+
 def test_kp_fit_monomial_labels_respect_max_order(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.kp")
 
@@ -232,6 +291,32 @@ def test_kp_fit_monomial_labels_respect_max_order(load_pyatb) -> None:
         "kz^2",
     ]
     assert "kx^3" not in labels
+
+
+def test_kp_fit_monomial_labels_can_limit_directions(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    labels = module._kp_fit_monomial_labels(max_order=2, variable_labels=("kx", "ky"))
+
+    assert labels == [
+        "1",
+        "kx",
+        "ky",
+        "kx^2",
+        "kx*ky",
+        "ky^2",
+    ]
+
+
+def test_kp_error_grid_keeps_inactive_directions_at_k0(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    q_points = module._kp_error_q_grid(0.02, 3, direction_indices=(0, 1))
+
+    assert q_points.shape == (9, 3)
+    assert np.allclose(q_points[:, 2], 0.0)
+    assert sorted(set(np.round(q_points[:, 0], 8))) == [-0.02, 0.0, 0.02]
+    assert sorted(set(np.round(q_points[:, 1], 8))) == [-0.02, 0.0, 0.02]
 
 
 def test_block_matrix_rows_preserve_empty_block_widths(load_pyatb) -> None:
@@ -1940,6 +2025,8 @@ def test_lowdin_tb_from_character_payload_uses_symmetrized_hs_and_rr(load_pyatb,
             "active_stru_path": "/tmp/symmetrized/STRU",
             "active_hr_path": "/tmp/symmetrized/data-HR-sparse_SPIN0-covsymm.csr",
             "active_sr_path": "/tmp/symmetrized/data-SR-sparse_SPIN0-covsymm.csr",
+            "active_rR_path": "/tmp/symmetrized/data-rR-sparse-covsymm.csr",
+            "active_rR_unit": "Angstrom",
             "lattice_constant": 2.0,
             "lattice_vector": np.eye(3) * 3.0,
             "HR_unit": "Ry",
@@ -1955,14 +2042,14 @@ def test_lowdin_tb_from_character_payload_uses_symmetrized_hs_and_rr(load_pyatb,
         ("SR", 4, "/tmp/symmetrized/data-SR-sparse_SPIN0-covsymm.csr"),
         True,
     )
-    assert calls["rr"] == (("rRx", "/tmp/source/data-rR-sparse.csr", "Bohr"), "rRy", "rRz", True)
+    assert calls["rr"] == (("rRx", "/tmp/symmetrized/data-rR-sparse-covsymm.csr", "Angstrom"), "rRy", "rRz", True)
     assert calls["stru"] == ("/tmp/symmetrized/STRU", True)
-    assert active.kp_lowdin_data_convention == "CHARACTER active symmetrized H/S data with input rR matrix"
+    assert active.kp_lowdin_data_convention == "CHARACTER active symmetrized H/S/rR data"
     assert active.kp_lowdin_data_paths == {
         "stru": "/tmp/symmetrized/STRU",
         "HR": "/tmp/symmetrized/data-HR-sparse_SPIN0-covsymm.csr",
         "SR": "/tmp/symmetrized/data-SR-sparse_SPIN0-covsymm.csr",
-        "rR": "/tmp/source/data-rR-sparse.csr",
+        "rR": "/tmp/symmetrized/data-rR-sparse-covsymm.csr",
     }
 
 

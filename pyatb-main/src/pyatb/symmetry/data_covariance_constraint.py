@@ -8,7 +8,7 @@ import spglib
 from ase.data import atomic_numbers
 from scipy.sparse import coo_matrix
 
-from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR
+from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR, abacus_readrR
 from pyatb.symmetry.Dk_matrix import build_atom_local_rotation, find_atom_mapping
 from pyatb.symmetry.hs_covariance import _dense_blocks_by_r_with_optional_full_reconstruction, read_stru_lattice_vector
 from pyatb.symmetry.hs_standardize import (
@@ -16,6 +16,7 @@ from pyatb.symmetry.hs_standardize import (
     _build_metadata_from_stru,
     _unit_scale_from_hr_unit,
     _write_abacus_sparse_xr,
+    _write_abacus_sparse_rR,
 )
 from pyatb.tb.multixr import multiXR
 
@@ -123,6 +124,21 @@ def load_abacus_hs_blocks(
     hr_blocks = _dense_blocks_by_r_with_optional_full_reconstruction(hr, full_matrix_from_hermitian=True)
     sr_blocks = _dense_blocks_by_r_with_optional_full_reconstruction(sr, full_matrix_from_hermitian=True)
     return metadata, hr_blocks, sr_blocks
+
+
+def load_abacus_rR_blocks(
+    rR_path: str | Path,
+    rR_unit: str = "Angstrom",
+    full_matrix_from_hermitian: bool = True,
+) -> list[dict[tuple[int, int, int], np.ndarray]]:
+    rR_components = abacus_readrR(str(rR_path), str(rR_unit))
+    return [
+        _dense_blocks_by_r_with_optional_full_reconstruction(
+            component,
+            full_matrix_from_hermitian=bool(full_matrix_from_hermitian),
+        )
+        for component in rR_components
+    ]
 
 
 def _dense_blocks_to_multixr(
@@ -373,6 +389,49 @@ def transform_blocks_with_context(
     if return_touched_pairs:
         return transformed, touched_pairs
     return transformed
+
+
+def transform_vector_blocks_with_context(
+    vector_blocks: list[dict[tuple[int, int, int], np.ndarray]] | tuple[dict[tuple[int, int, int], np.ndarray], ...],
+    metadata,
+    context: dict,
+    zero_tol: float = 1.0e-14,
+    nonzero_block_tol: float = 1.0e-9,
+) -> list[dict[tuple[int, int, int], np.ndarray]]:
+    if len(vector_blocks) != 3:
+        raise ValueError("rR covariance expects exactly three Cartesian component block dictionaries.")
+
+    scalar_transformed = [
+        transform_blocks_with_context(
+            source_blocks=component_blocks,
+            metadata=metadata,
+            context=context,
+            zero_tol=float(zero_tol),
+            nonzero_block_tol=float(nonzero_block_tol),
+        )
+        for component_blocks in vector_blocks
+    ]
+
+    cart_rotation = np.asarray(context["cart_rotation"], dtype=float)
+    if cart_rotation.shape != (3, 3):
+        raise ValueError(f"cart_rotation must have shape (3, 3), got {cart_rotation.shape}.")
+
+    all_keys = sorted(set().union(*(set(blocks.keys()) for blocks in scalar_transformed)))
+    basis_num = int(metadata.basis_num)
+    zero = np.zeros((basis_num, basis_num), dtype=complex)
+    mixed: list[dict[tuple[int, int, int], np.ndarray]] = []
+    for alpha in range(3):
+        component: dict[tuple[int, int, int], np.ndarray] = {}
+        for r_key in all_keys:
+            value = np.zeros_like(zero, dtype=complex)
+            for beta in range(3):
+                coeff = float(cart_rotation[alpha, beta])
+                if abs(coeff) <= 1.0e-14:
+                    continue
+                value += coeff * np.asarray(scalar_transformed[beta].get(r_key, zero), dtype=complex)
+            component[r_key] = value
+        mixed.append(component)
+    return mixed
 
 
 def build_active_pair_index(
@@ -641,6 +700,38 @@ def compare_block_sets_with_detail(
     return summary, best
 
 
+def compare_vector_block_sets(
+    reference_vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    predicted_vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    basis_num: int,
+) -> dict:
+    if len(reference_vector_blocks) != 3 or len(predicted_vector_blocks) != 3:
+        raise ValueError("Vector block comparison expects exactly three components.")
+
+    component_names = ("x", "y", "z")
+    components = []
+    max_abs = 0.0
+    mean_abs_sum = 0.0
+    rms_sq_sum = 0.0
+    rel_fro_max = 0.0
+    for name, ref, pred in zip(component_names, reference_vector_blocks, predicted_vector_blocks, strict=True):
+        summary = compare_block_sets(ref, pred, int(basis_num))
+        components.append({"component": name, **summary.to_dict()})
+        max_abs = max(max_abs, float(summary.max_abs))
+        mean_abs_sum += float(summary.mean_abs)
+        rms_sq_sum += float(summary.rms_abs ** 2)
+        rel_fro_max = max(rel_fro_max, float(summary.rel_fro))
+
+    return {
+        "component_count": 3,
+        "global_max_abs": float(max_abs),
+        "mean_abs_over_components": float(mean_abs_sum / 3.0),
+        "rms_abs_over_components": float(np.sqrt(rms_sq_sum / 3.0)),
+        "max_rel_fro_over_components": float(rel_fro_max),
+        "components": components,
+    }
+
+
 def average_block_sets(
     lhs_blocks: dict[tuple[int, int, int], np.ndarray],
     rhs_blocks: dict[tuple[int, int, int], np.ndarray],
@@ -656,6 +747,19 @@ def average_block_sets(
         rhs = np.asarray(rhs_blocks.get(r_key, rhs_zero), dtype=complex)
         averaged[r_key] = 0.5 * (lhs + rhs)
     return averaged
+
+
+def average_vector_block_sets(
+    lhs_vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    rhs_vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    basis_num: int,
+) -> list[dict[tuple[int, int, int], np.ndarray]]:
+    if len(lhs_vector_blocks) != 3 or len(rhs_vector_blocks) != 3:
+        raise ValueError("Vector block averaging expects exactly three components.")
+    return [
+        average_block_sets(lhs, rhs, int(basis_num))
+        for lhs, rhs in zip(lhs_vector_blocks, rhs_vector_blocks, strict=True)
+    ]
 
 
 def average_block_sets_on_touched_pairs(
@@ -757,6 +861,52 @@ def _self_covariance_statistics_with_contexts(
     }
 
 
+def _vector_self_covariance_statistics_with_contexts(
+    vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    metadata,
+    operation_contexts: list[tuple[dict, dict]],
+    nonzero_block_tol: float = 1.0e-9,
+) -> dict:
+    per_op = []
+    max_abs = 0.0
+    mean_abs_sum = 0.0
+    rms_sq_sum = 0.0
+    rel_fro_max = 0.0
+
+    for op, context in operation_contexts:
+        transformed = transform_vector_blocks_with_context(
+            vector_blocks,
+            metadata,
+            context,
+            nonzero_block_tol=float(nonzero_block_tol),
+        )
+        summary = compare_vector_block_sets(vector_blocks, transformed, int(metadata.basis_num))
+        per_op.append(
+            {
+                "operation_index": int(op["index"]),
+                "max_abs": float(summary["global_max_abs"]),
+                "mean_abs": float(summary["mean_abs_over_components"]),
+                "rms_abs": float(summary["rms_abs_over_components"]),
+                "rel_fro": float(summary["max_rel_fro_over_components"]),
+                "components": summary["components"],
+            }
+        )
+        max_abs = max(max_abs, float(summary["global_max_abs"]))
+        mean_abs_sum += float(summary["mean_abs_over_components"])
+        rms_sq_sum += float(summary["rms_abs_over_components"] ** 2)
+        rel_fro_max = max(rel_fro_max, float(summary["max_rel_fro_over_components"]))
+
+    op_count = len(per_op)
+    return {
+        "operation_count": int(op_count),
+        "global_max_abs": float(max_abs),
+        "mean_abs_over_operations": float(mean_abs_sum / op_count) if op_count > 0 else 0.0,
+        "rms_abs_over_operations": float(np.sqrt(rms_sq_sum / op_count)) if op_count > 0 else 0.0,
+        "max_rel_fro_over_operations": float(rel_fro_max),
+        "operations": per_op,
+    }
+
+
 def self_covariance_statistics(
     blocks: dict[tuple[int, int, int], np.ndarray],
     metadata,
@@ -773,6 +923,28 @@ def self_covariance_statistics(
         )
     return _self_covariance_statistics_with_contexts(
         blocks,
+        metadata,
+        operation_contexts,
+        nonzero_block_tol=float(nonzero_block_tol),
+    )
+
+
+def vector_self_covariance_statistics(
+    vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    metadata,
+    operations: list[dict],
+    map_tol: float = 1.0e-5,
+    nonzero_block_tol: float = 1.0e-9,
+    operation_contexts: list[tuple[dict, dict]] | None = None,
+) -> dict:
+    if operation_contexts is None:
+        operation_contexts = prepare_operation_contexts(
+            metadata,
+            operations,
+            map_tol=float(map_tol),
+        )
+    return _vector_self_covariance_statistics_with_contexts(
+        vector_blocks,
         metadata,
         operation_contexts,
         nonzero_block_tol=float(nonzero_block_tol),
@@ -966,6 +1138,98 @@ def sequential_symmetrize_hs(
     return cur_hr, cur_sr, history
 
 
+def sequential_symmetrize_rR(
+    vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    metadata,
+    operations: list[dict],
+    operation_target_max_abs: float = 1.0e-8,
+    max_iter_per_operation: int | None = 5,
+    map_tol: float = 1.0e-5,
+    nonzero_block_tol: float = 1.0e-9,
+    verbose: bool = False,
+    operation_contexts: list[tuple[dict, dict]] | None = None,
+) -> tuple[list[dict[tuple[int, int, int], np.ndarray]], list[dict]]:
+    max_iter_per_operation = int(5 if max_iter_per_operation is None else max_iter_per_operation)
+    if max_iter_per_operation <= 0:
+        raise ValueError(f"max_iter_per_operation must be positive, got {max_iter_per_operation}.")
+    if len(vector_blocks) != 3:
+        raise ValueError("rR symmetrization expects exactly three Cartesian component block dictionaries.")
+
+    cur = [
+        {key: np.asarray(value, dtype=complex).copy() for key, value in component.items()}
+        for component in vector_blocks
+    ]
+    if operation_contexts is None:
+        operation_contexts = prepare_operation_contexts(
+            metadata,
+            operations,
+            map_tol=float(map_tol),
+        )
+    if not operation_contexts:
+        return cur, []
+
+    history = []
+    op_count = len(operation_contexts)
+    if verbose:
+        print(
+            f"[covsymm] start rR symmetrization: operations={op_count}, "
+            f"max_iter_per_operation={max_iter_per_operation}, "
+            f"target={float(operation_target_max_abs):.3e}",
+            flush=True,
+        )
+
+    for op_pos, (op, context) in enumerate(operation_contexts, start=1):
+        op_row = {
+            "operation_index": int(op["index"]),
+            "operation_position": int(op_pos),
+            "target_max_abs": float(operation_target_max_abs),
+            "max_iter_per_operation": int(max_iter_per_operation),
+            "nonzero_block_tol": float(nonzero_block_tol),
+            "iterations": [],
+            "converged": False,
+        }
+        for op_iter in range(1, max_iter_per_operation + 1):
+            transformed = transform_vector_blocks_with_context(
+                cur,
+                metadata,
+                context,
+                nonzero_block_tol=float(nonzero_block_tol),
+            )
+            stat = compare_vector_block_sets(cur, transformed, int(metadata.basis_num))
+            op_row["iterations"].append(
+                {
+                    "iteration_index": int(op_iter),
+                    "rR": stat,
+                }
+            )
+            if verbose:
+                print(
+                    f"[covsymm] rR op {op_pos}/{op_count} (#{int(op['index'])}) "
+                    f"iter {op_iter}/{max_iter_per_operation}: "
+                    f"max={float(stat['global_max_abs']):.3e}, "
+                    f"mean={float(stat['mean_abs_over_components']):.3e}, "
+                    f"rms={float(stat['rms_abs_over_components']):.3e}",
+                    flush=True,
+                )
+            cur = average_vector_block_sets(cur, transformed, int(metadata.basis_num))
+            if float(stat["global_max_abs"]) <= float(operation_target_max_abs):
+                op_row["converged"] = True
+                break
+
+        final_iter = op_row["iterations"][-1]
+        op_row["final_rR_max_abs"] = float(final_iter["rR"]["global_max_abs"])
+        history.append(op_row)
+
+    final_rR = _vector_self_covariance_statistics_with_contexts(
+        cur,
+        metadata,
+        operation_contexts,
+        nonzero_block_tol=float(nonzero_block_tol),
+    )
+    history.append({"final_symmetry_error": {"rR": final_rR}})
+    return cur, history
+
+
 def write_symmetrized_hs(
     hr_blocks: dict[tuple[int, int, int], np.ndarray],
     sr_blocks: dict[tuple[int, int, int], np.ndarray],
@@ -989,4 +1253,20 @@ def write_symmetrized_hs(
         int(basis_num),
         int(nspin),
         unit_scale=1.0,
+    )
+
+
+def write_symmetrized_rR(
+    vector_blocks: list[dict[tuple[int, int, int], np.ndarray]],
+    output_rR_path: str | Path,
+    basis_num: int,
+    nspin: int,
+    rR_unit: str = "Angstrom",
+) -> None:
+    _write_abacus_sparse_rR(
+        Path(output_rR_path),
+        vector_blocks,
+        int(basis_num),
+        int(nspin),
+        rR_unit=str(rR_unit),
     )

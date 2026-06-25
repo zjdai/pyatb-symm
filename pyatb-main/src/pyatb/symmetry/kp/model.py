@@ -748,9 +748,11 @@ def _lowdin_tb_from_character_payload(
     if not isinstance(payload, Mapping):
         return reference_tb
 
-    rR_path = _first_existing_route(rR_route)
+    payload_rR_path = payload.get("active_rR_path")
+    rR_path = _first_existing_route(payload_rR_path) or _first_existing_route(rR_route)
     if rR_path is None:
         return reference_tb
+    active_rR_unit = str(payload.get("active_rR_unit", rR_unit))
 
     active_hr_path = payload.get("active_hr_path")
     active_sr_path = payload.get("active_sr_path")
@@ -774,10 +776,10 @@ def _lowdin_tb_from_character_payload(
     active_sr = abacus_readSR(int(reference_tb.nspin), str(active_sr_path))
     is_sparse = bool(getattr(reference_tb, "HSR_iSsparse", False))
     active_tb.set_solver_HSR(active_hr, active_sr, is_sparse)
-    active_rR = abacus_readrR(str(rR_path), str(rR_unit))
+    active_rR = abacus_readrR(str(rR_path), active_rR_unit)
     active_tb.set_solver_rR(active_rR[0], active_rR[1], active_rR[2], is_sparse)
     active_tb.read_stru(str(active_stru_path), need_orb=True)
-    active_tb.kp_lowdin_data_convention = "CHARACTER active symmetrized H/S data with input rR matrix"
+    active_tb.kp_lowdin_data_convention = "CHARACTER active symmetrized H/S/rR data"
     active_tb.kp_lowdin_data_paths = {
         "stru": str(active_stru_path),
         "HR": str(active_hr_path),
@@ -1473,12 +1475,49 @@ def _representation_alignment_analyses_for_results(
     return analyses
 
 
-def _kp_fit_monomial_labels(max_order: int = 3) -> list[str]:
+def _normalize_k_direction(
+    k_direction: str | Sequence[str] | None = "xyz",
+) -> tuple[str, tuple[int, ...], tuple[str, ...]]:
+    if k_direction is None:
+        text = "xyz"
+    elif isinstance(k_direction, str):
+        text = k_direction
+    else:
+        text = "".join(str(item) for item in k_direction)
+    text = text.strip().lower().replace(",", "").replace(" ", "")
+    if not text:
+        raise ValueError("KP.k_direction must contain one or more of x, y, z.")
+    allowed = {"x", "y", "z"}
+    if any(char not in allowed for char in text):
+        raise ValueError("KP.k_direction must contain only x, y, z.")
+    if len(set(text)) != len(text):
+        raise ValueError("KP.k_direction must not repeat x, y, or z.")
+    canonical = "".join(char for char in "xyz" if char in set(text))
+    indices = tuple("xyz".index(char) for char in canonical)
+    labels = tuple(KP_DIRECTIONS[index] for index in indices)
+    return canonical, indices, labels
+
+
+def _subtransform_for_k_labels(transform: np.ndarray, variable_labels: Sequence[str]) -> np.ndarray:
+    matrix = np.asarray(transform, dtype=complex)
+    labels = tuple(str(label) for label in variable_labels)
+    if matrix.shape == (3, 3) and labels and all(label in KP_DIRECTIONS for label in labels):
+        indices = tuple(KP_DIRECTIONS.index(label) for label in labels)
+        return matrix[np.ix_(indices, indices)]
+    return matrix
+
+
+def _kp_fit_monomial_labels(
+    max_order: int = 3,
+    *,
+    variable_labels: Sequence[str] = KP_DIRECTIONS,
+) -> list[str]:
     max_order = max(0, int(max_order))
+    labels = tuple(str(label) for label in variable_labels)
     return ["1"] + [
-        _monomial_label(exponent)
+        _monomial_label(exponent, labels)
         for order in range(1, max_order + 1)
-        for exponent in _monomial_exponents(order, 3)
+        for exponent in _monomial_exponents(order, len(labels))
     ]
 
 
@@ -1584,13 +1623,17 @@ def _schur_kp_parameter_fit_analyses(
     representation_analyses: Sequence[Mapping[str, Any]],
     *,
     max_order: int = 3,
+    variable_labels: Sequence[str] = KP_DIRECTIONS,
 ) -> list[dict[str, Any]]:
     numeric_analyses = list(info.get("numeric_lowdin_kp_analyses", []) or [])
     if not numeric_analyses or not representation_analyses:
         return []
 
     max_order = max(0, int(max_order))
-    monomial_labels = _kp_fit_monomial_labels(max_order=max_order)
+    monomial_labels = _kp_fit_monomial_labels(
+        max_order=max_order,
+        variable_labels=variable_labels,
+    )
     fits = []
     for rep_analysis in representation_analyses:
         selection_index = int(rep_analysis.get("selection_index", 0))
@@ -1655,6 +1698,7 @@ def _schur_kp_parameter_fit_analyses(
                 "selection_index": selection_index,
                 "convention": "H_form_fit(q) ~= U_schur^dagger H_numeric(q) U_schur",
                 "max_order": int(max_order),
+                "k_direction": "".join(label[-1] for label in variable_labels),
                 "monomial_basis": list(monomial_labels),
                 "formal_parameter_labels": formal_labels,
                 "formal_parameters": [float(value) for value in parameters],
@@ -1667,7 +1711,12 @@ def _schur_kp_parameter_fit_analyses(
     return fits
 
 
-def _kp_error_q_grid(radius: float, grid: int) -> np.ndarray:
+def _kp_error_q_grid(
+    radius: float,
+    grid: int,
+    *,
+    direction_indices: Sequence[int] = (0, 1, 2),
+) -> np.ndarray:
     grid_count = int(grid)
     if grid_count <= 0:
         raise ValueError("KP.kp_grid must be a positive integer.")
@@ -1678,8 +1727,10 @@ def _kp_error_q_grid(radius: float, grid: int) -> np.ndarray:
         axis = np.array([0.0], dtype=float)
     else:
         axis = np.linspace(-radius_value, radius_value, grid_count, dtype=float)
+    active = {int(index) for index in direction_indices}
+    axes = [axis if index in active else np.array([0.0], dtype=float) for index in range(3)]
     return np.asarray(
-        [[kx, ky, kz] for kx in axis for ky in axis for kz in axis],
+        [[kx, ky, kz] for kx in axes[0] for ky in axes[1] for kz in axes[2]],
         dtype=float,
     )
 
@@ -1774,12 +1825,19 @@ def _kp_energy_error_analyses(
     *,
     radius: float,
     grid: int,
+    direction_indices: Sequence[int] = (0, 1, 2),
 ) -> list[dict[str, Any]]:
     radius_value = float(radius)
     if radius_value <= 0.0:
         return []
     grid_count = int(grid)
-    q_points = _kp_error_q_grid(radius_value, grid_count)
+    active_indices = tuple(int(index) for index in direction_indices)
+    q_points = _kp_error_q_grid(
+        radius_value,
+        grid_count,
+        direction_indices=active_indices,
+    )
+    grid_shape = [grid_count if index in set(active_indices) else 1 for index in range(3)]
     numeric_by_selection = {
         int(item.get("selection_index", 0)): item
         for item in numeric_analyses or []
@@ -1827,6 +1885,8 @@ def _kp_energy_error_analyses(
                 "selection_index": selection_index,
                 "radius_A^-1": radius_value,
                 "grid_points_per_axis": grid_count,
+                "grid_shape": [int(value) for value in grid_shape],
+                "k_direction": "".join("xyz"[index] for index in active_indices),
                 "point_count": int(q_points.shape[0]),
                 "band_count": int(kp_energy_array.shape[1]),
                 "direct_diagonalization_band_range": [int(band_range[0]), int(band_range[1])],
@@ -2597,19 +2657,24 @@ def _k_polynomial_irrep_analyses(
     *,
     orders: Sequence[int] = (1, 2, 3),
     lattice: Sequence[Sequence[float]] | np.ndarray | None = None,
+    k_direction: str | Sequence[str] | None = "xyz",
 ) -> list[dict[str, Any]]:
     operations = list(spgrep_info.get("operations") or [])
     if not operations or not character_table:
         return []
 
+    k_direction_text, direction_indices, variable_labels = _normalize_k_direction(k_direction)
     candidates = _character_table_candidates(character_table)
     operation_indices = [int(operation.get("operation_index", index + 1)) for index, operation in enumerate(operations)]
     analyses = []
     for order in orders:
-        exponents = _monomial_exponents(int(order), 3)
-        basis_labels = [_monomial_label(exponent) for exponent in exponents]
+        exponents = _monomial_exponents(int(order), len(variable_labels))
+        basis_labels = [_monomial_label(exponent, variable_labels) for exponent in exponents]
         representation_matrices = [
-            _polynomial_transform_matrix(_reciprocal_rotation_from_operation(operation, lattice=lattice), exponents)
+            _polynomial_transform_matrix(
+                _reciprocal_rotation_from_operation(operation, lattice=lattice)[np.ix_(direction_indices, direction_indices)],
+                exponents,
+            )
             for operation in operations
         ]
         characters = np.asarray([np.trace(matrix) for matrix in representation_matrices], dtype=complex)
@@ -2655,6 +2720,8 @@ def _k_polynomial_irrep_analyses(
         analyses.append(
             {
                 "order": int(order),
+                "k_direction": k_direction_text,
+                "variable_labels": list(variable_labels),
                 "coordinate_basis": "cartesian",
                 "operation_indices": operation_indices,
                 "characters": _complex_vector_to_pairs(characters),
@@ -3202,6 +3269,7 @@ def _time_reversal_constraint_analyses(
     operator_analyses: Sequence[Mapping[str, Any]],
     kp_form_solution_analyses: Sequence[Mapping[str, Any]],
     *,
+    variable_labels: Sequence[str] = KP_DIRECTIONS,
     tol: float = 1.0e-7,
 ) -> list[dict[str, Any]]:
     spgrep_info = info.get("spgrep_operations", {})
@@ -3250,10 +3318,11 @@ def _time_reversal_constraint_analyses(
             anti_linear_operation,
             lattice=info.get("lattice_vectors"),
         )
+        base_transform = _subtransform_for_k_labels(base_transform, variable_labels)
         function_transform = _polynomial_transform_matrix_for_labels(
             -base_transform,
             monomial_labels,
-            variable_labels=("kx", "ky", "kz"),
+            variable_labels=variable_labels,
         )
         function_transform = np.linalg.inv(np.real_if_close(function_transform, tol=1000).real)
         for pair in analysis.get("irrep_pair_solutions", []):
@@ -3438,6 +3507,7 @@ def _final_kp_model_analyses(
                 base_transform = _zeeman_field_transform_from_operation(anti_linear_operation or {}, lattice=lattice)
             else:
                 base_transform = _reciprocal_rotation_from_operation(anti_linear_operation or {}, lattice=lattice)
+                base_transform = _subtransform_for_k_labels(base_transform, variable_labels)
             function_transform = _polynomial_transform_matrix_for_labels(
                 -base_transform,
                 monomial_labels,
@@ -5081,6 +5151,7 @@ def _format_k_polynomial_irrep_analyses(
         [
             "k polynomial irreducible decomposition",
             "k-transform convention: q' = R_cart^{-1} q in Cartesian coordinates",
+            f"k_direction: {analyses[0].get('k_direction', 'xyz')}",
         ]
     )
     separator = "---------------------------------------------------------------------------------------"
@@ -5501,6 +5572,7 @@ def _format_numeric_lowdin_kp_analyses(
             "Numerical Lowdin k.p model coefficients",
             "basis convention: listed per selection",
             "q convention: q = k - k0 in Cartesian coordinates, Angstrom^-1",
+            f"k_direction: {analyses[0].get('k_direction', 'xyz')}",
             "velocity convention: V_i = (hbar / m_e) pi_i from pyatb velocity_matrix",
         ]
     )
@@ -5992,6 +6064,7 @@ def _format_schur_kp_parameter_fit_analyses(
             "Numerical Lowdin k.p model coefficients",
             "basis convention: listed per selection",
             "q convention: q = k - k0 in Cartesian coordinates, Angstrom^-1",
+            f"k_direction: {analyses[0].get('k_direction', 'xyz')}",
             "velocity convention: V_i = (hbar / m_e) pi_i from pyatb velocity_matrix",
         ]
     )
@@ -6114,9 +6187,12 @@ def _format_kp_energy_error_analyses(
             lines.append(separator)
             lines.append(f"selection = {int(analysis.get('selection_index', index + 1))}")
         grid = int(analysis.get("grid_points_per_axis", 0))
+        grid_shape = list(analysis.get("grid_shape", []) or [])
+        if len(grid_shape) != 3:
+            grid_shape = [grid, grid, grid]
         lines.extend(
             [
-                f"MP grid around k0: {grid} {grid} {grid}",
+                f"MP grid around k0: {int(grid_shape[0])} {int(grid_shape[1])} {int(grid_shape[2])}",
                 f"Radius: {float(analysis.get('radius_A^-1', 0.0)):.6f} A^-1",
                 f"Band max error:  {float(analysis.get('max_abs_error_eV', 0.0)):.12e} eV",
                 f"Band mean error: {float(analysis.get('mean_abs_error_eV', 0.0)):.12e} eV",
@@ -6743,6 +6819,7 @@ def calculate_kp_irreps(
     mag_tag: int = 0,
     mag: str | Sequence[float] = "auto",
     korder: int = 2,
+    k_direction: str | Sequence[str] = "xyz",
     zeeman_term: str | bool | int = "yes",
     kp_radius: float = 0.0,
     kp_grid: int = 4,
@@ -6754,6 +6831,7 @@ def calculate_kp_irreps(
 
     if kpoint_mode != "direct":
         raise ValueError("KP currently supports only direct k-point mode.")
+    rR_unit = rR_unit or "Angstrom"
 
     kpoints = np.asarray(kpoint_direct_coor, dtype=float)
     if kpoints.ndim != 2 or kpoints.shape[1] != 3 or kpoints.shape[0] == 0:
@@ -6773,6 +6851,7 @@ def calculate_kp_irreps(
     if max_k_order < 0:
         raise ValueError("KP.korder must be zero or a positive integer.")
     k_orders = tuple(range(max_k_order + 1))
+    k_direction_text, k_direction_indices, k_variable_labels = _normalize_k_direction(k_direction)
     include_zeeman = _kp_zeeman_enabled(zeeman_term)
     kp_radius_value = float(kp_radius)
     if kp_radius_value < 0.0:
@@ -6801,6 +6880,8 @@ def calculate_kp_irreps(
         occ_band=effective_occ_band,
         mag_tag=mag_tag,
         mag=mag,
+        rR_route=rR_route,
+        rR_unit=rR_unit,
         **character_kwargs,
     )
 
@@ -6817,6 +6898,8 @@ def calculate_kp_irreps(
                     mag=mag,
                 )
                 symmetry_info["korder"] = int(max_k_order)
+                symmetry_info["k_direction"] = k_direction_text
+                symmetry_info["k_direction_labels"] = list(k_variable_labels)
                 symmetry_info["zeeman_term"] = "yes" if include_zeeman else "no"
                 symmetry_info["kp_radius"] = float(kp_radius_value)
                 symmetry_info["kp_grid"] = int(kp_grid_value)
@@ -6832,6 +6915,7 @@ def calculate_kp_irreps(
                     symmetry_info.get("character_table", {}),
                     orders=k_orders,
                     lattice=symmetry_info.get("lattice_vectors"),
+                    k_direction=k_direction_text,
                 )
                 if k_polynomial_analyses:
                     symmetry_info["k_polynomial_irrep_analyses"] = k_polynomial_analyses
@@ -6856,6 +6940,7 @@ def calculate_kp_irreps(
                             symmetry_info,
                             operator_analyses,
                             kp_form_solutions,
+                            variable_labels=k_variable_labels,
                         )
                         if time_reversal_checks:
                             symmetry_info["time_reversal_constraint_analyses"] = time_reversal_checks
@@ -6863,6 +6948,7 @@ def calculate_kp_irreps(
                             symmetry_info,
                             operator_analyses,
                             kp_form_solutions,
+                            variable_labels=k_variable_labels,
                         )
                         if final_kp_model:
                             symmetry_info["final_kp_model_analyses"] = final_kp_model
@@ -6914,12 +7000,15 @@ def calculate_kp_irreps(
                 else:
                     numeric_lowdin_kp = _numeric_lowdin_kp_analyses_for_results(lowdin_tb, results)
                     if numeric_lowdin_kp:
+                        for analysis in numeric_lowdin_kp:
+                            analysis["k_direction"] = k_direction_text
                         symmetry_info["numeric_lowdin_kp_analyses"] = numeric_lowdin_kp
                 if representation_alignments and symmetry_info.get("numeric_lowdin_kp_analyses"):
                     schur_fits = _schur_kp_parameter_fit_analyses(
                         symmetry_info,
                         representation_alignments,
                         max_order=max_k_order,
+                        variable_labels=k_variable_labels,
                     )
                     if schur_fits:
                         symmetry_info["schur_kp_parameter_fit_analyses"] = schur_fits
@@ -6930,6 +7019,7 @@ def calculate_kp_irreps(
                                 symmetry_info.get("numeric_lowdin_kp_analyses", []),
                                 radius=kp_radius_value,
                                 grid=kp_grid_value,
+                                direction_indices=k_direction_indices,
                             )
                             if energy_errors:
                                 symmetry_info["kp_energy_error_analyses"] = energy_errors

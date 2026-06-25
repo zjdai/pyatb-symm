@@ -217,6 +217,8 @@ def main():
             HR_route=input_parameters.get('HR_route'),
             SR_route=input_parameters.get('SR_route'),
             HR_unit=input_parameters.get('HR_unit'),
+            rR_route=input_parameters.get('rR_route'),
+            rR_unit=input_parameters.get('rR_unit') or 'Angstrom',
         )
 
     if function_switch['KP']:
@@ -230,7 +232,7 @@ def main():
             SR_route=input_parameters.get('SR_route'),
             HR_unit=input_parameters.get('HR_unit'),
             rR_route=input_parameters.get('rR_route'),
-            rR_unit=input_parameters.get('rR_unit'),
+            rR_unit=input_parameters.get('rR_unit') or 'Angstrom',
         )
 
     if function_switch['SURFACE_STATE']:

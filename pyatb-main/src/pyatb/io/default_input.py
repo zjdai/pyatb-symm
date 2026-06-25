@@ -382,6 +382,7 @@ INPUT = {
         'mag_tag'                     : [int, 1, 0],
         'mag'                         : [str, 1, 'auto'],
         'korder'                      : [int, 1, 2],
+        'k_direction'                 : [str, 1, 'xyz'],
         'zeeman_term'                 : [str, 1, 'yes'],
         'kp_radius'                   : [float, 1, 0.0],
         'kp_grid'                     : [int, 1, 4],

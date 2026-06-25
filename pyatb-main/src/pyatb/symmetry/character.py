@@ -25,16 +25,35 @@ from pyatb.symmetry.character_core import (
     calculate_subspace_characters,
     group_degenerate_bands,
 )
-from pyatb.symmetry.hs_standardize import canonicalize_abacus_hs
+from pyatb.symmetry.hs_standardize import canonicalize_abacus_hs, canonicalize_abacus_rR
 from pyatb.symmetry.symm_stru import SymmStructureAnalyzer
 from pyatb.symmetry.data_covariance_constraint import (
     get_symmetry_operations_from_metadata,
     load_abacus_hs_blocks,
+    load_abacus_rR_blocks,
     prepare_operation_contexts,
     self_covariance_statistics,
     sequential_symmetrize_hs,
+    sequential_symmetrize_rR,
+    vector_self_covariance_statistics,
     write_symmetrized_hs,
+    write_symmetrized_rR,
 )
+
+
+def _first_existing_route(route) -> Path | None:
+    if route is None:
+        return None
+    if isinstance(route, (list, tuple)):
+        for item in route:
+            path = _first_existing_route(item)
+            if path is not None:
+                return path
+        return None
+    path = Path(route)
+    if path.exists():
+        return path
+    return None
 
 
 class Character:
@@ -825,6 +844,8 @@ class Character:
         HR_route,
         SR_route,
         HR_unit,
+        rR_route,
+        rR_unit,
         data_symmetrize,
         data_symm_target_max_abs_ry,
         data_symm_max_iter_per_operation,
@@ -847,9 +868,10 @@ class Character:
         active_stru_path = Path(stru_file)
         active_hr_path = Path(HR_route or "data-HR-sparse_SPIN0.csr")
         active_sr_path = Path(SR_route or "data-SR-sparse_SPIN0.csr")
+        active_rR_path = _first_existing_route(rR_route)
         structure_standardized = bool(analysis_result.get("need_rebuild_hs"))
-        active_lattice_constant = float(self._tb.lattice_constant)
-        active_lattice_vector = np.asarray(self._tb.lattice_vector, dtype=float)
+        active_lattice_constant = float(getattr(self._tb, "lattice_constant", 1.0))
+        active_lattice_vector = np.asarray(getattr(self._tb, "lattice_vector", np.eye(3)), dtype=float)
 
         if RANK == 0:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
@@ -869,6 +891,9 @@ class Character:
                     "CHARACTER structure standardization requested H/S rebuild, "
                     f"but standardized STRU was not written: {target_stru_path}"
                 )
+            standardized_rR_path = None
+            if active_rR_path is not None:
+                standardized_rR_path = Path(self.output_path) / f"{active_rR_path.stem}-standardized.csr"
             if RANK == 0:
                 canonicalize_abacus_hs(
                     tb=self._tb,
@@ -889,22 +914,41 @@ class Character:
                     symmetry_report_path=None,
                     symmetry_map_tol=float(symm_prec),
                 )
+                if active_rR_path is not None:
+                    canonicalize_abacus_rR(
+                        tb=self._tb,
+                        target_stru_path=target_stru_path,
+                        rR_route=active_rR_path,
+                        rR_unit=str(rR_unit),
+                        atom_mapping=analysis_result["atom_mapping"],
+                        lattice_new=np.asarray(analysis_result["lattice_new"], dtype=float),
+                        lattice_transform_fractional=np.asarray(analysis_result["lattice_transform_fractional"], dtype=float),
+                        xyz_axis_transform_cartesian=np.asarray(analysis_result["xyz_axis_transform_cartesian"], dtype=float),
+                        output_rR_path=standardized_rR_path,
+                        full_matrix_from_hermitian=full_matrix_from_hermitian,
+                    )
 
             active_stru_path = target_stru_path
             active_lattice_vector = np.asarray(analysis_result["lattice_new"], dtype=float) / active_lattice_constant
             active_hr_path = Path(analysis_result["target_hr"])
             active_sr_path = Path(analysis_result["target_sr"])
+            if standardized_rR_path is not None:
+                active_rR_path = standardized_rR_path
 
             if RANK == 0:
                 with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
                     fp.write(f"standardized_stru = {active_stru_path.resolve()}\n")
                     fp.write(f"standardized_hr   = {active_hr_path.resolve()}\n")
                     fp.write(f"standardized_sr   = {active_sr_path.resolve()}\n")
+                    if active_rR_path is not None:
+                        fp.write(f"standardized_rR   = {active_rR_path.resolve()}\n")
         elif RANK == 0:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
                 fp.write(f"active_stru = {active_stru_path.resolve()}\n")
                 fp.write(f"active_hr   = {active_hr_path.resolve()}\n")
                 fp.write(f"active_sr   = {active_sr_path.resolve()}\n")
+                if active_rR_path is not None:
+                    fp.write(f"active_rR   = {active_rR_path.resolve()}\n")
 
         metadata, hr_blocks, sr_blocks = load_abacus_hs_blocks(
             stru_path=active_stru_path,
@@ -913,6 +957,13 @@ class Character:
             nspin=int(self._tb.nspin),
             hr_unit=str(HR_unit),
         )
+        rR_blocks = None
+        if active_rR_path is not None:
+            rR_blocks = load_abacus_rR_blocks(
+                active_rR_path,
+                rR_unit=str(rR_unit),
+                full_matrix_from_hermitian=True,
+            )
         analysis_source_operations = self._active_structure_operations(analysis_result)
         if mag_tag == 1 and analysis_source_operations:
             covariance_operations = self._analysis_operations_to_covariance_operations(analysis_source_operations)
@@ -946,8 +997,19 @@ class Character:
             stage_label="before data symmetrization",
             suggest_data_symmetrize=(data_symmetrize == 0),
         )
+        before_rR = None
+        if rR_blocks is not None:
+            before_rR = vector_self_covariance_statistics(
+                rR_blocks,
+                metadata,
+                covariance_operations,
+                map_tol=float(symm_prec),
+                nonzero_block_tol=float(data_symm_nonzero_block_tol),
+                operation_contexts=operation_contexts,
+            )
         final_hr_stats = before_hr
         final_sr_stats = before_sr
+        final_rR_stats = before_rR
 
         if data_symmetrize == 1:
             operations = covariance_operations
@@ -980,6 +1042,29 @@ class Character:
                 nonzero_block_tol=float(data_symm_nonzero_block_tol),
                 operation_contexts=operation_contexts,
             )
+            rR_symm = None
+            rR_symm_history = []
+            after_rR = None
+            if rR_blocks is not None:
+                rR_symm, rR_symm_history = sequential_symmetrize_rR(
+                    vector_blocks=rR_blocks,
+                    metadata=metadata,
+                    operations=operations,
+                    operation_target_max_abs=float(data_symm_target_max_abs_ry),
+                    max_iter_per_operation=int(data_symm_max_iter_per_operation),
+                    map_tol=float(symm_prec),
+                    nonzero_block_tol=float(data_symm_nonzero_block_tol),
+                    verbose=bool(data_symm_verbose),
+                    operation_contexts=operation_contexts,
+                )
+                after_rR = vector_self_covariance_statistics(
+                    rR_symm,
+                    metadata,
+                    operations,
+                    map_tol=float(symm_prec),
+                    nonzero_block_tol=float(data_symm_nonzero_block_tol),
+                    operation_contexts=operation_contexts,
+                )
             self._validate_covariance_statistics(
                 after_hr,
                 after_sr,
@@ -989,9 +1074,13 @@ class Character:
             )
             final_hr_stats = after_hr
             final_sr_stats = after_sr
+            final_rR_stats = after_rR if after_rR is not None else final_rR_stats
 
             cov_hr_path = Path(self.output_path) / f"{active_hr_path.stem}-covsymm.csr"
             cov_sr_path = Path(self.output_path) / f"{active_sr_path.stem}-covsymm.csr"
+            cov_rR_path = None
+            if active_rR_path is not None:
+                cov_rR_path = Path(self.output_path) / f"{active_rR_path.stem}-covsymm.csr"
             if RANK == 0:
                 write_symmetrized_hs(
                     hr_blocks=hr_symm,
@@ -1002,6 +1091,14 @@ class Character:
                     nspin=int(self._tb.nspin),
                     hr_unit=str(HR_unit),
                 )
+                if rR_symm is not None and cov_rR_path is not None:
+                    write_symmetrized_rR(
+                        vector_blocks=rR_symm,
+                        output_rR_path=cov_rR_path,
+                        basis_num=int(metadata.basis_num),
+                        nspin=int(self._tb.nspin),
+                        rR_unit=str(rR_unit),
+                    )
 
             symm_report_path = Path(self.output_path) / "data_symmetrization_report.txt"
             hr_max_before = float(before_hr["global_max_abs"])
@@ -1012,21 +1109,33 @@ class Character:
             sr_mean_before = float(before_sr["mean_abs_over_operations"])
             sr_max_after = float(after_sr["global_max_abs"])
             sr_mean_after = float(after_sr["mean_abs_over_operations"])
+            rR_max_before = float(before_rR["global_max_abs"]) if before_rR is not None else None
+            rR_mean_before = float(before_rR["mean_abs_over_operations"]) if before_rR is not None else None
+            rR_max_after = float(after_rR["global_max_abs"]) if after_rR is not None else None
+            rR_mean_after = float(after_rR["mean_abs_over_operations"]) if after_rR is not None else None
             symm_history_json_path = Path(self.output_path) / "data_symmetrization_history.json"
+            rR_symm_history_json_path = Path(self.output_path) / "rR_data_symmetrization_history.json"
 
             if RANK == 0:
                 if self._emit_data_symm_aux_outputs:
                     if symm_history:
                         with symm_history_json_path.open("w", encoding="utf-8") as jfp:
                             json.dump(symm_history, jfp, ensure_ascii=False, indent=2)
+                    if rR_symm_history:
+                        with rR_symm_history_json_path.open("w", encoding="utf-8") as jfp:
+                            json.dump(rR_symm_history, jfp, ensure_ascii=False, indent=2)
 
                     with symm_report_path.open("w", encoding="utf-8") as fp:
                         fp.write("Data Symmetrization Summary\n")
                         fp.write(f"source_stru = {active_stru_path}\n")
                         fp.write(f"source_hr   = {active_hr_path}\n")
                         fp.write(f"source_sr   = {active_sr_path}\n")
+                        if active_rR_path is not None:
+                            fp.write(f"source_rR   = {active_rR_path}\n")
                         fp.write(f"output_hr   = {cov_hr_path}\n")
                         fp.write(f"output_sr   = {cov_sr_path}\n")
+                        if cov_rR_path is not None:
+                            fp.write(f"output_rR   = {cov_rR_path}\n")
                         fp.write(f"target_max_abs_ry = {data_symm_target_max_abs_ry:.12e}\n")
                         fp.write(f"max_iter_per_operation = {data_symm_max_iter_per_operation}\n")
                         fp.write(f"nonzero_block_tol = {data_symm_nonzero_block_tol:.12e}\n")
@@ -1040,6 +1149,12 @@ class Character:
                             f"SR after : max={sr_max_after:.12e}, mean={sr_mean_after:.12e}\n"
                             f"SR delta : max={sr_max_after-sr_max_before:.12e}, mean={sr_mean_after-sr_mean_before:.12e}\n"
                         )
+                        if before_rR is not None and after_rR is not None:
+                            fp.write(
+                                f"rR before: max={rR_max_before:.12e}, mean={rR_mean_before:.12e}\n"
+                                f"rR after : max={rR_max_after:.12e}, mean={rR_mean_after:.12e}\n"
+                                f"rR delta : max={rR_max_after-rR_max_before:.12e}, mean={rR_mean_after-rR_mean_before:.12e}\n"
+                            )
                         if symm_history:
                             fp.write(f"history_entries = {len(symm_history)}\n")
                             fp.write(f"history_json = {symm_history_json_path}\n")
@@ -1075,8 +1190,11 @@ class Character:
                                     f"R = {detail.get('R', [0, 0, 0])}, row = {int(detail.get('row', 1))}, col = {int(detail.get('col', 1))}\n"
                                     f"diff = ({float(detail.get('diff_real', 0.0)):.12e}, {float(detail.get('diff_imag', 0.0)):.12e})\n"
                                 )
+                        if rR_symm_history:
+                            fp.write(f"\nrR history_entries = {len(rR_symm_history)}\n")
+                            fp.write(f"rR_history_json = {rR_symm_history_json_path}\n")
                 else:
-                    for path in (symm_history_json_path, symm_report_path):
+                    for path in (symm_history_json_path, rR_symm_history_json_path, symm_report_path):
                         if path.exists():
                             path.unlink()
 
@@ -1091,11 +1209,20 @@ class Character:
                         f"SR max/mean before -> after : {sr_max_before:.6e}/{sr_mean_before:.6e} -> "
                         f"{sr_max_after:.6e}/{sr_mean_after:.6e}\n"
                     )
+                    if before_rR is not None and after_rR is not None:
+                        fp.write(
+                            f"rR max/mean before -> after : {rR_max_before:.6e}/{rR_mean_before:.6e} -> "
+                            f"{rR_max_after:.6e}/{rR_mean_after:.6e}\n"
+                        )
                     fp.write(f"symmetrized_hr = {cov_hr_path.resolve()}\n")
                     fp.write(f"symmetrized_sr = {cov_sr_path.resolve()}\n")
+                    if cov_rR_path is not None:
+                        fp.write(f"symmetrized_rR = {cov_rR_path.resolve()}\n")
 
             active_hr_path = cov_hr_path
             active_sr_path = cov_sr_path
+            if cov_rR_path is not None:
+                active_rR_path = cov_rR_path
 
         elif RANK == 0:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:
@@ -1122,6 +1249,8 @@ class Character:
             "active_stru_path": str(active_stru_path.resolve()),
             "active_hr_path": str(active_hr_path.resolve()),
             "active_sr_path": str(active_sr_path.resolve()),
+            "active_rR_path": str(active_rR_path.resolve()) if active_rR_path is not None else None,
+            "active_rR_unit": str(rR_unit),
             "lattice_constant": float(active_lattice_constant),
             "lattice_vector": np.asarray(active_lattice_vector, dtype=float),
             "HR_unit": str(HR_unit),
@@ -1140,6 +1269,8 @@ class Character:
         HR_route=None,
         SR_route="data-SR-sparse_SPIN0.csr",
         HR_unit="Ry",
+        rR_route=None,
+        rR_unit="Angstrom",
         data_symmetrize=0,
         data_symm_target_max_abs_ry=1.0e-8,
         data_symm_max_iter_per_operation=5,
@@ -1148,6 +1279,7 @@ class Character:
         **kwargs,
     ) -> dict:
         data_symmetrize = int(data_symmetrize)
+        rR_unit = rR_unit or "Angstrom"
         if data_symmetrize not in (0, 1):
             raise ValueError("CHARACTER.data_symmetrize must be 0 or 1.")
         data_symm_max_iter_per_operation = int(data_symm_max_iter_per_operation)
@@ -1197,6 +1329,8 @@ class Character:
                 HR_route=HR_route,
                 SR_route=SR_route,
                 HR_unit=HR_unit,
+                rR_route=rR_route,
+                rR_unit=rR_unit,
                 data_symmetrize=data_symmetrize,
                 data_symm_target_max_abs_ry=data_symm_target_max_abs_ry,
                 data_symm_max_iter_per_operation=data_symm_max_iter_per_operation,

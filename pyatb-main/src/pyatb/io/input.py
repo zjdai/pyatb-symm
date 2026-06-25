@@ -89,6 +89,18 @@ def parse_kp_zeeman_term(raw_value):
     raise ValueError("KP.zeeman_term must be yes or no.")
 
 
+def parse_kp_direction(raw_value):
+    value = str(raw_value).strip().lower()
+    if not value:
+        raise ValueError("KP.k_direction must contain one or more of x, y, z.")
+    allowed = {'x', 'y', 'z'}
+    if any(char not in allowed for char in value):
+        raise ValueError("KP.k_direction must contain only x, y, z.")
+    if len(set(value)) != len(value):
+        raise ValueError("KP.k_direction must not repeat x, y, or z.")
+    return ''.join(char for char in 'xyz' if char in set(value))
+
+
 def operate_character_special_parameters(block_parameters, block_data):
     known_parameter_names = set(block_parameters.keys())
     block_parameters['group'][-1] = parse_character_group(block_parameters['group'][-1])
@@ -122,6 +134,8 @@ def operate_kp_special_parameters(block_parameters, block_data):
         block_parameters['zeeman_term'][-1] = parse_kp_zeeman_term(raw_zeeman[0])
     else:
         block_parameters['zeeman_term'][-1] = parse_kp_zeeman_term(block_parameters['zeeman_term'][-1])
+
+    block_parameters['k_direction'][-1] = parse_kp_direction(block_parameters['k_direction'][-1])
 
 
 def get_file_block(input_filename: str) -> dict:
@@ -398,6 +412,8 @@ def check():
 
         if int(kp_parameters['korder']) < 0:
             raise ValueError('KP.korder must be zero or a positive integer.')
+
+        kp_parameters['k_direction'] = parse_kp_direction(kp_parameters['k_direction'])
 
         kp_parameters['zeeman_term'] = parse_kp_zeeman_term(kp_parameters['zeeman_term'])
 
