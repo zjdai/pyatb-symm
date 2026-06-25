@@ -430,6 +430,7 @@ def _build_numeric_lowdin_kp_analysis(
     band_range: Sequence[int],
     selection_index: int,
     basis_convention: str = "pyatb eigenvector basis at the reference k point",
+    wavefunction_source: str = "pyatb diagonalization at the reference k point",
     hamiltonian_data_convention: str = "current pyatb TB H/S data",
     hamiltonian_data_paths: Mapping[str, str] | None = None,
     free_electron_coefficient: float = KP_FREE_ELECTRON_COEFFICIENT_EV_A2,
@@ -646,6 +647,7 @@ def _build_numeric_lowdin_kp_analysis(
         "reference_k_cartesian": [float(value) for value in reference_k_cartesian],
         "expansion_variable": "q = k - k0 in Cartesian coordinates, Angstrom^-1",
         "basis_convention": str(basis_convention),
+        "wavefunction_source": str(wavefunction_source),
         "hamiltonian_data_convention": str(hamiltonian_data_convention),
         "hamiltonian_data_paths": dict(hamiltonian_data_paths or {}),
         "velocity_convention": "V_i = (hbar / m_e) pi_i = dH/dk_i-like linear coefficient from pyatb velocity_matrix",
@@ -779,7 +781,7 @@ def _lowdin_tb_from_character_payload(
     active_rR = abacus_readrR(str(rR_path), active_rR_unit)
     active_tb.set_solver_rR(active_rR[0], active_rR[1], active_rR[2], is_sparse)
     active_tb.read_stru(str(active_stru_path), need_orb=True)
-    active_tb.kp_lowdin_data_convention = "CHARACTER active symmetrized H/S/rR data"
+    active_tb.kp_lowdin_data_convention = "CHARACTER active H/S/rR data"
     active_tb.kp_lowdin_data_paths = {
         "stru": str(active_stru_path),
         "HR": str(active_hr_path),
@@ -823,7 +825,7 @@ def _active_hs_tb_from_character_payload(
     is_sparse = bool(getattr(reference_tb, "HSR_iSsparse", False))
     active_tb.set_solver_HSR(active_hr, active_sr, is_sparse)
     active_tb.read_stru(str(active_stru_path), need_orb=True)
-    active_tb.kp_alignment_data_convention = "CHARACTER active symmetrized H/S data"
+    active_tb.kp_alignment_data_convention = "CHARACTER active H/S data"
     active_tb.kp_alignment_data_paths = {
         "stru": str(active_stru_path),
         "HR": str(active_hr_path),
@@ -859,11 +861,13 @@ def _numeric_lowdin_kp_analyses_for_results(
             wavefunctions = np.asarray(character_row["target_eigenvectors_full"], dtype=complex)
             eigenvalues_for_analysis = np.asarray(character_row["target_eigenvalues_full"], dtype=float)
             basis_convention = "CHARACTER eigenvector basis at the reference k point"
+            wavefunction_source = "CHARACTER payload target_eigenvectors_full"
         else:
             eigenvectors, eigenvalues = tb_solver.diago_H(k_direct)
             wavefunctions = np.asarray(eigenvectors[0], dtype=complex)
             eigenvalues_for_analysis = np.asarray(eigenvalues[0], dtype=float)
             basis_convention = "pyatb eigenvector basis at the reference k point"
+            wavefunction_source = "fallback tb_solver.diago_H at the reference k point"
         velocity_basis = tb_solver.get_velocity_basis_k(k_direct)
         velocity_matrices = np.asarray(
             [
@@ -895,6 +899,7 @@ def _numeric_lowdin_kp_analyses_for_results(
                 band_range=band_range,
                 selection_index=int(result.get("selection_index", len(analyses) + 1)),
                 basis_convention=basis_convention,
+                wavefunction_source=wavefunction_source,
                 hamiltonian_data_convention=getattr(
                     tb,
                     "kp_lowdin_data_convention",
@@ -4815,25 +4820,43 @@ def _format_matrix_pair_comparison_3(
     fitted_matrix: Sequence[Sequence[Sequence[float]]],
     *,
     title: str,
+    transformed_matrix: Sequence[Sequence[Sequence[float]]] | None = None,
 ) -> list[str]:
     numeric_lines = [line.strip() for line in _format_matrix_pairs_3(numeric_matrix)]
+    transformed_lines = (
+        [line.strip() for line in _format_matrix_pairs_3(transformed_matrix)]
+        if transformed_matrix is not None
+        else []
+    )
     fitted_lines = [line.strip() for line in _format_matrix_pairs_3(fitted_matrix)]
-    if not numeric_lines and not fitted_lines:
+    if not numeric_lines and not transformed_lines and not fitted_lines:
         return []
 
-    row_count = max(len(numeric_lines), len(fitted_lines))
+    row_count = max(len(numeric_lines), len(transformed_lines), len(fitted_lines))
     numeric_lines.extend([""] * (row_count - len(numeric_lines)))
+    transformed_lines.extend([""] * (row_count - len(transformed_lines)))
     fitted_lines.extend([""] * (row_count - len(fitted_lines)))
     left_title = "Numerical result:"
+    middle_title = "Numerical basis after transform:"
     right_title = "Fitted result:"
     left_width = max([len(left_title), *(len(line) for line in numeric_lines)]) + 4
     right_width = max([len(right_title), *(len(line) for line in fitted_lines)])
-    total_width = left_width + 5 + right_width
+    if transformed_matrix is None:
+        lines = [title, f"{left_title:^{left_width}}     {right_title:^{right_width}}"]
+        lines.extend(
+            f"{left:<{left_width}}     {right}"
+            for left, right in zip(numeric_lines, fitted_lines, strict=False)
+        )
+        return lines
 
-    lines = [title, f"{left_title:^{left_width}}     {right_title:^{right_width}}"]
+    middle_width = max([len(middle_title), *(len(line) for line in transformed_lines)]) + 4
+    lines = [
+        title,
+        f"{left_title:^{left_width}}     {middle_title:^{middle_width}}     {right_title:^{right_width}}",
+    ]
     lines.extend(
-        f"{left:<{left_width}}     {right}"
-        for left, right in zip(numeric_lines, fitted_lines, strict=False)
+        f"{left:<{left_width}}     {middle:<{middle_width}}     {right}"
+        for left, middle, right in zip(numeric_lines, transformed_lines, fitted_lines, strict=False)
     )
     return lines
 
@@ -5574,6 +5597,8 @@ def _format_numeric_lowdin_kp_analyses(
             "q convention: q = k - k0 in Cartesian coordinates, Angstrom^-1",
             f"k_direction: {analyses[0].get('k_direction', 'xyz')}",
             "velocity convention: V_i = (hbar / m_e) pi_i from pyatb velocity_matrix",
+            "matrix convention: printed matrices are monomial coefficient matrices; "
+            "fitted matrices include fitted parameters and formal-basis normalization coefficients",
         ]
     )
     if max_order >= 3:
@@ -5595,6 +5620,8 @@ def _format_numeric_lowdin_kp_analyses(
         lines.extend(
             [
                 f"hbar^2/(2m_e) = {float(analysis.get('free_electron_coefficient_eV_A2', 0.0)):.8f} eV Angstrom^2",
+                f"wavefunction source: {analysis.get('wavefunction_source', 'unknown')}",
+                f"H/S/rR source: {analysis.get('hamiltonian_data_convention', 'unknown')}",
                 "constant energies E0 (eV):",
             ]
         )
@@ -6066,6 +6093,8 @@ def _format_schur_kp_parameter_fit_analyses(
             "q convention: q = k - k0 in Cartesian coordinates, Angstrom^-1",
             f"k_direction: {analyses[0].get('k_direction', 'xyz')}",
             "velocity convention: V_i = (hbar / m_e) pi_i from pyatb velocity_matrix",
+            "matrix convention: printed matrices are monomial coefficient matrices; "
+            "fitted matrices include fitted parameters and formal-basis normalization coefficients",
         ]
     )
     if max_order >= 3:
@@ -6092,6 +6121,9 @@ def _format_schur_kp_parameter_fit_analyses(
             "hbar^2/(2m_e) = "
             f"{float(numeric.get('free_electron_coefficient_eV_A2', 0.0)):.8f} eV Angstrom^2"
         )
+        if numeric:
+            lines.append(f"wavefunction source: {numeric.get('wavefunction_source', 'unknown')}")
+            lines.append(f"H/S/rR source: {numeric.get('hamiltonian_data_convention', 'unknown')}")
         lines.append(separator)
         lines.extend(
             _format_symmetrized_model_formula_lines(
@@ -6152,6 +6184,7 @@ def _format_schur_kp_parameter_fit_analyses(
                         record.get("raw_numeric_matrix", record.get("transformed_numeric_matrix", [])),
                         record.get("formal_fit_matrix", []),
                         title=title,
+                        transformed_matrix=record.get("transformed_numeric_matrix"),
                     )
                 )
             if section_lines:
@@ -6259,6 +6292,7 @@ def _format_schur_zeeman_parameter_fit_analyses(
                     record.get("raw_numeric_matrix", record.get("transformed_numeric_matrix", [])),
                     record.get("formal_fit_matrix", []),
                     title=f"G_{field}",
+                    transformed_matrix=record.get("transformed_numeric_matrix"),
                 )
             )
         if section_lines:

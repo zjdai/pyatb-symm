@@ -34,10 +34,8 @@ from pyatb.symmetry.data_covariance_constraint import (
     prepare_operation_contexts,
     self_covariance_statistics,
     sequential_symmetrize_hs,
-    sequential_symmetrize_rR,
     vector_self_covariance_statistics,
     write_symmetrized_hs,
-    write_symmetrized_rR,
 )
 
 
@@ -1046,29 +1044,6 @@ class Character:
                 nonzero_block_tol=float(data_symm_nonzero_block_tol),
                 operation_contexts=operation_contexts,
             )
-            rR_symm = None
-            rR_symm_history = []
-            after_rR = None
-            if rR_blocks is not None:
-                rR_symm, rR_symm_history = sequential_symmetrize_rR(
-                    vector_blocks=rR_blocks,
-                    metadata=metadata,
-                    operations=operations,
-                    operation_target_max_abs=float(data_symm_target_max_abs_ry),
-                    max_iter_per_operation=int(data_symm_max_iter_per_operation),
-                    map_tol=float(symm_prec),
-                    nonzero_block_tol=float(data_symm_nonzero_block_tol),
-                    verbose=bool(data_symm_verbose),
-                    operation_contexts=operation_contexts,
-                )
-                after_rR = vector_self_covariance_statistics(
-                    rR_symm,
-                    metadata,
-                    operations,
-                    map_tol=float(symm_prec),
-                    nonzero_block_tol=float(data_symm_nonzero_block_tol),
-                    operation_contexts=operation_contexts,
-                )
             self._validate_covariance_statistics(
                 after_hr,
                 after_sr,
@@ -1078,13 +1053,9 @@ class Character:
             )
             final_hr_stats = after_hr
             final_sr_stats = after_sr
-            final_rR_stats = after_rR if after_rR is not None else final_rR_stats
 
             cov_hr_path = Path(self.output_path) / f"{active_hr_path.stem}-covsymm.csr"
             cov_sr_path = Path(self.output_path) / f"{active_sr_path.stem}-covsymm.csr"
-            cov_rR_path = None
-            if active_rR_path is not None:
-                cov_rR_path = Path(self.output_path) / f"{active_rR_path.stem}-covsymm.csr"
             if RANK == 0:
                 write_symmetrized_hs(
                     hr_blocks=hr_symm,
@@ -1095,14 +1066,6 @@ class Character:
                     nspin=int(self._tb.nspin),
                     hr_unit=str(HR_unit),
                 )
-                if rR_symm is not None and cov_rR_path is not None:
-                    write_symmetrized_rR(
-                        vector_blocks=rR_symm,
-                        output_rR_path=cov_rR_path,
-                        basis_num=int(metadata.basis_num),
-                        nspin=int(self._tb.nspin),
-                        rR_unit=str(rR_unit),
-                    )
 
             symm_report_path = Path(self.output_path) / "data_symmetrization_report.txt"
             hr_max_before = float(before_hr["global_max_abs"])
@@ -1115,8 +1078,6 @@ class Character:
             sr_mean_after = float(after_sr["mean_abs_over_operations"])
             rR_max_before = float(before_rR["global_max_abs"]) if before_rR is not None else None
             rR_mean_before = float(before_rR["mean_abs_over_operations"]) if before_rR is not None else None
-            rR_max_after = float(after_rR["global_max_abs"]) if after_rR is not None else None
-            rR_mean_after = float(after_rR["mean_abs_over_operations"]) if after_rR is not None else None
             symm_history_json_path = Path(self.output_path) / "data_symmetrization_history.json"
             rR_symm_history_json_path = Path(self.output_path) / "rR_data_symmetrization_history.json"
 
@@ -1125,9 +1086,8 @@ class Character:
                     if symm_history:
                         with symm_history_json_path.open("w", encoding="utf-8") as jfp:
                             json.dump(symm_history, jfp, ensure_ascii=False, indent=2)
-                    if rR_symm_history:
-                        with rR_symm_history_json_path.open("w", encoding="utf-8") as jfp:
-                            json.dump(rR_symm_history, jfp, ensure_ascii=False, indent=2)
+                    if rR_symm_history_json_path.exists():
+                        rR_symm_history_json_path.unlink()
 
                     with symm_report_path.open("w", encoding="utf-8") as fp:
                         fp.write("Data Symmetrization Summary\n")
@@ -1138,8 +1098,8 @@ class Character:
                             fp.write(f"source_rR   = {active_rR_path}\n")
                         fp.write(f"output_hr   = {cov_hr_path}\n")
                         fp.write(f"output_sr   = {cov_sr_path}\n")
-                        if cov_rR_path is not None:
-                            fp.write(f"output_rR   = {cov_rR_path}\n")
+                        if active_rR_path is not None:
+                            fp.write(f"output_rR   = {active_rR_path} (unchanged; rR symmetrization skipped)\n")
                         fp.write(f"target_max_abs_ry = {data_symm_target_max_abs_ry:.12e}\n")
                         fp.write(f"max_iter_per_operation = {data_symm_max_iter_per_operation}\n")
                         fp.write(f"nonzero_block_tol = {data_symm_nonzero_block_tol:.12e}\n")
@@ -1153,11 +1113,10 @@ class Character:
                             f"SR after : max={sr_max_after:.12e}, mean={sr_mean_after:.12e}\n"
                             f"SR delta : max={sr_max_after-sr_max_before:.12e}, mean={sr_mean_after-sr_mean_before:.12e}\n"
                         )
-                        if before_rR is not None and after_rR is not None:
+                        if before_rR is not None:
                             fp.write(
-                                f"rR before: max={rR_max_before:.12e}, mean={rR_mean_before:.12e}\n"
-                                f"rR after : max={rR_max_after:.12e}, mean={rR_mean_after:.12e}\n"
-                                f"rR delta : max={rR_max_after-rR_max_before:.12e}, mean={rR_mean_after-rR_mean_before:.12e}\n"
+                                "rR symmetrization skipped: active rR is kept unchanged for Lowdin velocity.\n"
+                                f"rR input covariance check: max={rR_max_before:.12e}, mean={rR_mean_before:.12e}\n"
                             )
                         if symm_history:
                             fp.write(f"history_entries = {len(symm_history)}\n")
@@ -1194,9 +1153,6 @@ class Character:
                                     f"R = {detail.get('R', [0, 0, 0])}, row = {int(detail.get('row', 1))}, col = {int(detail.get('col', 1))}\n"
                                     f"diff = ({float(detail.get('diff_real', 0.0)):.12e}, {float(detail.get('diff_imag', 0.0)):.12e})\n"
                                 )
-                        if rR_symm_history:
-                            fp.write(f"\nrR history_entries = {len(rR_symm_history)}\n")
-                            fp.write(f"rR_history_json = {rR_symm_history_json_path}\n")
                 else:
                     for path in (symm_history_json_path, rR_symm_history_json_path, symm_report_path):
                         if path.exists():
@@ -1213,20 +1169,18 @@ class Character:
                         f"SR max/mean before -> after : {sr_max_before:.6e}/{sr_mean_before:.6e} -> "
                         f"{sr_max_after:.6e}/{sr_mean_after:.6e}\n"
                     )
-                    if before_rR is not None and after_rR is not None:
+                    if before_rR is not None:
                         fp.write(
-                            f"rR max/mean before -> after : {rR_max_before:.6e}/{rR_mean_before:.6e} -> "
-                            f"{rR_max_after:.6e}/{rR_mean_after:.6e}\n"
+                            f"rR symmetrization skipped; input max/mean = "
+                            f"{rR_max_before:.6e}/{rR_mean_before:.6e}\n"
                         )
+                        if active_rR_path is not None:
+                            fp.write(f"active_rR = {active_rR_path.resolve()}\n")
                     fp.write(f"symmetrized_hr = {cov_hr_path.resolve()}\n")
                     fp.write(f"symmetrized_sr = {cov_sr_path.resolve()}\n")
-                    if cov_rR_path is not None:
-                        fp.write(f"symmetrized_rR = {cov_rR_path.resolve()}\n")
 
             active_hr_path = cov_hr_path
             active_sr_path = cov_sr_path
-            if cov_rR_path is not None:
-                active_rR_path = cov_rR_path
 
         elif RANK == 0:
             with open(RUNNING_LOG, "a", encoding="utf-8") as fp:

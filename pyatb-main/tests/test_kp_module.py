@@ -1648,9 +1648,10 @@ def test_schur_kp_fit_formatter_outputs_transformed_numeric_and_fit_side_by_side
     assert "Linear coefficient matrices V_i (eV Angstrom)" in text
     assert "V_kx" in text
     assert "Numerical result:" in text
+    assert "Numerical basis after transform:" in text
     assert "Fitted result:" in text
     assert "(   9.877  +0.000i)" in text
-    assert "(   1.235  +0.000i)" not in text
+    assert "(   1.235  +0.000i)" in text
     assert text.index("Symmetrized formual for k.p Hamiltonian:") < text.index("Parameters fitted:")
     assert text.index("Parameters fitted:") < text.index("Detailed information:")
     assert text.index("Detailed information:") < text.index("Linear coefficient matrices V_i")
@@ -1739,9 +1740,10 @@ def test_schur_zeeman_fit_formatter_outputs_transformed_numeric_and_fit_side_by_
     assert "Zeeman coefficient matrices G_i" in text
     assert "G_Bx" in text
     assert "Numerical result:" in text
+    assert "Numerical basis after transform:" in text
     assert "Fitted result:" in text
     assert "(   9.877  +0.000i)" in text
-    assert "(   1.235  +0.000i)" not in text
+    assert "(   1.235  +0.000i)" in text
     assert text.index("Symmetrized formual for Zeeman Hamiltonian:") < text.index("Parameters fitted:")
     assert text.index("Parameters fitted:") < text.index("Detailed information:")
     assert text.index("Detailed information:") < text.index("Zeeman coefficient matrices G_i")
@@ -1990,7 +1992,7 @@ def test_numeric_lowdin_kp_reuses_character_eigenvectors(load_pyatb) -> None:
     assert lowdin_xx[0, 0] == pytest.approx(-1.0)
 
 
-def test_lowdin_tb_from_character_payload_uses_symmetrized_hs_and_rr(load_pyatb, monkeypatch) -> None:
+def test_lowdin_tb_from_character_payload_uses_active_hs_and_rr(load_pyatb, monkeypatch) -> None:
     module = load_pyatb("pyatb.symmetry.kp")
     calls: dict[str, object] = {}
 
@@ -2025,7 +2027,7 @@ def test_lowdin_tb_from_character_payload_uses_symmetrized_hs_and_rr(load_pyatb,
             "active_stru_path": "/tmp/symmetrized/STRU",
             "active_hr_path": "/tmp/symmetrized/data-HR-sparse_SPIN0-covsymm.csr",
             "active_sr_path": "/tmp/symmetrized/data-SR-sparse_SPIN0-covsymm.csr",
-            "active_rR_path": "/tmp/symmetrized/data-rR-sparse-covsymm.csr",
+            "active_rR_path": "/tmp/symmetrized/data-rR-sparse-standardized.csr",
             "active_rR_unit": "Angstrom",
             "lattice_constant": 2.0,
             "lattice_vector": np.eye(3) * 3.0,
@@ -2042,14 +2044,14 @@ def test_lowdin_tb_from_character_payload_uses_symmetrized_hs_and_rr(load_pyatb,
         ("SR", 4, "/tmp/symmetrized/data-SR-sparse_SPIN0-covsymm.csr"),
         True,
     )
-    assert calls["rr"] == (("rRx", "/tmp/symmetrized/data-rR-sparse-covsymm.csr", "Angstrom"), "rRy", "rRz", True)
+    assert calls["rr"] == (("rRx", "/tmp/symmetrized/data-rR-sparse-standardized.csr", "Angstrom"), "rRy", "rRz", True)
     assert calls["stru"] == ("/tmp/symmetrized/STRU", True)
-    assert active.kp_lowdin_data_convention == "CHARACTER active symmetrized H/S/rR data"
+    assert active.kp_lowdin_data_convention == "CHARACTER active H/S/rR data"
     assert active.kp_lowdin_data_paths == {
         "stru": "/tmp/symmetrized/STRU",
         "HR": "/tmp/symmetrized/data-HR-sparse_SPIN0-covsymm.csr",
         "SR": "/tmp/symmetrized/data-SR-sparse_SPIN0-covsymm.csr",
-        "rR": "/tmp/symmetrized/data-rR-sparse-covsymm.csr",
+        "rR": "/tmp/symmetrized/data-rR-sparse-standardized.csr",
     }
 
 
