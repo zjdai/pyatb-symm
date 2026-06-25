@@ -6600,6 +6600,7 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
     hall_symbol = spacegroup.get("hall_symbol", "unknown")
     spin_orbit = bool(info.get("spin_group", {}).get("enabled", False))
     magnetic_type = info.get("magnetic_spacegroup_type", {})
+    include_zeeman = _kp_zeeman_enabled(info.get("zeeman_term", "yes"))
 
     lines = [
         star_line,
@@ -6681,12 +6682,13 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
             star_line=star_line,
         )
     )
-    lines.extend(
-        _format_zeeman_field_irrep_analyses(
-            info.get("zeeman_field_irrep_analyses", []),
-            star_line=star_line,
+    if include_zeeman:
+        lines.extend(
+            _format_zeeman_field_irrep_analyses(
+                info.get("zeeman_field_irrep_analyses", []),
+                star_line=star_line,
+            )
         )
-    )
     lines.extend(
         _format_kp_form_solution_analyses(
             info.get("kp_form_solution_analyses", []),
@@ -6695,13 +6697,14 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
             final_kp_model_analyses=info.get("final_kp_model_analyses", []),
         )
     )
-    lines.extend(
-        _format_zeeman_form_solution_analyses(
-            info.get("zeeman_form_solution_analyses", []),
-            star_line=star_line,
-            final_zeeman_analyses=info.get("final_zeeman_model_analyses", []),
+    if include_zeeman:
+        lines.extend(
+            _format_zeeman_form_solution_analyses(
+                info.get("zeeman_form_solution_analyses", []),
+                star_line=star_line,
+                final_zeeman_analyses=info.get("final_zeeman_model_analyses", []),
+            )
         )
-    )
     lines.extend(
         _format_numeric_lowdin_kp_status(
             info.get("numeric_lowdin_kp_status"),
@@ -6710,7 +6713,7 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
     )
     max_order = int(info.get("korder", 3))
     schur_kp_fits = info.get("schur_kp_parameter_fit_analyses", [])
-    schur_zeeman_fits = info.get("schur_zeeman_parameter_fit_analyses", [])
+    schur_zeeman_fits = info.get("schur_zeeman_parameter_fit_analyses", []) if include_zeeman else []
     if schur_kp_fits:
         lines.extend(
             _format_schur_kp_parameter_fit_analyses(
@@ -6729,22 +6732,23 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
                 max_order=max_order,
             )
         )
-    if schur_zeeman_fits:
-        lines.extend(
-            _format_schur_zeeman_parameter_fit_analyses(
-                schur_zeeman_fits,
-                star_line=star_line,
-                final_zeeman_model_analyses=info.get("final_zeeman_model_analyses", []),
-                numeric_analyses=info.get("numeric_lowdin_kp_analyses", []),
+    if include_zeeman:
+        if schur_zeeman_fits:
+            lines.extend(
+                _format_schur_zeeman_parameter_fit_analyses(
+                    schur_zeeman_fits,
+                    star_line=star_line,
+                    final_zeeman_model_analyses=info.get("final_zeeman_model_analyses", []),
+                    numeric_analyses=info.get("numeric_lowdin_kp_analyses", []),
+                )
             )
-        )
-    else:
-        lines.extend(
-            _format_numeric_zeeman_analyses(
-                info.get("numeric_lowdin_kp_analyses", []),
-                star_line=star_line,
+        else:
+            lines.extend(
+                _format_numeric_zeeman_analyses(
+                    info.get("numeric_lowdin_kp_analyses", []),
+                    star_line=star_line,
+                )
             )
-        )
     lines.extend(
         _format_final_hamiltonian_summary(
             schur_kp_fits,

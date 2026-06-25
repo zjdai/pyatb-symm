@@ -1542,6 +1542,60 @@ def test_numeric_zeeman_formatter_uses_three_decimal_matrices(load_pyatb) -> Non
     assert "H/S data convention: debug H/S" not in text
 
 
+def test_kp_model_header_skips_numeric_zeeman_when_disabled(load_pyatb, tmp_path: Path) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    matrix = [
+        [[1.0, 0.0], [0.0, -0.25]],
+        [[0.0, 0.25], [0.0, 0.0]],
+    ]
+    info = {
+        "zeeman_term": "no",
+        "korder": 2,
+        "numeric_lowdin_kp_analyses": [
+            {
+                "selection_index": 1,
+                "free_electron_coefficient_eV_A2": 3.809982,
+                "constant_energies_eV": [0.0, 1.0],
+                "linear_matrices": [],
+                "quadratic_monomial_matrices": [],
+                "zeeman_formula": "G formula should be hidden",
+                "zeeman_orbital_matrices": [{"field": "Bx", "matrix": matrix}],
+                "zeeman_spin_matrices": [{"field": "Bx", "matrix": matrix}],
+                "zeeman_matrices": [{"field": "Bx", "matrix": matrix}],
+            }
+        ],
+        "schur_zeeman_parameter_fit_analyses": [
+            {
+                "selection_index": 1,
+                "formal_parameter_labels": ["Z1"],
+                "formal_parameters": [1.0],
+                "records": [
+                    {
+                        "field": "Bx",
+                        "raw_numeric_matrix": matrix,
+                        "transformed_numeric_matrix": matrix,
+                        "formal_fit_matrix": matrix,
+                    }
+                ],
+            }
+        ],
+    }
+    output_path = tmp_path / "kp_model.txt"
+
+    module._write_kp_model_header(info, output_path)
+
+    text = output_path.read_text(encoding="utf-8")
+    assert "Numerical Lowdin k.p model coefficients" in text
+    assert "Numerical Zeeman matrices from Lowdin perturbation" not in text
+    assert "G formula should be hidden" not in text
+    assert "Orbital Zeeman G^orb_i matrices" not in text
+    assert "Spin Zeeman sigma_i matrices" not in text
+    assert "Total Zeeman G_i matrices" not in text
+    assert "Schur-aligned numerical Zeeman parameter fit" not in text
+    assert "Symmetrized Zeeman Hamiltonian" not in text
+
+
 def test_three_decimal_complex_formatter_aligns_columns_and_suppresses_negative_zero(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.kp")
 
