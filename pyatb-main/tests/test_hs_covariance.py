@@ -218,3 +218,40 @@ def test_write_symmetrized_rR_roundtrips_with_abacus_reader(load_pyatb, tmp_path
     np.testing.assert_allclose(dense[0][(0, 0, 0)], np.array([[1.25 + 0.0j]]))
     np.testing.assert_allclose(dense[1][(0, 0, 0)], np.array([[2.50 + 0.0j]]))
     np.testing.assert_allclose(dense[2][(0, 0, 0)], np.array([[3.75 + 0.0j]]))
+
+
+def test_standardized_rR_writer_preserves_reference_zero_r_blocks(load_pyatb, tmp_path) -> None:
+    hs_standardize = load_pyatb("pyatb.symmetry.hs_standardize")
+    reader = load_pyatb("pyatb.io.abacus_read_xr")
+
+    path = tmp_path / "data-rR-sparse-standardized.csr"
+    vector_blocks = [
+        {(0, 0, 0): np.array([[1.0 + 0.0j]], dtype=complex)},
+        {(0, 0, 0): np.array([[2.0 + 0.0j]], dtype=complex)},
+        {(0, 0, 0): np.array([[3.0 + 0.0j]], dtype=complex)},
+    ]
+    reference_r_keys = np.array(
+        [
+            [0, 0, 0],
+            [1, -2, 1],
+        ],
+        dtype=int,
+    )
+
+    hs_standardize._write_abacus_sparse_rR(
+        path,
+        vector_blocks,
+        basis_num=1,
+        nspin=1,
+        rR_unit="Angstrom",
+        reference_r_keys=reference_r_keys,
+    )
+
+    roundtrip = reader.abacus_readrR(str(path), "Angstrom")
+    coords = [tuple(int(value) for value in row) for row in roundtrip[0].R_direct_coor]
+
+    assert coords == [(0, 0, 0), (1, -2, 1)]
+    for component in roundtrip:
+        assert component.R_num == 2
+        zero_index = coords.index((1, -2, 1))
+        assert component.XR.getrow(zero_index).nnz == 0

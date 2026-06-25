@@ -895,7 +895,7 @@ class Character:
             if active_rR_path is not None:
                 standardized_rR_path = Path(self.output_path) / f"{active_rR_path.stem}-standardized.csr"
             if RANK == 0:
-                canonicalize_abacus_hs(
+                standardized_hs = canonicalize_abacus_hs(
                     tb=self._tb,
                     target_stru_path=target_stru_path,
                     hr_route=hr_source,
@@ -915,6 +915,9 @@ class Character:
                     symmetry_map_tol=float(symm_prec),
                 )
                 if active_rR_path is not None:
+                    reference_r_keys = None
+                    if isinstance(standardized_hs, dict) and standardized_hs.get("hr") is not None:
+                        reference_r_keys = getattr(standardized_hs["hr"], "R_direct_coor", None)
                     canonicalize_abacus_rR(
                         tb=self._tb,
                         target_stru_path=target_stru_path,
@@ -926,6 +929,7 @@ class Character:
                         xyz_axis_transform_cartesian=np.asarray(analysis_result["xyz_axis_transform_cartesian"], dtype=float),
                         output_rR_path=standardized_rR_path,
                         full_matrix_from_hermitian=full_matrix_from_hermitian,
+                        reference_r_keys=reference_r_keys,
                     )
 
             active_stru_path = target_stru_path

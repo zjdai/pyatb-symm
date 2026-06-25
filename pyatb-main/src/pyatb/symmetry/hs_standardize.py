@@ -359,11 +359,15 @@ def _write_abacus_sparse_rR(
     basis_num: int,
     nspin: int,
     rR_unit: str = "Angstrom",
+    reference_r_keys=None,
 ) -> None:
     if len(vector_matrices_by_r) != 3:
         raise ValueError("rR writer expects exactly three Cartesian component block dictionaries.")
 
-    r_keys = sorted(set().union(*(set(component.keys()) for component in vector_matrices_by_r)))
+    r_key_set = set().union(*(set(component.keys()) for component in vector_matrices_by_r))
+    if reference_r_keys is not None:
+        r_key_set.update(tuple(int(value) for value in key) for key in reference_r_keys)
+    r_keys = sorted(r_key_set)
     unit_scale = _unit_scale_from_rR_unit(str(rR_unit))
     zero = np.zeros((int(basis_num), int(basis_num)), dtype=complex)
     with path.open("w", encoding="utf-8") as handle:
@@ -565,6 +569,7 @@ def canonicalize_abacus_rR(
     xyz_axis_transform_cartesian,
     output_rR_path,
     full_matrix_from_hermitian: bool = True,
+    reference_r_keys=None,
 ):
     source_metadata = extract_abacus_basis_metadata(tb)
     target_metadata = _build_metadata_from_stru(Path(target_stru_path), np.asarray(lattice_new, dtype=float), int(tb.nspin))
@@ -601,6 +606,7 @@ def canonicalize_abacus_rR(
         int(target_metadata.basis_num),
         int(tb.nspin),
         rR_unit=str(rR_unit),
+        reference_r_keys=reference_r_keys,
     )
 
     canonical_rR = abacus_readrR(str(output_rR_path), str(rR_unit))
