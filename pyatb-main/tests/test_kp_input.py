@@ -81,6 +81,8 @@ def test_kp_block_accepts_direct_kpoints_with_per_kpoint_bands(load_pyatb, tmp_p
     assert input_data["KP"]["mag"] == "auto"
     assert input_data["KP"]["korder"] == 2
     assert input_data["KP"]["zeeman_term"] == "yes"
+    assert input_data["KP"]["kp_radius"] == pytest.approx(0.0)
+    assert input_data["KP"]["kp_grid"] == 4
 
 
 def test_kp_block_accepts_korder_and_zeeman_term(load_pyatb, tmp_path: Path) -> None:
@@ -96,6 +98,8 @@ def test_kp_block_accepts_korder_and_zeeman_term(load_pyatb, tmp_path: Path) -> 
                 "    band 77 80",
                 "    korder 3",
                 "    zeeman_term no",
+                "    kp_radius 0.02",
+                "    kp_grid 7",
             ]
         ),
     )
@@ -104,6 +108,29 @@ def test_kp_block_accepts_korder_and_zeeman_term(load_pyatb, tmp_path: Path) -> 
 
     assert input_data["KP"]["korder"] == 3
     assert input_data["KP"]["zeeman_term"] == "no"
+    assert input_data["KP"]["kp_radius"] == pytest.approx(0.02)
+    assert input_data["KP"]["kp_grid"] == 7
+
+
+def test_kp_block_rejects_invalid_energy_error_grid(load_pyatb, tmp_path: Path) -> None:
+    input_mod = load_pyatb("pyatb.io.input")
+    input_file = tmp_path / "Input"
+    _write_kp_input(
+        input_file,
+        "\n".join(
+            [
+                "    kpoint_mode direct",
+                "    kpoint_num 1",
+                "    kpoint_direct_coor 0.0 0.0 0.0",
+                "    band 77 80",
+                "    kp_radius 0.02",
+                "    kp_grid 0",
+            ]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="KP.kp_grid"):
+        input_mod.read_input(str(input_file))
 
 
 def test_kp_block_accepts_spaced_zeeman_term_alias(load_pyatb, tmp_path: Path) -> None:

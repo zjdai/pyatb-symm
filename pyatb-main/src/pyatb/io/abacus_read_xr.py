@@ -7,6 +7,26 @@ import re
 from pyatb.constants import Ry_to_eV, Ang_to_Bohr
 from pyatb.tb.multixr import multiXR
 
+
+def _read_sparse_data_line(fread, data_size, unit):
+    raw_line = fread.readline()
+    complex_values = re.findall(r'[(]([^,]+),([^)]+)[)]', raw_line)
+    if complex_values:
+        if len(complex_values) != data_size:
+            raise ValueError(
+                f'Expected {data_size} complex sparse values, got {len(complex_values)}.'
+            )
+        return np.array(
+            [complex(float(real), float(imag)) * unit for real, imag in complex_values],
+            dtype=complex,
+        )
+
+    line = raw_line.split()
+    if len(line) != data_size:
+        raise ValueError(f'Expected {data_size} sparse values, got {len(line)}.')
+    return np.array([float(value) * unit for value in line], dtype=complex)
+
+
 def abacus_readHR(nspin, HR_route, HR_unit, **kwarg):
     if HR_unit == 'eV':
         unit = 1.0
@@ -39,24 +59,11 @@ def abacus_readHR(nspin, HR_route, HR_unit, **kwarg):
             R_direct_coor[iR, 2] = int(line[2])
             data_size = int(line[3])
             
-            if nspin != 4:
-                data = np.zeros((data_size,), dtype=float)
-            else:
-                data = np.zeros((data_size,), dtype=complex)
-
             indices = np.zeros(data_size, dtype=int)
             indptr = np.zeros((basis_num+1,), dtype=int)
 
             if data_size != 0:
-                if nspin != 4:
-                    line = fread.readline().split()
-                    for index in range(data_size):
-                        data[index] = float(line[index]) * unit
-                else:
-                    line = re.findall('[(](.*?)[)]', fread.readline())
-                    for index in range(data_size):
-                        value = line[index].split(',')
-                        data[index] = complex(float(value[0]), float(value[1])) * unit
+                data = _read_sparse_data_line(fread, data_size, unit)
 
                 line = fread.readline().split()
                 for index in range(data_size):
@@ -109,24 +116,11 @@ def abacus_readSR(nspin, SR_route, **kwarg):
             R_direct_coor[iR, 2] = int(line[2])
             data_size = int(line[3])
             
-            if nspin != 4:
-                data = np.zeros((data_size,), dtype=float)
-            else:
-                data = np.zeros((data_size,), dtype=complex)
-
             indices = np.zeros(data_size, dtype=int)
             indptr = np.zeros((basis_num+1,), dtype=int)
 
             if data_size != 0:
-                if nspin != 4:
-                    line = fread.readline().split()
-                    for index in range(data_size):
-                        data[index] = float(line[index]) * unit
-                else:
-                    line = re.findall('[(](.*?)[)]', fread.readline())
-                    for index in range(data_size):
-                        value = line[index].split(',')
-                        data[index] = complex(float(value[0]), float(value[1])) * unit
+                data = _read_sparse_data_line(fread, data_size, unit)
 
                 line = fread.readline().split()
                 for index in range(data_size):
@@ -185,14 +179,11 @@ def abacus_readrR(rR_route, rR_unit, **kwarg):
             for direction in range(3):
                 line = fread.readline().split()
                 data_size = int(line[0])
-                data = np.zeros((data_size,), dtype=float)
                 indices = np.zeros(data_size, dtype=int)
                 indptr = np.zeros((basis_num+1,), dtype=int)
 
                 if data_size != 0:
-                    line = fread.readline().split()
-                    for index in range(data_size):
-                        data[index] = float(line[index]) * unit
+                    data = _read_sparse_data_line(fread, data_size, unit)
 
                     line = fread.readline().split()
                     for index in range(data_size):

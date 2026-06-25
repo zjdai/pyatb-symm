@@ -383,6 +383,8 @@ INPUT = {
         'mag'                         : [str, 1, 'auto'],
         'korder'                      : [int, 1, 2],
         'zeeman_term'                 : [str, 1, 'yes'],
+        'kp_radius'                   : [float, 1, 0.0],
+        'kp_grid'                     : [int, 1, 4],
         'data_symmetrize'             : [int, 1, 0],
         'data_symm_target_max_abs_ry' : [float, 1, 1e-8],
         'data_symm_max_iter_per_operation' : [int, 1, 5],

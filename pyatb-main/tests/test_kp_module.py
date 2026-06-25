@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -210,6 +212,239 @@ def test_calculate_kp_irreps_honors_korder_and_zeeman_toggle(load_pyatb, monkeyp
     )
 
     assert calls["orders"] == (0, 1)
+
+
+def test_kp_fit_monomial_labels_respect_max_order(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    labels = module._kp_fit_monomial_labels(max_order=2)
+
+    assert labels == [
+        "1",
+        "kx",
+        "ky",
+        "kz",
+        "kx^2",
+        "kx*ky",
+        "kx*kz",
+        "ky^2",
+        "ky*kz",
+        "kz^2",
+    ]
+    assert "kx^3" not in labels
+
+
+def test_block_matrix_rows_preserve_empty_block_widths(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    matrix = np.zeros((4, 4), dtype=complex)
+    matrix[0, 0] = 1.0
+    matrix[1, 1] = 2.0
+    matrix[2:, 2:] = np.asarray([[3.0, 4.0], [5.0, 6.0]], dtype=complex)
+
+    rows = module._format_block_matrix_rows(module._complex_matrix_to_pairs(matrix), [1, 1, 2])
+
+    assert rows[0].index("(   3.000") == rows[1].index("(   5.000")
+
+
+def test_representation_matrix_output_uses_raw_numerical_matrices(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    raw_unitary = [[[2.0, 0.0]]]
+    raw_antiunitary = [[[3.0, 0.0]]]
+    standard = [[[1.0, 0.0]]]
+    analysis = {
+        "target_corep_labels": ["GM1"],
+        "target_corep_dimensions": [1],
+        "operation_indices": [1],
+        "antiunitary_operation_indices": [1],
+        "numeric_representation_matrices": [raw_unitary],
+        "spgrep_representation_matrices": [standard],
+        "numeric_antiunitary_representation_matrices": [raw_antiunitary],
+        "spgrep_antiunitary_representation_matrices": [standard],
+        "schur_alignment": {
+            "unitary_numeric_to_standard": standard,
+            "transformed_numeric_matrices": [standard],
+            "transformed_numeric_antiunitary_matrices": [standard],
+            "unitary_max_abs_representation_difference": 0.0,
+            "antiunitary_max_abs_representation_difference": 0.0,
+        },
+    }
+
+    text = "\n".join(
+        module._format_linear_representation_matrix_comparison_analyses(
+            [analysis],
+            star_line="***",
+        )
+    )
+
+    assert "  Numerical basis:\n  (   2.000  +0.000i)" in text
+    assert "  Numerical basis after transform:\n  (   1.000  +0.000i)" in text
+    assert "  Numerical basis:\n  (   3.000  +0.000i)" in text
+    assert text.count("  Numerical basis after transform:\n  (   1.000  +0.000i)") == 2
+
+
+def test_character_style_operations_prefers_full_group_records(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    spgrep_info = {
+        "operations": [
+            {
+                "operation_index": 1,
+                "spgrep_operation_index": 1,
+                "rotation": np.eye(3, dtype=int).tolist(),
+                "translation": [0.0, 0.0, 0.0],
+                "time_reversal": False,
+                "anti_linear": False,
+                "in_little_group": True,
+            }
+        ],
+        "antiunitary_operations": [],
+        "all_operations": [
+            {
+                "operation_index": 1,
+                "spgrep_operation_index": 1,
+                "rotation": np.eye(3, dtype=int).tolist(),
+                "translation": [0.0, 0.0, 0.0],
+                "time_reversal": False,
+                "anti_linear": False,
+                "in_little_group": True,
+            },
+            {
+                "operation_index": 2,
+                "spgrep_operation_index": 2,
+                "rotation": np.diag([1, -1, -1]).astype(int).tolist(),
+                "translation": [0.0, 0.0, 0.0],
+                "time_reversal": False,
+                "anti_linear": False,
+                "in_little_group": False,
+            },
+        ],
+        "all_antiunitary_operations": [
+            {
+                "antiunitary_operation_index": 1,
+                "operation_index": 3,
+                "spgrep_operation_index": 3,
+                "rotation": np.eye(3, dtype=int).tolist(),
+                "translation": [0.0, 0.0, 0.0],
+                "time_reversal": True,
+                "anti_linear": True,
+                "in_little_group": False,
+            }
+        ],
+    }
+
+    text = "\n".join(
+        module._format_spgrep_character_style_operations(
+            spgrep_info,
+            lattice=np.eye(3),
+            star_line=None,
+        )
+    )
+
+    assert "Number of linear operations: 2" in text
+    assert "Number of  anti-linear operations: 1" in text
+    assert "3 (E*T): unity op. times time reversal" in text
+
+
+def test_kpoint_records_use_little_group_operation_indices(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    records = [
+        {
+            "k_index": 1,
+            "k_direct": [0.0, 0.0, 0.4],
+            "k_name": "L",
+            "band_range": [77, 80],
+            "band_rep": "C3 + C4",
+        }
+    ]
+    spgrep_info = {
+        "operations": [{}, {}],
+        "antiunitary_operations": [{}, {}],
+        "little_group_linear_operation_indices": [1, 7],
+        "little_group_anti_linear_operation_indices": [14, 20],
+    }
+
+    text = "\n".join(
+        module._format_kpoint_record_lines(
+            records,
+            star_line=None,
+            spgrep_info=spgrep_info,
+        )
+    )
+
+    assert "Existence of linear operations: 1 7 " in text
+    assert "Existence of non-linear operations: 14 20 " in text
+
+
+def test_spgrep_reference_kpoint_prefers_character_k_direct(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    record = {
+        "k_direct": [0.0, 0.0, 0.4],
+        "character_k_direct": [0.0, 0.4, 0.0],
+        "phase_k_direct": [0.25, 0.25, 0.25],
+    }
+
+    kpoint = module._spgrep_reference_kpoint_from_record(record)
+
+    assert kpoint == [0.0, 0.4, 0.0]
+
+
+def test_spgrep_unitary_operation_aliases_include_display_indices(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    spgrep_info = {
+        "operations": [
+            {"operation_index": 1, "display_operation_index": 1},
+            {"operation_index": 2, "display_operation_index": 10},
+        ]
+    }
+
+    aliases = module._spgrep_unitary_operation_aliases(spgrep_info)
+
+    assert aliases[1] == [1]
+    assert aliases[2] == [2, 10]
+
+
+def test_symmetry_operation_keeps_kpoint_filters_nontrim_time_reversal(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    kpoint = np.asarray([0.0, 0.4, 0.0], dtype=float)
+
+    assert module._symmetry_operation_keeps_kpoint(np.eye(3), kpoint, antiunitary=False)
+    assert not module._symmetry_operation_keeps_kpoint(np.eye(3), kpoint, antiunitary=True)
+
+
+def test_spgrep_operations_summary_keeps_antiunitary_mapping_k_to_minus_k_for_soc(
+    load_pyatb, monkeypatch
+) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    def _spinor_irreps(lattice, rotations, translations, time_reversals=None, kpoint=None):
+        assert np.asarray(kpoint, dtype=float).tolist() == [0.0, 0.4, 0.0]
+        corep = np.asarray([[[1.0 + 0.0j]]])
+        return [corep], [1], np.ones((1, 1), dtype=complex), np.eye(2)[None, :, :], np.asarray([False]), np.asarray([0])
+
+    fake_spgrep = types.ModuleType("spgrep")
+    fake_spgrep.get_spacegroup_spinor_irreps_from_primitive_symmetry = _spinor_irreps
+    monkeypatch.setitem(sys.modules, "spgrep", fake_spgrep)
+
+    rotations = np.asarray(
+        [
+            np.eye(3, dtype=int),
+            -np.eye(3, dtype=int),
+        ],
+        dtype=int,
+    )
+    translations = np.zeros((2, 3), dtype=float)
+
+    summary = module._spgrep_operations_summary(
+        lattice=np.eye(3),
+        rotations=rotations,
+        translations=translations,
+        time_reversals=np.asarray([0, 1], dtype=int),
+        kpoint=[0.0, 0.4, 0.0],
+        spin_orbit=True,
+    )
+
+    assert summary["operations"][0]["spgrep_operation_index"] == 1
+    assert summary["antiunitary_operations"][0]["spgrep_operation_index"] == 2
+    assert summary["little_group_anti_linear_operation_indices"] == [2]
 
 
 def test_kpoint_records_use_requested_band_range_not_degeneracy_representatives(load_pyatb) -> None:
@@ -514,11 +749,15 @@ def test_calculate_kp_irreps_writes_kp_symmetry_info(load_pyatb, monkeypatch, tm
     assert "Spglib determined space group No. 166 (R-3m), Hall symbol -R 3 2\"." in model_text
     assert f"calculated stru: {active_stru}" in model_text
     assert "Symmetry operations Pi={Ri|taui+tm}   note: defined in Symmetrized Stru" in model_text
+    assert "Number of linear operations: 1" in model_text
+    assert "Number of  anti-linear operations: 0" in model_text
     assert "1 (E): unity op." in model_text
     assert "time reversal: no" in model_text
     assert "    Ri       taui   inv(Ri)   Ri(Cartesian coord)" in model_text
     assert "    Ri       taui   inv(Ri)   Ri(Cartesian coord)         spin matrix" not in model_text
     assert "  1  0  0   0.000   1  0  0   1.000  0.000  0.000" in model_text
+    assert "Existence of linear operations: 1 " in model_text
+    assert "Existence of non-linear operations:  " in model_text
     assert "Band rep:    GM8 + GM9" in model_text
     symmetry_index = model_text.index("Symmetry operations Pi={Ri|taui+tm}")
     kpoint_index = model_text.index("knum =  1    k = 0.000000 0.000000 0.000000")
@@ -621,6 +860,145 @@ def test_spgrep_unitary_operations_are_sorted_by_character_order(load_pyatb) -> 
         operation_by_source_index,
         [_CharacterOperation(op_b), _CharacterOperation(op_a)],
     ) == [1, 0]
+
+
+def test_spgrep_operations_summary_uses_spinless_unitary_subgroup_for_nsoc(load_pyatb, monkeypatch) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    calls = []
+
+    def _spinless_irreps(rotations, translations, kpoint):
+        calls.append(
+            {
+                "rotations": np.asarray(rotations, dtype=int),
+                "translations": np.asarray(translations, dtype=float),
+                "kpoint": np.asarray(kpoint, dtype=float),
+            }
+        )
+        return [np.asarray([[[1.0 + 0.0j]]])], np.asarray([0], dtype=int)
+
+    def _spinor_irreps(*args, **kwargs):
+        raise AssertionError("NSOC KP must not request spinor spgrep irreps.")
+
+    fake_spgrep = types.ModuleType("spgrep")
+    fake_spgrep.get_spacegroup_irreps_from_primitive_symmetry = _spinless_irreps
+    fake_spgrep.get_spacegroup_spinor_irreps_from_primitive_symmetry = _spinor_irreps
+    monkeypatch.setitem(sys.modules, "spgrep", fake_spgrep)
+
+    rotations = np.asarray(
+        [
+            np.eye(3, dtype=int),
+            -np.eye(3, dtype=int),
+        ],
+        dtype=int,
+    )
+    translations = np.zeros((2, 3), dtype=float)
+    summary = module._spgrep_operations_summary(
+        lattice=np.eye(3),
+        rotations=rotations,
+        translations=translations,
+        time_reversals=np.asarray([0, 1], dtype=int),
+        kpoint=[0.0, 0.0, 0.0],
+        spin_orbit=False,
+    )
+
+    assert summary["call"] == "get_spacegroup_irreps_from_primitive_symmetry(unitary subgroup)"
+    assert calls[0]["rotations"].shape == (1, 3, 3)
+    assert calls[0]["rotations"][0].tolist() == np.eye(3, dtype=int).tolist()
+    assert summary["operations"][0]["time_reversal"] is False
+    assert summary["antiunitary_operations"][0]["time_reversal"] is True
+    assert summary["antiunitary_operations"][0]["anti_linear"] is True
+    assert summary["antiunitary_operations"][0]["spgrep_operation_index"] == 2
+    assert summary["coreps"][0]["operation_matrices"][0]["operation_index"] == 1
+
+
+def test_spgrep_operations_summary_writes_spinless_pure_time_reversal_as_complex_conjugation(
+    load_pyatb, monkeypatch
+) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    def _spinless_irreps(rotations, translations, kpoint):
+        return [np.asarray([[[1.0 + 0.0j]]])], np.asarray([0], dtype=int)
+
+    fake_spgrep = types.ModuleType("spgrep")
+    fake_spgrep.get_spacegroup_irreps_from_primitive_symmetry = _spinless_irreps
+    monkeypatch.setitem(sys.modules, "spgrep", fake_spgrep)
+
+    rotations = np.asarray([np.eye(3, dtype=int), np.eye(3, dtype=int)], dtype=int)
+    translations = np.zeros((2, 3), dtype=float)
+    summary = module._spgrep_operations_summary(
+        lattice=np.eye(3),
+        rotations=rotations,
+        translations=translations,
+        time_reversals=np.asarray([0, 1], dtype=int),
+        kpoint=[0.0, 0.0, 0.0],
+        spin_orbit=False,
+    )
+
+    assert summary["antiunitary_operations"][0]["spgrep_operation_index"] == 2
+    antiunitary_matrices = summary["coreps"][0]["antiunitary_operation_matrices"]
+    assert antiunitary_matrices[0]["antiunitary_operation_index"] == 1
+    assert antiunitary_matrices[0]["spgrep_operation_index"] == 2
+    assert antiunitary_matrices[0]["matrix"] == [[[1.0, 0.0]]]
+
+
+def test_spinless_time_reversal_sewing_matrix_handles_complex_irrep_basis(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    omega = np.exp(2.0j * np.pi / 3.0)
+    c3 = np.diag([omega, omega.conj()])
+    c2 = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    matrices = [
+        np.eye(2, dtype=complex),
+        c3,
+        c3 @ c3,
+        c2,
+        c3 @ c2,
+        c3 @ c3 @ c2,
+    ]
+
+    sewing = module._spinless_time_reversal_sewing_matrix(matrices)
+
+    for matrix in matrices:
+        assert np.allclose(matrix @ sewing, sewing @ matrix.conj(), atol=1.0e-10)
+    assert np.allclose(np.diag(sewing), 0.0, atol=1.0e-10)
+    assert np.allclose(np.abs(sewing[0, 1]), 1.0, atol=1.0e-10)
+    assert np.allclose(np.abs(sewing[1, 0]), 1.0, atol=1.0e-10)
+    assert not np.allclose(sewing, np.eye(2), atol=1.0e-10)
+
+
+def test_spgrep_operations_summary_keeps_only_little_group_unitary_operations(load_pyatb, monkeypatch) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    def _spinless_irreps(rotations, translations, kpoint):
+        return [np.asarray([[[1.0 + 0.0j]]])], np.asarray([1], dtype=int)
+
+    fake_spgrep = types.ModuleType("spgrep")
+    fake_spgrep.get_spacegroup_irreps_from_primitive_symmetry = _spinless_irreps
+    monkeypatch.setitem(sys.modules, "spgrep", fake_spgrep)
+
+    rotations = np.asarray(
+        [
+            np.eye(3, dtype=int),
+            [[-1, 0, 0], [0, -1, 0], [0, 0, 1]],
+            -np.eye(3, dtype=int),
+        ],
+        dtype=int,
+    )
+    translations = np.zeros((3, 3), dtype=float)
+    summary = module._spgrep_operations_summary(
+        lattice=np.eye(3),
+        rotations=rotations,
+        translations=translations,
+        time_reversals=None,
+        kpoint=[0.5, 0.0, 0.0],
+        spin_orbit=False,
+    )
+
+    assert [operation["spgrep_operation_index"] for operation in summary["operations"]] == [2]
+    assert summary["operations"][0]["operation_index"] == 1
+    assert summary["operations"][0]["in_little_group"] is True
+    assert summary["coreps"][0]["operation_matrices"][0]["operation_index"] == 1
+    assert summary["coreps"][0]["operation_matrices"][0]["spgrep_operation_index"] == 2
 
 
 def test_spgrep_trace_table_checks_character_table(load_pyatb) -> None:
@@ -821,6 +1199,8 @@ def test_spgrep_character_style_operations_include_time_reversal_flag(load_pyatb
     )
 
     assert "Symmetry operations Pi={Ri|taui+tm}   note: defined in Symmetrized Stru" in text
+    assert "Number of linear operations: 1" in text
+    assert "Number of  anti-linear operations: 1" in text
     assert "1 (E): unity op." in text
     assert "2 (E*T): unity op. times time reversal" in text
     assert text.index("main axes: ( 1.000,  0.000,  0.000)") < text.index("time reversal: no")
@@ -1287,6 +1667,76 @@ def test_schur_zeeman_fit_formatter_outputs_transformed_numeric_and_fit_side_by_
     assert "difference matrix:" not in text
 
 
+def test_kp_energy_error_analysis_compares_fitted_kp_to_direct_bands(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    class _FakeSolver:
+        def diago_H_eigenvaluesOnly_range(self, k_direct, lower_band, upper_band):
+            values = []
+            for kx, ky, kz in np.asarray(k_direct, dtype=float):
+                values.append([1.0 + kx + 0.01, 2.0 + 2.0 * ky - kz - 0.02])
+            return np.asarray(values, dtype=float)
+
+    class _FakeTB:
+        max_kpoint_num = 2
+
+        def __init__(self):
+            self.tb_solver = _FakeSolver()
+
+        def direct_to_cartesian_kspace(self, k_direct):
+            return np.asarray(k_direct, dtype=float)
+
+        def cartesian_to_direct_kspace(self, k_cart):
+            return np.asarray(k_cart, dtype=float)
+
+    def _matrix_pairs(matrix):
+        return module._complex_matrix_to_pairs(np.asarray(matrix, dtype=complex))
+
+    fit = {
+        "selection_index": 1,
+        "monomial_basis": ["1", "kx", "ky", "kz"],
+        "records": [
+            {"monomial": "1", "formal_fit_matrix": _matrix_pairs([[1.0, 0.0], [0.0, 2.0]])},
+            {"monomial": "kx", "formal_fit_matrix": _matrix_pairs([[1.0, 0.0], [0.0, 0.0]])},
+            {"monomial": "ky", "formal_fit_matrix": _matrix_pairs([[0.0, 0.0], [0.0, 2.0]])},
+            {"monomial": "kz", "formal_fit_matrix": _matrix_pairs([[0.0, 0.0], [0.0, -1.0]])},
+        ],
+    }
+    numeric = {
+        "selection_index": 1,
+        "reference_k_direct": [0.0, 0.0, 0.0],
+        "reference_k_cartesian": [0.0, 0.0, 0.0],
+        "band_range": [3, 4],
+        "constant_energies_eV": [1.0, 2.0],
+    }
+
+    analyses = module._kp_energy_error_analyses(
+        _FakeTB(),
+        [fit],
+        [numeric],
+        radius=0.1,
+        grid=2,
+    )
+
+    assert len(analyses) == 1
+    analysis = analyses[0]
+    assert analysis["selection_index"] == 1
+    assert analysis["point_count"] == 8
+    assert analysis["band_count"] == 2
+    assert analysis["max_abs_error_eV"] == pytest.approx(0.02)
+    assert analysis["mean_abs_error_eV"] == pytest.approx(0.015)
+    assert analysis["rms_error_eV"] == pytest.approx((0.5 * (0.01**2 + 0.02**2)) ** 0.5)
+    assert analysis["direct_diagonalization_band_range"] == [3, 4]
+
+    text = "\n".join(module._format_kp_energy_error_analyses(analyses, star_line="***"))
+    assert "kp band test:" in text
+    assert "MP grid around k0: 2 2 2" in text
+    assert "Radius: 0.100000 A^-1" in text
+    assert "Band max error:  2.000000000000e-02 eV" in text
+    assert "Band mean error: 1.500000000000e-02 eV" in text
+    assert "worst_q_cartesian" not in text
+
+
 def test_summary_formatter_expands_kp_and_zeeman_hamiltonians_with_ordered_parameter_names(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.kp")
 
@@ -1331,6 +1781,7 @@ def test_summary_formatter_expands_kp_and_zeeman_hamiltonians_with_ordered_param
     final_zeeman = [
         {
             "order": 1,
+            "time_reversal_applied": False,
             "terms": [
                 {
                     "label": "Z1_1",
@@ -1394,6 +1845,7 @@ def test_spin_pauli_target_matrices_use_orbital_major_soc_basis(load_pyatb) -> N
 
 def test_numeric_lowdin_kp_reuses_character_eigenvectors(load_pyatb) -> None:
     module = load_pyatb("pyatb.symmetry.kp")
+    calls: dict[str, object] = {}
 
     velocity_basis = np.zeros((1, 3, 2, 2), dtype=complex)
     velocity_basis[0, 0, 0, 0] = 0.25
@@ -1404,7 +1856,8 @@ def test_numeric_lowdin_kp_reuses_character_eigenvectors(load_pyatb) -> None:
         def diago_H(self, _kpoint):
             raise AssertionError("Lowdin must reuse CHARACTER eigenvectors")
 
-        def get_velocity_basis_k(self, _kpoint):
+        def get_velocity_basis_k(self, kpoint):
+            calls["velocity_kpoint"] = np.asarray(kpoint, dtype=float).tolist()
             return velocity_basis
 
     class _TB:
@@ -1416,9 +1869,17 @@ def test_numeric_lowdin_kp_reuses_character_eigenvectors(load_pyatb) -> None:
         [
             {
                 "selection_index": 1,
-                "kpoint": [0.0, 0.0, 0.0],
+                "kpoint": [0.0, 0.0, 0.4],
                 "band": [1, 1],
                 "character_payload": {
+                    "analysis_result": {
+                        "kpoint_records": [
+                            {
+                                "k_direct": [0.0, 0.0, 0.4],
+                                "character_k_direct": [0.0, 0.4, 0.0],
+                            }
+                        ]
+                    },
                     "character_rows": [
                         {
                             "target_band_range": [1, 1],
@@ -1433,6 +1894,8 @@ def test_numeric_lowdin_kp_reuses_character_eigenvectors(load_pyatb) -> None:
     )
 
     assert len(analyses) == 1
+    assert calls["velocity_kpoint"] == [[0.0, 0.4, 0.0]]
+    assert analyses[0]["reference_k_direct"] == [0.0, 0.4, 0.0]
     assert analyses[0]["basis_convention"] == "CHARACTER eigenvector basis at the reference k point"
     linear = np.asarray(module._complex_array_from_pairs(analyses[0]["linear_matrices"][0]["matrix"]))
     assert linear[0, 0] == pytest.approx(0.25)
@@ -1558,6 +2021,192 @@ def test_schur_intertwiner_aligns_equivalent_representations(load_pyatb) -> None
     assert alignment["max_abs_representation_difference"] <= 1.0e-12
     for num, ref in zip(numeric, std):
         assert np.allclose(transform.conj().T @ num @ transform, ref, atol=1.0e-12, rtol=0.0)
+
+
+def test_schur_alignment_uses_antiunitary_projection_for_repeated_corep_gauge(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    identity = np.eye(2, dtype=complex)
+    swap = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+
+    alignment = module._schur_representation_alignment(
+        operation_indices=[1],
+        numeric_matrices=[identity],
+        standard_matrices=[identity],
+        antiunitary_operation_indices=[1],
+        numeric_antiunitary_matrices=[identity],
+        standard_antiunitary_matrices=[swap],
+        standard_block_dimensions=[1, 1],
+    )
+    transform = np.asarray(module._complex_array_from_pairs(alignment["unitary_numeric_to_standard"]))
+
+    assert alignment["antiunitary_max_abs_representation_difference"] <= 1.0e-12
+    assert np.allclose(transform.conj().T @ identity @ transform, identity, atol=1.0e-12, rtol=0.0)
+    assert np.allclose(transform.conj().T @ identity @ transform.conj(), swap, atol=1.0e-12, rtol=0.0)
+
+
+def test_representation_alignment_uses_gT_antiunitary_operations(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    identity = np.eye(2, dtype=complex)
+    unitary_g = np.asarray([[1.0j, 0.0], [0.0, -1.0j]], dtype=complex)
+    anti_reference = np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    anti_gT = unitary_g @ anti_reference
+
+    info = {
+        "character_table": {
+            "irreps": [
+                {
+                    "label": "A",
+                    "characters": module._complex_vector_to_pairs([2.0, 0.0]),
+                }
+            ]
+        },
+        "spgrep_operations": {
+            "operations": [
+                {
+                    "operation_index": 1,
+                    "display_operation_index": 1,
+                    "spgrep_operation_index": 1,
+                },
+                {
+                    "operation_index": 2,
+                    "display_operation_index": 2,
+                    "spgrep_operation_index": 2,
+                },
+            ],
+            "antiunitary_operations": [
+                {
+                    "antiunitary_operation_index": 1,
+                    "display_operation_index": 3,
+                    "spgrep_operation_index": 3,
+                    "reference_antiunitary_operation_index": 1,
+                    "left_unitary_operation_index": 1,
+                },
+                {
+                    "antiunitary_operation_index": 2,
+                    "display_operation_index": 4,
+                    "spgrep_operation_index": 4,
+                    "reference_antiunitary_operation_index": 1,
+                    "left_unitary_operation_index": 2,
+                },
+            ],
+            "coreps": [
+                {
+                    "corep_index": 1,
+                    "operation_matrices": [
+                        {"operation_index": 1, "matrix": module._complex_matrix_to_pairs(identity)},
+                        {"operation_index": 2, "matrix": module._complex_matrix_to_pairs(unitary_g)},
+                    ],
+                    "antiunitary_operation_matrices": [
+                        {
+                            "antiunitary_operation_index": 1,
+                            "matrix": module._complex_matrix_to_pairs(anti_reference),
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+    results = [
+        {
+            "selection_index": 1,
+            "band": [1, 2],
+            "rows": [{"irrep": "A"}],
+            "character_payload": {
+                "character_rows": [
+                    {
+                        "target_band_range": [1, 2],
+                        "target_operation_indices": [1, 2],
+                        "target_representation_matrices": [identity, unitary_g],
+                        "target_antiunitary_spgrep_operation_indices": [3, 4],
+                        "target_antiunitary_representation_matrices": [anti_reference, anti_gT],
+                    }
+                ]
+            },
+        }
+    ]
+
+    analyses = module._representation_alignment_analyses_for_results(info, results)
+
+    assert len(analyses) == 1
+    analysis = analyses[0]
+    assert analysis["antiunitary_operation_indices"] == [1]
+    assert analysis["antiunitary_display_operation_indices"] == [3]
+    standard = [
+        np.asarray(module._complex_array_from_pairs(matrix), dtype=complex)
+        for matrix in analysis["spgrep_antiunitary_representation_matrices"]
+    ]
+    assert np.allclose(standard[0], anti_reference, atol=1.0e-12, rtol=0.0)
+    assert analysis["schur_alignment"]["antiunitary_projector_applied"] is False
+    assert analysis["schur_alignment"]["antiunitary_max_abs_representation_difference"] <= 1.0e-12
+
+    standard_by_operation = {1: identity, 2: unitary_g}
+    assert np.allclose(
+        module._target_antiunitary_matrix_for_operation(
+            info["spgrep_operations"],
+            [1],
+            info["spgrep_operations"]["antiunitary_operations"][1],
+            standard_by_operation,
+        ),
+        anti_gT,
+        atol=1.0e-12,
+        rtol=0.0,
+    )
+
+
+def test_antiunitary_numeric_matrix_uses_target_kpoint_phase(load_pyatb, monkeypatch) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    calls = []
+
+    monkeypatch.setattr(
+        module.Character,
+        "_time_reversal_basis_matrix",
+        staticmethod(lambda _tb: np.eye(1, dtype=complex)),
+    )
+
+    def _fake_build_dk_matrix(_tb, k_direct, _operation, include_cell_shift_phase=True, map_tol=1.0e-6):
+        del include_cell_shift_phase, map_tol
+        k_direct = np.asarray(k_direct, dtype=float)
+        calls.append(k_direct)
+        value = 1.0 if np.allclose(k_direct, [0.0, 0.4, 0.0], atol=1.0e-12) else 0.0
+        return np.asarray([[value]], dtype=complex)
+
+    monkeypatch.setattr(module, "build_dk_matrix", _fake_build_dk_matrix)
+
+    info = {
+        "lattice_vectors": np.eye(3).tolist(),
+        "spgrep_operations": {
+            "antiunitary_operations": [
+                {
+                    "spgrep_operation_index": 3,
+                    "rotation": np.eye(3, dtype=int).tolist(),
+                    "translation": [0.0, 0.0, 0.0],
+                }
+            ]
+        },
+    }
+    result = {
+        "character_payload": {
+            "analysis_result": {
+                "kpoint_records": [
+                    {
+                        "character_k_direct": [0.0, 0.4, 0.0],
+                    }
+                ]
+            }
+        }
+    }
+    row = {
+        "target_eigenvectors_full": np.eye(1, dtype=complex),
+        "target_overlap": np.eye(1, dtype=complex),
+        "target_band_range": [1, 1],
+    }
+
+    matrices = module._antiunitary_numeric_matrices_from_row(info, result, row, tb=object())
+
+    assert len(calls) == 1
+    assert np.allclose(calls[0], [0.0, 0.4, 0.0], atol=1.0e-12, rtol=0.0)
+    assert matrices[3][0, 0] == pytest.approx(1.0)
 
 
 def test_spgrep_antiunitary_irrep_matrices_are_formatted(load_pyatb) -> None:
@@ -2107,7 +2756,8 @@ def test_zeeman_form_solution_formatter_includes_time_reversal_projected_terms(l
     assert "B irrep GM2+ ------> Hermitian irrep GM2+" in text
     assert "Candidate_count = 1" in text
     assert "H1_GM2+_1 = 1 * diag(1) * Bz" in text
-    assert "Time reversal applied: yes" in text
+    assert "Anti-linear operation applied: no" in text
+    assert "Time reversal applied" not in text
     assert "Z1_1 = 1 * diag(1) * Bz" in text
     assert "rank =" not in text
 
@@ -2172,7 +2822,7 @@ def test_kp_form_solutions_pair_conjugate_irreps(load_pyatb) -> None:
     assert "k irrep A ------> Hermitian irrep A" in text
     assert "k irrep B ------> Hermitian irrep B" in text
     assert "Candidate_count =" in text
-    assert "Time reversal applied: no" in text
+    assert "Anti-linear operation applied: no" in text
     assert "rank =" not in text
     assert "* diag(1) * kx" in text or "* diag(2) * kx" in text
     assert "* re(1,2) * ky" in text or "* im(1,2) * ky" in text
@@ -2191,8 +2841,202 @@ def test_kp_form_solutions_pair_conjugate_irreps(load_pyatb) -> None:
             ],
         )
     )
-    assert "Time reversal applied: yes" in tr_text
+    assert "Anti-linear operation applied: yes" in tr_text
     assert "K1_1 =" in tr_text
+
+
+def test_final_kp_model_uses_available_antiunitary_operation_for_constraint(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+
+    operator_analysis = {
+        "dimension": 1,
+        "target_label": "A",
+        "target_corep_indices": [1],
+        "hermitian_basis": [{"label": "diag(1)"}],
+    }
+    form_solutions = [
+        {
+            "order": 1,
+            "irrep_pair_solutions": [
+                {
+                    "k_irrep_label": "A",
+                    "hermitian_irrep_label": "A",
+                    "terms": [
+                        {
+                            "label": "H1_A_1",
+                            "linear_combination": [
+                                {
+                                    "hermitian_basis_index": 1,
+                                    "hermitian_basis_label": "diag(1)",
+                                    "k_basis_index": 1,
+                                    "k_basis_label": "kx",
+                                    "coefficient": [1.0, 0.0],
+                                }
+                            ],
+                        },
+                        {
+                            "label": "H1_A_2",
+                            "linear_combination": [
+                                {
+                                    "hermitian_basis_index": 1,
+                                    "hermitian_basis_label": "diag(1)",
+                                    "k_basis_index": 2,
+                                    "k_basis_label": "ky",
+                                    "coefficient": [1.0, 0.0],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    info = {
+        "lattice_vectors": np.eye(3).tolist(),
+        "spgrep_operations": {
+            "coreps": [
+                {
+                    "corep_index": 1,
+                    "antiunitary_operation_matrices": [
+                        {
+                            "antiunitary_operation_index": 1,
+                            "matrix": module._complex_matrix_to_pairs(np.eye(1, dtype=complex)),
+                        }
+                    ],
+                }
+            ],
+            "antiunitary_operations": [
+                {
+                    "antiunitary_operation_index": 1,
+                    "display_operation_index": 9,
+                    "spgrep_operation_index": 9,
+                    "time_reversal": True,
+                    "anti_linear": True,
+                    "rotation": [[-1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                    "translation": [0.0, 0.0, 0.0],
+                }
+            ],
+        },
+    }
+
+    final = module._final_kp_model_analyses(
+        info,
+        [operator_analysis],
+        form_solutions,
+    )
+
+    assert len(final) == 1
+    assert final[0]["anti_linear_operation_applied"] is True
+    assert final[0]["anti_linear_operator_index"] == 9
+    assert final[0]["antiunitary_operation_index"] == 1
+    assert final[0]["spgrep_operation_index"] == 9
+    assert [term["label"] for term in final[0]["terms"]] == ["K1_1"]
+    assert final[0]["terms"][0]["linear_combination"][0]["k_basis_label"] == "kx"
+
+    text = "\n".join(
+        module._format_kp_form_solution_analyses(
+            form_solutions,
+            star_line="***",
+            final_kp_model_analyses=final,
+        )
+    )
+    assert "Anti-linear operation applied: yes" in text
+    assert "anti-linear operator index: 9" in text
+    assert "antiunitary operation index:" not in text
+    assert "spgrep operation index:" not in text
+    assert "K1_1 = 1 * diag(1) * kx" in text
+    assert "K1_2 = 1 * diag(1) * ky" not in text
+
+
+def test_anti_linear_constraint_check_uses_non_pure_time_reversal_operation(load_pyatb) -> None:
+    module = load_pyatb("pyatb.symmetry.kp")
+    operator_analysis = {
+        "dimension": 1,
+        "target_label": "A",
+        "target_corep_indices": [1],
+    }
+    form_solutions = [
+        {
+            "order": 1,
+            "irrep_pair_solutions": [
+                {
+                    "k_irrep_label": "A",
+                    "hermitian_irrep_label": "A",
+                    "terms": [
+                        {
+                            "label": "H1_A_kx",
+                            "linear_combination": [
+                                {
+                                    "hermitian_basis_index": 1,
+                                    "hermitian_basis_label": "diag(1)",
+                                    "k_basis_index": 1,
+                                    "k_basis_label": "kx",
+                                    "coefficient": [1.0, 0.0],
+                                }
+                            ],
+                        },
+                        {
+                            "label": "H1_A_ky",
+                            "linear_combination": [
+                                {
+                                    "hermitian_basis_index": 1,
+                                    "hermitian_basis_label": "diag(1)",
+                                    "k_basis_index": 2,
+                                    "k_basis_label": "ky",
+                                    "coefficient": [1.0, 0.0],
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    info = {
+        "lattice_vectors": np.eye(3).tolist(),
+        "spgrep_operations": {
+            "coreps": [
+                {
+                    "corep_index": 1,
+                    "operation_matrices": [
+                        {
+                            "operation_index": 1,
+                            "matrix": module._complex_matrix_to_pairs(np.eye(1, dtype=complex)),
+                        }
+                    ],
+                    "antiunitary_operation_matrices": [
+                        {
+                            "antiunitary_operation_index": 1,
+                            "matrix": module._complex_matrix_to_pairs(np.eye(1, dtype=complex)),
+                        }
+                    ],
+                }
+            ],
+            "antiunitary_operations": [
+                {
+                    "antiunitary_operation_index": 1,
+                    "display_operation_index": 9,
+                    "spgrep_operation_index": 9,
+                    "time_reversal": True,
+                    "anti_linear": True,
+                    "rotation": [[-1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                    "translation": [0.0, 0.0, 0.0],
+                }
+            ],
+        },
+    }
+
+    analyses = module._time_reversal_constraint_analyses(
+        info,
+        [operator_analysis],
+        form_solutions,
+    )
+
+    assert len(analyses) == 1
+    assert analyses[0]["anti_linear_operator_index"] == 9
+    checks = {item["label"]: item for item in analyses[0]["term_checks"]}
+    assert checks["H1_A_kx"]["status"] == "ok"
+    assert checks["H1_A_ky"]["status"] == "violation"
 
 
 def test_kp_form_solution_formatter_uses_final_time_reversal_basis_by_block(load_pyatb) -> None:
@@ -2277,6 +3121,7 @@ def test_kp_form_solution_formatter_uses_final_time_reversal_basis_by_block(load
 
     assert "k irrep GM1+ ------> Hermitian irrep GM1+" in text
     assert "K2_1 = 1 * diag(1) * kz^2" in text
+    assert "Anti-linear operation applied: no" in text
     assert "k irrep GM3+ ------> Hermitian irrep GM3+" in text
     assert "Candidate_count = 2" in text
     assert "K2: none" in text
@@ -2577,7 +3422,7 @@ def test_time_reversal_constraint_flags_odd_spinless_k_terms(load_pyatb) -> None
             star_line="***",
         )
     )
-    assert "Time-reversal constraint check for k.p invariant terms" in text
+    assert "Anti-linear constraint check for k.p invariant terms" in text
     assert "H1_B_1   order = 1   parity = -1   status = violation" in text
     assert "H2_A_1   order = 2   parity = 1   status = ok" in text
 
@@ -2716,7 +3561,7 @@ def test_final_kp_model_uses_real_tr_even_linear_combinations(load_pyatb) -> Non
     assert by_order[2]["terms"][0]["linear_combination"][0]["coefficient"][1] == pytest.approx(0.0)
 
     text = "\n".join(module._format_final_kp_model_analyses(analyses, star_line="***"))
-    assert "Final real Hermitian time-reversal-even k.p basis" in text
+    assert "Final real Hermitian anti-linear-even k.p basis" in text
     assert "order = 1" in text
     assert "tr_even_rank = 1" in text
     assert "K1_1" in text

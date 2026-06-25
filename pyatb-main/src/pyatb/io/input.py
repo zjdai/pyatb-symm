@@ -401,6 +401,12 @@ def check():
 
         kp_parameters['zeeman_term'] = parse_kp_zeeman_term(kp_parameters['zeeman_term'])
 
+        if float(kp_parameters['kp_radius']) < 0:
+            raise ValueError('KP.kp_radius must be zero or a positive float.')
+
+        if int(kp_parameters['kp_grid']) <= 0:
+            raise ValueError('KP.kp_grid must be a positive integer.')
+
         if kp_parameters['mag_tag'] not in [0, 1]:
             raise ValueError('KP.mag_tag must be 0 or 1.')
 

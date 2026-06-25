@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -13,86 +12,22 @@ from pyatb import OUTPUT_PATH, RANK, RUNNING_LOG
 from pyatb.io.abacus_read_xr import abacus_readHR, abacus_readSR, abacus_readrR
 from pyatb.symmetry.character import Character
 from pyatb.symmetry.character_core import _resolved_irrep_character_slice
-from pyatb.symmetry.Dk_matrix import axis_angle_from_cartesian_rotation, spin_half_matrix_from_cartesian_rotation
+from pyatb.symmetry.Dk_matrix import (
+    axis_angle_from_cartesian_rotation,
+    build_dk_matrix,
+    spin_half_matrix_from_axis_angle,
+    spin_half_matrix_from_cartesian_rotation,
+)
 from pyatb.tb.tb import tb as TBModel
 
-
-KP_FREE_ELECTRON_COEFFICIENT_EV_A2 = 3.80998212
-KP_DIRECTIONS = ("kx", "ky", "kz")
-ZEEMAN_FIELD_DIRECTIONS = ("Bx", "By", "Bz")
-
-
-@dataclass(frozen=True)
-class KPointBandSelection:
-    """One kp target: a direct-coordinate k point and its band range."""
-
-    kpoint: Sequence[float]
-    band: Sequence[int]
-    label: str | None = None
-    occ_band: int | None = None
-
-    def __post_init__(self) -> None:
-        kpoint = tuple(float(value) for value in self.kpoint)
-        if len(kpoint) != 3:
-            raise ValueError("kp selection kpoint must contain exactly three direct coordinates.")
-
-        band = tuple(int(value) for value in self.band)
-        if len(band) != 2 or band[0] <= 0 or band[1] <= 0 or band[0] > band[1]:
-            raise ValueError("kp selection band must be two positive integers with band[0] <= band[1].")
-
-        if self.occ_band is not None and int(self.occ_band) <= 0:
-            raise ValueError("kp selection occ_band must be a positive integer.")
-
-        object.__setattr__(self, "kpoint", kpoint)
-        object.__setattr__(self, "band", band)
-        if self.occ_band is not None:
-            object.__setattr__(self, "occ_band", int(self.occ_band))
-
-    @property
-    def band_start(self) -> int:
-        return int(self.band[0])
-
-    @property
-    def band_stop(self) -> int:
-        return int(self.band[1])
-
-
-def _coerce_selection(selection: KPointBandSelection | Mapping[str, Any]) -> KPointBandSelection:
-    if isinstance(selection, KPointBandSelection):
-        return selection
-    if isinstance(selection, Mapping):
-        try:
-            kpoint = selection["kpoint"]
-            band = selection["band"]
-        except KeyError as exc:
-            raise ValueError("kp selection mapping must contain 'kpoint' and 'band'.") from exc
-        return KPointBandSelection(
-            kpoint=kpoint,
-            band=band,
-            label=selection.get("label"),
-            occ_band=selection.get("occ_band"),
-        )
-    raise TypeError("kp selection must be a KPointBandSelection or a mapping.")
-
-
-def _normalize_selections(
-    selections: Sequence[KPointBandSelection | Mapping[str, Any]],
-) -> list[KPointBandSelection]:
-    normalized = [_coerce_selection(selection) for selection in selections]
-    if not normalized:
-        raise ValueError("kp calculation requires at least one kpoint/band selection.")
-    return normalized
-
-
-def _kp_zeeman_enabled(value: str | bool | int) -> bool:
-    if isinstance(value, bool):
-        return bool(value)
-    text = str(value).strip().lower()
-    if text in {"yes", "y", "true", "1"}:
-        return True
-    if text in {"no", "n", "false", "0"}:
-        return False
-    raise ValueError("KP.zeeman_term must be yes or no.")
+from pyatb.symmetry.kp.types import (
+    KP_DIRECTIONS,
+    KP_FREE_ELECTRON_COEFFICIENT_EV_A2,
+    ZEEMAN_FIELD_DIRECTIONS,
+    KPointBandSelection,
+    _kp_zeeman_enabled,
+    _normalize_selections,
+)
 
 
 def _parse_band_irrep_file(path: Path) -> list[dict[str, Any]]:
@@ -367,6 +302,38 @@ def _kp_model_kpoint_records(results: Sequence[Mapping[str, Any]]) -> list[dict[
             }
         )
     return records
+
+
+def _spgrep_reference_kpoint_from_record(record: Mapping[str, Any]) -> list[float]:
+    return _vector3(record.get("character_k_direct", record.get("k_direct")), [0.0, 0.0, 0.0])
+
+
+def _symmetry_operation_keeps_kpoint(
+    rotation: Sequence[Sequence[float]] | np.ndarray,
+    kpoint: Sequence[float] | np.ndarray,
+    *,
+    antiunitary: bool,
+    tol: float = 1.0e-6,
+) -> bool:
+    try:
+        reciprocal_rotation = np.linalg.inv(np.asarray(rotation, dtype=float))
+    except np.linalg.LinAlgError:
+        return False
+    kpoint_array = np.asarray(kpoint, dtype=float).reshape(3)
+    mapped = reciprocal_rotation @ kpoint_array
+    if antiunitary:
+        mapped = -mapped
+    diff = mapped - kpoint_array
+    return bool(np.allclose(diff - np.rint(diff), 0.0, atol=tol, rtol=0.0))
+
+
+def _lowdin_reference_kpoint_from_result(result: Mapping[str, Any]) -> list[float]:
+    payload = result.get("character_payload")
+    if isinstance(payload, Mapping):
+        records = list(payload.get("analysis_result", {}).get("kpoint_records") or [])
+        if records:
+            return _spgrep_reference_kpoint_from_record(records[0])
+    return _vector3(result.get("kpoint"), [0.0, 0.0, 0.0])
 
 
 def _target_indices_from_band_range(band_range: Sequence[int]) -> np.ndarray:
@@ -795,7 +762,7 @@ def _lowdin_tb_from_character_payload(
         return reference_tb
 
     lattice_constant = float(payload.get("lattice_constant", getattr(reference_tb, "lattice_constant", 1.0)))
-    lattice_vector = np.asarray(payload.get("lattice_vector", getattr(reference_tb, "lattice_vector")), dtype=float)
+    lattice_vector = np.asarray(payload.get("lattice_vector", getattr(reference_tb, "lattice_vector", np.eye(3))), dtype=float)
     max_kpoint_num = getattr(reference_tb, "max_kpoint_num", None)
     active_tb = TBModel(
         int(reference_tb.nspin),
@@ -820,6 +787,49 @@ def _lowdin_tb_from_character_payload(
     return active_tb
 
 
+def _active_hs_tb_from_character_payload(
+    reference_tb,
+    payload: Mapping[str, Any] | None,
+    *,
+    HR_unit: str | None = None,
+):
+    if not isinstance(payload, Mapping):
+        return reference_tb
+
+    active_hr_path = payload.get("active_hr_path")
+    active_sr_path = payload.get("active_sr_path")
+    active_stru_path = payload.get("active_stru_path")
+    if not active_hr_path or not active_sr_path or not active_stru_path:
+        return reference_tb
+    if not Path(active_hr_path).exists() or not Path(active_sr_path).exists() or not Path(active_stru_path).exists():
+        return reference_tb
+
+    if int(getattr(reference_tb, "nspin", 0)) == 2:
+        return reference_tb
+
+    lattice_constant = float(payload.get("lattice_constant", getattr(reference_tb, "lattice_constant", 1.0)))
+    lattice_vector = np.asarray(payload.get("lattice_vector", getattr(reference_tb, "lattice_vector", np.eye(3))), dtype=float)
+    max_kpoint_num = getattr(reference_tb, "max_kpoint_num", None)
+    active_tb = TBModel(
+        int(reference_tb.nspin),
+        lattice_constant,
+        lattice_vector,
+        max_kpoint_num,
+    )
+    active_hr = abacus_readHR(int(reference_tb.nspin), str(active_hr_path), str(payload.get("HR_unit", HR_unit or "Ry")))
+    active_sr = abacus_readSR(int(reference_tb.nspin), str(active_sr_path))
+    is_sparse = bool(getattr(reference_tb, "HSR_iSsparse", False))
+    active_tb.set_solver_HSR(active_hr, active_sr, is_sparse)
+    active_tb.read_stru(str(active_stru_path), need_orb=True)
+    active_tb.kp_alignment_data_convention = "CHARACTER active symmetrized H/S data"
+    active_tb.kp_alignment_data_paths = {
+        "stru": str(active_stru_path),
+        "HR": str(active_hr_path),
+        "SR": str(active_sr_path),
+    }
+    return active_tb
+
+
 def _numeric_lowdin_kp_analyses_for_results(
     tb,
     results: Sequence[Mapping[str, Any]],
@@ -837,7 +847,7 @@ def _numeric_lowdin_kp_analyses_for_results(
         band_range = list(result.get("band") or [])
         if len(band_range) != 2:
             continue
-        k_direct = np.asarray([_vector3(result.get("kpoint"), [0.0, 0.0, 0.0])], dtype=float)
+        k_direct = np.asarray([_lowdin_reference_kpoint_from_result(result)], dtype=float)
         character_row = _character_target_representation_row(result)
         if (
             isinstance(character_row, Mapping)
@@ -923,6 +933,115 @@ def _schur_project_intertwiner(
         count += 1
     projected /= float(count)
     return projected
+
+
+def _schur_intertwiner_between_representations(
+    left_matrices: Sequence[np.ndarray],
+    right_matrices: Sequence[np.ndarray],
+    *,
+    tol: float = 1.0e-9,
+) -> np.ndarray:
+    left = [np.asarray(matrix, dtype=complex) for matrix in left_matrices]
+    right = [np.asarray(matrix, dtype=complex) for matrix in right_matrices]
+    if not left or len(left) != len(right):
+        raise ValueError("left_matrices and right_matrices must have the same nonzero length.")
+    dimension = int(left[0].shape[0])
+    if any(matrix.shape != (dimension, dimension) for matrix in left + right):
+        raise ValueError("All representation matrices must have the same square shape.")
+
+    seeds = [np.eye(dimension, dtype=complex)]
+    for row in range(dimension):
+        for col in range(dimension):
+            seed = np.zeros((dimension, dimension), dtype=complex)
+            seed[row, col] = 1.0
+            seeds.extend([seed, 1.0j * seed])
+
+    best_projected = None
+    best_score = None
+    for seed in seeds:
+        projected = _schur_project_intertwiner(left, right, seed)
+        singular_values = np.linalg.svd(projected, compute_uv=False)
+        rank = int(np.count_nonzero(singular_values > tol))
+        score = (rank, float(singular_values[-1]), float(np.linalg.norm(projected)))
+        if best_score is None or score > best_score:
+            best_score = score
+            best_projected = projected
+
+    if best_projected is None or int(best_score[0]) < dimension:
+        raise ValueError("Failed to build a full-rank Schur intertwiner.")
+    return _unitarize_by_polar(best_projected)
+
+
+def _spinless_time_reversal_sewing_matrix(
+    unitary_matrices: Sequence[np.ndarray],
+    *,
+    tol: float = 1.0e-9,
+) -> np.ndarray:
+    """Return the spinless time-reversal sewing matrix in the chosen irrep basis.
+
+    For NSOC calculations time reversal is complex conjugation in a real-space
+    orbital basis, but after spgrep chooses a complex irrep basis the anti-linear
+    matrix is generally not identity.  It must satisfy D(g) A = A D(g)^*.
+    """
+
+    matrices = [np.asarray(matrix, dtype=complex) for matrix in unitary_matrices]
+    if not matrices:
+        return np.eye(0, dtype=complex)
+    return _schur_intertwiner_between_representations(
+        matrices,
+        [matrix.conj() for matrix in matrices],
+        tol=tol,
+    )
+
+
+def _canonical_antiunitary_sewing_matrix(
+    unitary_matrices: Sequence[np.ndarray],
+    *,
+    spin_orbit: bool,
+    tol: float = 1.0e-8,
+) -> np.ndarray:
+    matrices = [np.asarray(matrix, dtype=complex) for matrix in unitary_matrices]
+    if not matrices:
+        return np.eye(0, dtype=complex)
+    dimension = int(matrices[0].shape[0])
+    if dimension == 1:
+        return np.eye(1, dtype=complex)
+    if all(np.allclose(matrix, np.diag(np.diag(matrix)), atol=tol, rtol=0.0) for matrix in matrices):
+        diagonals = [np.diag(matrix) for matrix in matrices]
+        out = np.zeros((dimension, dimension), dtype=complex)
+        used: set[int] = set()
+        for left in range(dimension):
+            if left in used:
+                continue
+            partner = None
+            for right in range(left, dimension):
+                if right in used:
+                    continue
+                if all(
+                    abs(complex(diagonal[right]) - complex(diagonal[left]).conjugate()) <= tol
+                    for diagonal in diagonals
+                ):
+                    partner = right
+                    break
+            if partner is None:
+                partner = left
+            if partner == left:
+                out[left, left] = 1.0
+                used.add(left)
+            else:
+                if bool(spin_orbit):
+                    out[left, partner] = -1.0
+                    out[partner, left] = 1.0
+                else:
+                    out[left, partner] = 1.0
+                    out[partner, left] = 1.0
+                used.update({left, partner})
+        if len(used) == dimension:
+            return out
+    try:
+        return _spinless_time_reversal_sewing_matrix(matrices, tol=tol)
+    except ValueError:
+        return np.eye(dimension, dtype=complex)
 
 
 def _antiunitary_block_phase_refinement(
@@ -1021,6 +1140,7 @@ def _schur_representation_alignment(
     numeric_antiunitary_matrices: Sequence[np.ndarray] | None = None,
     standard_antiunitary_matrices: Sequence[np.ndarray] | None = None,
     standard_block_dimensions: Sequence[int] | None = None,
+    project_antiunitary: bool = True,
     tol: float = 1.0e-9,
 ) -> dict[str, Any]:
     """Align two equivalent corepresentations using Schur projection.
@@ -1047,6 +1167,8 @@ def _schur_representation_alignment(
         raise ValueError("All numeric antiunitary matrices must have the same square shape.")
     if any(matrix.shape != (dimension, dimension) for matrix in standard_antiunitary):
         raise ValueError("All standard antiunitary matrices must have the same square shape.")
+    projector_numeric_antiunitary = numeric_antiunitary if bool(project_antiunitary) else []
+    projector_standard_antiunitary = standard_antiunitary if bool(project_antiunitary) else []
 
     seeds = [np.eye(dimension, dtype=complex)]
     for row in range(dimension):
@@ -1054,14 +1176,20 @@ def _schur_representation_alignment(
             seed = np.zeros((dimension, dimension), dtype=complex)
             seed[row, col] = 1.0
             seeds.append(seed)
-            if numeric_antiunitary:
+            if projector_numeric_antiunitary:
                 seeds.append(1.0j * seed)
 
     best_projected = None
     best_score = None
     best_singular_values: np.ndarray | None = None
     for seed in seeds:
-        projected = _schur_project_intertwiner(numeric, standard, seed)
+        projected = _schur_project_intertwiner(
+            numeric,
+            standard,
+            seed,
+            numeric_antiunitary_matrices=projector_numeric_antiunitary,
+            standard_antiunitary_matrices=projector_standard_antiunitary,
+        )
         singular_values = np.linalg.svd(projected, compute_uv=False)
         rank = int(np.count_nonzero(singular_values > tol))
         score = (rank, float(singular_values[-1]), float(np.linalg.norm(projected)))
@@ -1077,7 +1205,13 @@ def _schur_representation_alignment(
         rng = np.random.default_rng(12345)
         for _ in range(64):
             seed = rng.normal(size=(dimension, dimension)) + 1j * rng.normal(size=(dimension, dimension))
-            projected = _schur_project_intertwiner(numeric, standard, seed)
+            projected = _schur_project_intertwiner(
+                numeric,
+                standard,
+                seed,
+                numeric_antiunitary_matrices=projector_numeric_antiunitary,
+                standard_antiunitary_matrices=projector_standard_antiunitary,
+            )
             singular_values = np.linalg.svd(projected, compute_uv=False)
             rank = int(np.count_nonzero(singular_values > tol))
             score = (rank, float(singular_values[-1]), float(np.linalg.norm(projected)))
@@ -1127,6 +1261,7 @@ def _schur_representation_alignment(
         "convention": "D_standard(g) ~= U^dagger D_numeric(g) U; T_standard(a) ~= U^dagger T_numeric(a) U^*",
         "operation_indices": [int(index) for index in operation_indices],
         "antiunitary_operation_indices": [int(index) for index in (antiunitary_operation_indices or [])],
+        "antiunitary_projector_applied": bool(project_antiunitary),
         "dimension": dimension,
         "projected_intertwiner_singular_values": [float(value) for value in np.asarray(best_singular_values).reshape(-1)],
         "unitary_numeric_to_standard": _complex_matrix_to_pairs(unitary),
@@ -1171,6 +1306,9 @@ def _character_target_representation_row(result: Mapping[str, Any]) -> Mapping[s
 def _representation_alignment_analyses_for_results(
     info: Mapping[str, Any],
     results: Sequence[Mapping[str, Any]],
+    *,
+    tb: Any = None,
+    symm_prec: float = 1.0e-6,
 ) -> list[dict[str, Any]]:
     spgrep_info = info.get("spgrep_operations", {})
     character_table = info.get("character_table", {})
@@ -1203,10 +1341,11 @@ def _representation_alignment_analyses_for_results(
 
         numeric_operation_indices = [int(index) for index in row.get("target_operation_indices", [])]
         numeric_matrices_all = [np.asarray(matrix, dtype=complex) for matrix in row.get("target_representation_matrices", [])]
-        standard_by_operation = {
-            int(index): np.asarray(matrix, dtype=complex)
-            for index, matrix in zip(standard_operation_indices, standard_matrices, strict=True)
-        }
+        operation_aliases = _spgrep_unitary_operation_aliases(spgrep_info)
+        standard_by_operation: dict[int, np.ndarray] = {}
+        for index, matrix in zip(standard_operation_indices, standard_matrices, strict=True):
+            for alias in operation_aliases.get(int(index), [int(index)]):
+                standard_by_operation[int(alias)] = np.asarray(matrix, dtype=complex)
 
         operation_indices = []
         numeric_matrices = []
@@ -1222,21 +1361,79 @@ def _representation_alignment_analyses_for_results(
             continue
 
         antiunitary_operation_indices: list[int] = []
+        antiunitary_display_operation_indices: list[int] = []
         numeric_antiunitary_matrices: list[np.ndarray] = []
         matched_standard_antiunitary_matrices: list[np.ndarray] = []
-        time_reversal_operation = _pure_time_reversal_operation(spgrep_info)
-        target_time_reversal = row.get("target_time_reversal_matrix")
-        if time_reversal_operation is not None and target_time_reversal is not None:
-            antiunitary_operation_index = int(time_reversal_operation.get("antiunitary_operation_index", 0))
-            standard_time_reversal = _target_antiunitary_matrix_from_corep_indices(
+        numeric_antiunitary_by_spgrep = _antiunitary_numeric_matrices_from_row(
+            info,
+            result,
+            row,
+            tb=tb,
+            symm_prec=symm_prec,
+        )
+        for antiunitary_operation in spgrep_info.get("antiunitary_operations", []) or []:
+            antiunitary_operation_index = int(antiunitary_operation.get("antiunitary_operation_index", 0))
+            spgrep_operation_index = int(antiunitary_operation.get("spgrep_operation_index", 0))
+            numeric_antiunitary = numeric_antiunitary_by_spgrep.get(spgrep_operation_index)
+            if numeric_antiunitary is None:
+                continue
+            standard_antiunitary = _target_antiunitary_matrix_for_operation(
                 spgrep_info,
                 corep_indices,
-                antiunitary_operation_index,
+                antiunitary_operation,
+                standard_by_operation,
             )
-            if standard_time_reversal is not None:
-                antiunitary_operation_indices.append(antiunitary_operation_index)
-                numeric_antiunitary_matrices.append(np.asarray(target_time_reversal, dtype=complex))
-                matched_standard_antiunitary_matrices.append(np.asarray(standard_time_reversal, dtype=complex))
+            if standard_antiunitary is None:
+                continue
+            antiunitary_operation_indices.append(antiunitary_operation_index)
+            antiunitary_display_operation_indices.append(
+                int(antiunitary_operation.get("display_operation_index", antiunitary_operation_index))
+            )
+            numeric_antiunitary_matrices.append(np.asarray(numeric_antiunitary, dtype=complex))
+            matched_standard_antiunitary_matrices.append(np.asarray(standard_antiunitary, dtype=complex))
+
+        if not antiunitary_operation_indices:
+            time_reversal_operation = _pure_time_reversal_operation(spgrep_info)
+            target_time_reversal = row.get("target_time_reversal_matrix")
+            if time_reversal_operation is not None and target_time_reversal is not None:
+                antiunitary_operation_index = int(time_reversal_operation.get("antiunitary_operation_index", 0))
+                standard_time_reversal = _target_antiunitary_matrix_from_corep_indices(
+                    spgrep_info,
+                    corep_indices,
+                    antiunitary_operation_index,
+                )
+                if standard_time_reversal is not None:
+                    antiunitary_operation_indices.append(antiunitary_operation_index)
+                    antiunitary_display_operation_indices.append(
+                        int(time_reversal_operation.get("display_operation_index", antiunitary_operation_index))
+                    )
+                    numeric_antiunitary_matrices.append(np.asarray(target_time_reversal, dtype=complex))
+                    matched_standard_antiunitary_matrices.append(np.asarray(standard_time_reversal, dtype=complex))
+
+        if antiunitary_operation_indices:
+            constraint_operation = _anti_linear_constraint_operation(spgrep_info)
+            constraint_index = (
+                int(constraint_operation.get("antiunitary_operation_index", 0))
+                if constraint_operation is not None
+                else 0
+            )
+            constraint_display_index = _anti_linear_display_operation_index(constraint_operation)
+            selected_position = None
+            for position, (operation_index, display_index) in enumerate(
+                zip(antiunitary_operation_indices, antiunitary_display_operation_indices, strict=False)
+            ):
+                if constraint_index and int(operation_index) == constraint_index:
+                    selected_position = position
+                    break
+                if constraint_display_index and int(display_index) == constraint_display_index:
+                    selected_position = position
+                    break
+            if selected_position is None:
+                selected_position = 0
+            antiunitary_operation_indices = [antiunitary_operation_indices[selected_position]]
+            antiunitary_display_operation_indices = [antiunitary_display_operation_indices[selected_position]]
+            numeric_antiunitary_matrices = [numeric_antiunitary_matrices[selected_position]]
+            matched_standard_antiunitary_matrices = [matched_standard_antiunitary_matrices[selected_position]]
 
         alignment = _schur_representation_alignment(
             operation_indices=operation_indices,
@@ -1246,6 +1443,7 @@ def _representation_alignment_analyses_for_results(
             numeric_antiunitary_matrices=numeric_antiunitary_matrices,
             standard_antiunitary_matrices=matched_standard_antiunitary_matrices,
             standard_block_dimensions=target_corep_dimensions,
+            project_antiunitary=False,
         )
 
         analyses.append(
@@ -1260,6 +1458,7 @@ def _representation_alignment_analyses_for_results(
                 "alignment_convention": alignment["convention"],
                 "operation_indices": operation_indices,
                 "antiunitary_operation_indices": antiunitary_operation_indices,
+                "antiunitary_display_operation_indices": antiunitary_display_operation_indices,
                 "numeric_representation_matrices": [_complex_matrix_to_pairs(matrix) for matrix in numeric_matrices],
                 "spgrep_representation_matrices": [_complex_matrix_to_pairs(matrix) for matrix in matched_standard_matrices],
                 "numeric_antiunitary_representation_matrices": [
@@ -1274,10 +1473,11 @@ def _representation_alignment_analyses_for_results(
     return analyses
 
 
-def _kp_fit_monomial_labels() -> list[str]:
+def _kp_fit_monomial_labels(max_order: int = 3) -> list[str]:
+    max_order = max(0, int(max_order))
     return ["1"] + [
         _monomial_label(exponent)
-        for order in (1, 2, 3)
+        for order in range(1, max_order + 1)
         for exponent in _monomial_exponents(order, 3)
     ]
 
@@ -1382,12 +1582,15 @@ def _fit_formal_parameters_to_tensor(
 def _schur_kp_parameter_fit_analyses(
     info: Mapping[str, Any],
     representation_analyses: Sequence[Mapping[str, Any]],
+    *,
+    max_order: int = 3,
 ) -> list[dict[str, Any]]:
     numeric_analyses = list(info.get("numeric_lowdin_kp_analyses", []) or [])
     if not numeric_analyses or not representation_analyses:
         return []
 
-    monomial_labels = _kp_fit_monomial_labels()
+    max_order = max(0, int(max_order))
+    monomial_labels = _kp_fit_monomial_labels(max_order=max_order)
     fits = []
     for rep_analysis in representation_analyses:
         selection_index = int(rep_analysis.get("selection_index", 0))
@@ -1424,7 +1627,7 @@ def _schur_kp_parameter_fit_analyses(
             info,
             dimension=dimension,
             monomial_labels=monomial_labels,
-            max_order=3,
+            max_order=max_order,
         )
         if not formal_labels:
             continue
@@ -1451,6 +1654,7 @@ def _schur_kp_parameter_fit_analyses(
             {
                 "selection_index": selection_index,
                 "convention": "H_form_fit(q) ~= U_schur^dagger H_numeric(q) U_schur",
+                "max_order": int(max_order),
                 "monomial_basis": list(monomial_labels),
                 "formal_parameter_labels": formal_labels,
                 "formal_parameters": [float(value) for value in parameters],
@@ -1461,6 +1665,190 @@ def _schur_kp_parameter_fit_analyses(
             }
         )
     return fits
+
+
+def _kp_error_q_grid(radius: float, grid: int) -> np.ndarray:
+    grid_count = int(grid)
+    if grid_count <= 0:
+        raise ValueError("KP.kp_grid must be a positive integer.")
+    radius_value = float(radius)
+    if radius_value < 0.0:
+        raise ValueError("KP.kp_radius must be zero or a positive float.")
+    if grid_count == 1:
+        axis = np.array([0.0], dtype=float)
+    else:
+        axis = np.linspace(-radius_value, radius_value, grid_count, dtype=float)
+    return np.asarray(
+        [[kx, ky, kz] for kx in axis for ky in axis for kz in axis],
+        dtype=float,
+    )
+
+
+def _kp_monomial_value(label: str, q_cartesian: Sequence[float]) -> float:
+    text = str(label).strip()
+    if text == "1":
+        return 1.0
+    q = np.asarray(q_cartesian, dtype=float).reshape(3)
+    value = 1.0
+    axis_values = {"kx": q[0], "ky": q[1], "kz": q[2]}
+    for factor in text.split("*"):
+        if "^" in factor:
+            axis, exponent_text = factor.split("^", 1)
+            exponent = int(exponent_text)
+        else:
+            axis = factor
+            exponent = 1
+        if axis not in axis_values:
+            raise ValueError(f"Unknown k monomial factor: {factor}")
+        value *= float(axis_values[axis]) ** exponent
+    return float(value)
+
+
+def _kp_fitted_monomial_matrices(
+    fit_analysis: Mapping[str, Any],
+) -> dict[str, np.ndarray]:
+    matrices: dict[str, np.ndarray] = {}
+    for record in fit_analysis.get("records", []) or []:
+        label = str(record.get("monomial", ""))
+        matrix = np.asarray(
+            _complex_array_from_pairs(record.get("formal_fit_matrix", [])),
+            dtype=complex,
+        )
+        if label and matrix.ndim == 2:
+            matrices[label] = matrix
+    return matrices
+
+
+def _evaluate_kp_hamiltonian_from_fit(
+    fit_analysis: Mapping[str, Any],
+    q_cartesian: Sequence[float],
+) -> np.ndarray:
+    matrices = _kp_fitted_monomial_matrices(fit_analysis)
+    if not matrices:
+        return np.zeros((0, 0), dtype=complex)
+    first_matrix = next(iter(matrices.values()))
+    hamiltonian = np.zeros_like(first_matrix, dtype=complex)
+    for label in fit_analysis.get("monomial_basis", []) or matrices.keys():
+        label_text = str(label)
+        matrix = matrices.get(label_text)
+        if matrix is None:
+            continue
+        hamiltonian += _kp_monomial_value(label_text, q_cartesian) * matrix
+    return _clean_complex_array(hamiltonian)
+
+
+def _direct_band_energies_for_kpoints(
+    tb,
+    k_direct_points: np.ndarray,
+    band_range: Sequence[int],
+) -> np.ndarray:
+    tb_solver = getattr(tb, "tb_solver", None)
+    if tb_solver is None:
+        raise ValueError("KP energy-error analysis requires a tb_solver.")
+    if len(band_range) != 2:
+        raise ValueError("KP.band must contain band_start band_stop for energy-error analysis.")
+    lower = int(band_range[0])
+    upper = int(band_range[1])
+    chunk_size = max(1, int(getattr(tb, "max_kpoint_num", len(k_direct_points)) or len(k_direct_points)))
+    chunks: list[np.ndarray] = []
+    for start in range(0, len(k_direct_points), chunk_size):
+        chunk = np.asarray(k_direct_points[start:start + chunk_size], dtype=float)
+        if hasattr(tb_solver, "diago_H_eigenvaluesOnly_range"):
+            values = tb_solver.diago_H_eigenvaluesOnly_range(chunk, lower, upper)
+        elif hasattr(tb_solver, "diago_H_eigenvaluesOnly"):
+            all_values = tb_solver.diago_H_eigenvaluesOnly(chunk)
+            values = np.asarray(all_values, dtype=float)[:, lower - 1:upper]
+        else:
+            _eigenvectors, all_values = tb_solver.diago_H(chunk)
+            values = np.asarray(all_values, dtype=float)[:, lower - 1:upper]
+        chunks.append(np.asarray(values, dtype=float))
+    if not chunks:
+        return np.zeros((0, upper - lower + 1), dtype=float)
+    return np.concatenate(chunks, axis=0)
+
+
+def _kp_energy_error_analyses(
+    tb,
+    fit_analyses: Sequence[Mapping[str, Any]],
+    numeric_analyses: Sequence[Mapping[str, Any]],
+    *,
+    radius: float,
+    grid: int,
+) -> list[dict[str, Any]]:
+    radius_value = float(radius)
+    if radius_value <= 0.0:
+        return []
+    grid_count = int(grid)
+    q_points = _kp_error_q_grid(radius_value, grid_count)
+    numeric_by_selection = {
+        int(item.get("selection_index", 0)): item
+        for item in numeric_analyses or []
+    }
+    analyses: list[dict[str, Any]] = []
+    for fit in fit_analyses or []:
+        selection_index = int(fit.get("selection_index", 0))
+        numeric = numeric_by_selection.get(selection_index)
+        if numeric is None:
+            continue
+        band_range = list(numeric.get("band_range", []))
+        if len(band_range) != 2:
+            continue
+        k0_direct = np.asarray(numeric.get("reference_k_direct", []), dtype=float).reshape(-1)
+        if k0_direct.size != 3:
+            continue
+        if hasattr(tb, "direct_to_cartesian_kspace"):
+            k0_cartesian = np.asarray(tb.direct_to_cartesian_kspace(k0_direct.reshape(1, 3)), dtype=float)[0]
+        else:
+            k0_cartesian = np.asarray(numeric.get("reference_k_cartesian", k0_direct), dtype=float).reshape(3)
+        k_cartesian_points = k0_cartesian.reshape(1, 3) + q_points
+        if hasattr(tb, "cartesian_to_direct_kspace"):
+            k_direct_points = np.asarray(tb.cartesian_to_direct_kspace(k_cartesian_points), dtype=float)
+        else:
+            k_direct_points = k_cartesian_points
+        direct_energies = _direct_band_energies_for_kpoints(tb, k_direct_points, band_range)
+        kp_energies = []
+        for q_point in q_points:
+            kp_hamiltonian = _evaluate_kp_hamiltonian_from_fit(fit, q_point)
+            if kp_hamiltonian.size == 0:
+                kp_energies = []
+                break
+            kp_energies.append(np.linalg.eigvalsh(kp_hamiltonian).real)
+        if not kp_energies:
+            continue
+        kp_energy_array = np.asarray(kp_energies, dtype=float)
+        if direct_energies.shape != kp_energy_array.shape:
+            continue
+        error = kp_energy_array - direct_energies
+        abs_error = np.abs(error)
+        worst_flat_index = int(np.argmax(abs_error))
+        worst_point_index, worst_band_index = np.unravel_index(worst_flat_index, abs_error.shape)
+        analyses.append(
+            {
+                "selection_index": selection_index,
+                "radius_A^-1": radius_value,
+                "grid_points_per_axis": grid_count,
+                "point_count": int(q_points.shape[0]),
+                "band_count": int(kp_energy_array.shape[1]),
+                "direct_diagonalization_band_range": [int(band_range[0]), int(band_range[1])],
+                "q_grid_convention": "q = k - k0 in Cartesian coordinates, Angstrom^-1",
+                "kp_energy_convention": "eigenvalues of fitted k.p Hamiltonian",
+                "direct_energy_convention": "direct diagonalization from the active symmetrized H/S data",
+                "max_abs_error_eV": float(np.max(abs_error)),
+                "mean_abs_error_eV": float(np.mean(abs_error)),
+                "rms_error_eV": float(np.sqrt(np.mean(abs_error**2))),
+                "per_band_max_abs_error_eV": [float(value) for value in np.max(abs_error, axis=0)],
+                "per_band_mean_abs_error_eV": [float(value) for value in np.mean(abs_error, axis=0)],
+                "worst_point_index": int(worst_point_index + 1),
+                "worst_band_offset": int(worst_band_index + 1),
+                "worst_band_index": int(band_range[0] + worst_band_index),
+                "worst_q_cartesian": [float(value) for value in q_points[worst_point_index]],
+                "worst_k_direct": [float(value) for value in k_direct_points[worst_point_index]],
+                "worst_direct_energy_eV": float(direct_energies[worst_point_index, worst_band_index]),
+                "worst_kp_energy_eV": float(kp_energy_array[worst_point_index, worst_band_index]),
+                "worst_signed_error_eV": float(error[worst_point_index, worst_band_index]),
+            }
+        )
+    return analyses
 
 
 def _schur_zeeman_parameter_fit_analyses(
@@ -1662,6 +2050,20 @@ def _target_matrices_from_corep_indices(
             _block_diag_matrices([matrices[op_pos] for _indices, matrices in matrices_by_corep])
         )
     return reference_indices, combined_matrices
+
+
+def _spgrep_unitary_operation_aliases(spgrep_info: Mapping[str, Any]) -> dict[int, list[int]]:
+    aliases: dict[int, list[int]] = {}
+    for operation in spgrep_info.get("operations", []) or []:
+        local_index = int(operation.get("operation_index", 0))
+        if local_index <= 0:
+            continue
+        values = [local_index]
+        display_index = int(operation.get("display_operation_index", local_index))
+        if display_index > 0 and display_index not in values:
+            values.append(display_index)
+        aliases[local_index] = values
+    return aliases
 
 
 def _target_corep_dimensions(
@@ -1921,7 +2323,7 @@ def _operator_irrep_analysis(
 
 def _split_irrep_terms(value: str) -> list[str]:
     terms = []
-    for part in str(value).replace("⊕", "+").split("+"):
+    for part in re.split(r"\s+\+\s+|⊕", str(value)):
         label = part.strip()
         if not label or label == "??":
             continue
@@ -2044,6 +2446,47 @@ def _polynomial_transform_matrix(transform: np.ndarray, exponents: Sequence[tupl
     return out
 
 
+def _monomial_exponent_from_label(
+    label: str,
+    variable_labels: Sequence[str] = ("kx", "ky", "kz"),
+) -> tuple[int, ...] | None:
+    text = str(label).strip()
+    if text == "1":
+        return tuple([0] * len(variable_labels))
+    variable_index = {str(name): index for index, name in enumerate(variable_labels)}
+    exponents = [0] * len(variable_labels)
+    for piece in text.split("*"):
+        item = piece.strip()
+        if not item:
+            continue
+        if "^" in item:
+            name, power_text = item.split("^", 1)
+            power = int(power_text)
+        else:
+            name = item
+            power = 1
+        index = variable_index.get(name)
+        if index is None:
+            return None
+        exponents[index] += int(power)
+    return tuple(exponents)
+
+
+def _polynomial_transform_matrix_for_labels(
+    transform: np.ndarray,
+    basis_labels: Sequence[str],
+    *,
+    variable_labels: Sequence[str] = ("kx", "ky", "kz"),
+) -> np.ndarray:
+    exponents = [
+        _monomial_exponent_from_label(label, variable_labels=variable_labels)
+        for label in basis_labels
+    ]
+    if any(exponent is None for exponent in exponents):
+        return np.eye(len(basis_labels), dtype=complex)
+    return _polynomial_transform_matrix(np.asarray(transform, dtype=complex), [tuple(exp) for exp in exponents if exp is not None])
+
+
 def _reciprocal_rotation_from_operation(
     operation: Mapping[str, Any],
     lattice: Sequence[Sequence[float]] | np.ndarray | None = None,
@@ -2071,6 +2514,38 @@ def _cartesian_rotation_from_operation(
         return rotation
     col_lattice = lattice_matrix.T
     return col_lattice @ rotation @ np.linalg.inv(col_lattice)
+
+
+def _factor_spin_matrix_from_cartesian_rotation(cart_rotation: np.ndarray) -> np.ndarray:
+    rot = np.asarray(cart_rotation, dtype=float)
+    proper_rot = -rot if float(np.linalg.det(rot)) < 0.0 else rot
+    axis, angle, _ = axis_angle_from_cartesian_rotation(proper_rot)
+    canonical_axis = _canonicalize_axis(axis)
+    if abs(float(angle) - float(np.pi)) < 1.0e-6:
+        signed_angle = -float(angle)
+    elif float(np.dot(axis, canonical_axis)) < 0.0:
+        signed_angle = -float(angle)
+    else:
+        signed_angle = float(angle)
+    return spin_half_matrix_from_axis_angle(canonical_axis, signed_angle)
+
+
+def _dk_operation_from_summary(
+    info: Mapping[str, Any],
+    operation: Mapping[str, Any],
+) -> dict[str, Any]:
+    lattice = np.asarray(info.get("lattice_vectors", np.eye(3)), dtype=float)
+    rotation = np.asarray(operation.get("rotation", np.eye(3, dtype=int)), dtype=int)
+    translation = np.asarray(_vector3(operation.get("translation"), [0.0, 0.0, 0.0]), dtype=float)
+    cart_rotation = _cartesian_rotation_from_operation({"rotation": rotation}, lattice=lattice)
+    out: dict[str, Any] = {
+        "rotation": rotation,
+        "translation": translation,
+        "cart_rotation": cart_rotation,
+    }
+    if int(info.get("nspin", 1)) == 4:
+        out["spin_matrix"] = _factor_spin_matrix_from_cartesian_rotation(cart_rotation)
+    return out
 
 
 def _zeeman_field_transform_from_operation(
@@ -2498,6 +2973,28 @@ def _pure_time_reversal_operation(spgrep_info: Mapping[str, Any], *, tol: float 
     return None
 
 
+def _anti_linear_constraint_operation(spgrep_info: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    pure_time_reversal = _pure_time_reversal_operation(spgrep_info)
+    if pure_time_reversal is not None:
+        return pure_time_reversal
+    operations = sorted(
+        list(spgrep_info.get("antiunitary_operations", []) or []),
+        key=lambda item: int(item.get("display_operation_index", item.get("antiunitary_operation_index", 0))),
+    )
+    return operations[0] if operations else None
+
+
+def _anti_linear_display_operation_index(operation: Mapping[str, Any] | None) -> int:
+    if not operation:
+        return 0
+    return int(
+        operation.get(
+            "display_operation_index",
+            operation.get("spgrep_operation_index", operation.get("antiunitary_operation_index", 0)),
+        )
+    )
+
+
 def _target_antiunitary_matrix_from_corep_indices(
     spgrep_info: Mapping[str, Any],
     corep_indices: Sequence[int],
@@ -2532,6 +3029,139 @@ def _target_antiunitary_matrix_from_corep_indices(
     return _block_diag_matrices(matrices)
 
 
+def _target_antiunitary_reference_matrix_from_corep_indices(
+    spgrep_info: Mapping[str, Any],
+    corep_indices: Sequence[int],
+) -> np.ndarray | None:
+    coreps = list(spgrep_info.get("coreps") or [])
+    matrices = []
+    for corep_index in corep_indices:
+        corep = next(
+            (
+                item
+                for item in coreps
+                if int(item.get("corep_index", 0)) == int(corep_index)
+            ),
+            None,
+        )
+        if corep is None:
+            return None
+        _operation_indices, unitary_matrices = _corep_operation_matrices(corep)
+        if not unitary_matrices:
+            return None
+        matrices.append(
+            _canonical_antiunitary_sewing_matrix(
+                unitary_matrices,
+                spin_orbit=bool(spgrep_info.get("spin_orbit", False)),
+            )
+        )
+    if not matrices:
+        return None
+    return _block_diag_matrices(matrices)
+
+
+def _target_antiunitary_matrix_for_operation(
+    spgrep_info: Mapping[str, Any],
+    corep_indices: Sequence[int],
+    antiunitary_operation: Mapping[str, Any],
+    standard_by_operation: Mapping[int, np.ndarray],
+) -> np.ndarray | None:
+    antiunitary_operation_index = int(antiunitary_operation.get("antiunitary_operation_index", 0))
+    direct = _target_antiunitary_matrix_from_corep_indices(
+        spgrep_info,
+        corep_indices,
+        antiunitary_operation_index,
+    )
+    uses_reference_relation = "reference_antiunitary_operation_index" in antiunitary_operation
+    if direct is not None and not uses_reference_relation:
+        return direct
+
+    reference_index = int(
+        antiunitary_operation.get(
+            "reference_antiunitary_operation_index",
+            antiunitary_operation_index,
+        )
+    )
+    reference = _target_antiunitary_reference_matrix_from_corep_indices(
+        spgrep_info,
+        corep_indices,
+    )
+    if reference is None:
+        reference = _target_antiunitary_matrix_from_corep_indices(
+            spgrep_info,
+            corep_indices,
+            reference_index,
+        )
+    if reference is None:
+        return None
+
+    left_index = int(antiunitary_operation.get("left_unitary_operation_index", 1))
+    left = standard_by_operation.get(left_index)
+    if left is None:
+        display_index = int(antiunitary_operation.get("left_unitary_display_operation_index", 0))
+        if display_index:
+            left = standard_by_operation.get(display_index)
+    if left is None:
+        return reference
+    return np.asarray(left, dtype=complex) @ np.asarray(reference, dtype=complex)
+
+
+def _antiunitary_numeric_matrices_from_row(
+    info: Mapping[str, Any],
+    result: Mapping[str, Any],
+    row: Mapping[str, Any],
+    *,
+    tb: Any = None,
+    symm_prec: float = 1.0e-6,
+) -> dict[int, np.ndarray]:
+    matrices_by_spgrep_index: dict[int, np.ndarray] = {}
+    stored_indices = [int(index) for index in row.get("target_antiunitary_spgrep_operation_indices", []) or []]
+    stored_matrices = [
+        np.asarray(matrix, dtype=complex)
+        for matrix in row.get("target_antiunitary_representation_matrices", []) or []
+    ]
+    for index, matrix in zip(stored_indices, stored_matrices, strict=False):
+        matrices_by_spgrep_index[int(index)] = matrix
+    if matrices_by_spgrep_index or tb is None:
+        return matrices_by_spgrep_index
+
+    time_reversal_matrix = Character._time_reversal_basis_matrix(tb)
+    if time_reversal_matrix is None:
+        return {}
+    eigenvectors = row.get("target_eigenvectors_full")
+    overlap = row.get("target_overlap")
+    band_range = [int(value) for value in row.get("target_band_range", []) or []]
+    if eigenvectors is None or overlap is None or len(band_range) != 2:
+        return {}
+    start = int(band_range[0]) - 1
+    stop = int(band_range[1])
+    target_subspace = np.asarray(eigenvectors, dtype=complex)[:, start:stop]
+    overlap_matrix = np.asarray(overlap, dtype=complex)
+    k_direct = np.asarray(_lowdin_reference_kpoint_from_result(result), dtype=float)
+    for operation in info.get("spgrep_operations", {}).get("antiunitary_operations", []) or []:
+        spgrep_operation_index = int(operation.get("spgrep_operation_index", 0))
+        if spgrep_operation_index <= 0:
+            continue
+        try:
+            dk_operation = _dk_operation_from_summary(info, operation)
+            unitary_part = build_dk_matrix(
+                tb,
+                k_direct,
+                dk_operation,
+                map_tol=float(symm_prec),
+            )
+        except Exception:
+            continue
+        matrices_by_spgrep_index[spgrep_operation_index] = (
+            target_subspace.conj().T
+            @ overlap_matrix
+            @ np.asarray(unitary_part, dtype=complex)
+            @ np.asarray(time_reversal_matrix, dtype=complex)
+            @ target_subspace.conj()
+        )
+    return matrices_by_spgrep_index
+
+
 def _antiunitary_operator_representation_matrix(
     target_matrix: np.ndarray,
     basis: Sequence[np.ndarray],
@@ -2551,10 +3181,13 @@ def _kp_product_coefficient_matrix(
     terms: Sequence[Mapping[str, Any]],
     *,
     hermitian_basis_count: int,
+    k_basis_count: int | None = None,
 ) -> np.ndarray:
-    k_basis_count = 0
+    inferred_k_basis_count = 0
     for term in terms:
-        k_basis_count = max(k_basis_count, int(term.get("k_basis_index", 0)))
+        inferred_k_basis_count = max(inferred_k_basis_count, int(term.get("k_basis_index", 0)))
+    if k_basis_count is None:
+        k_basis_count = inferred_k_basis_count
     coefficients = np.zeros((int(hermitian_basis_count), int(k_basis_count)), dtype=complex)
     for term in terms:
         x_index = int(term.get("hermitian_basis_index", 0)) - 1
@@ -2572,17 +3205,23 @@ def _time_reversal_constraint_analyses(
     tol: float = 1.0e-7,
 ) -> list[dict[str, Any]]:
     spgrep_info = info.get("spgrep_operations", {})
-    time_reversal_operation = _pure_time_reversal_operation(spgrep_info)
-    if time_reversal_operation is None or not operator_analyses or not kp_form_solution_analyses:
+    anti_linear_operation = _anti_linear_constraint_operation(spgrep_info)
+    if anti_linear_operation is None or not operator_analyses or not kp_form_solution_analyses:
         return []
 
     operator_analysis = operator_analyses[0]
     corep_indices = [int(index) for index in operator_analysis.get("target_corep_indices", [])]
-    antiunitary_operation_index = int(time_reversal_operation.get("antiunitary_operation_index", 0))
-    target_matrix = _target_antiunitary_matrix_from_corep_indices(
+    antiunitary_operation_index = int(anti_linear_operation.get("antiunitary_operation_index", 0))
+    operation_indices, target_matrices = _target_matrices_from_corep_indices(spgrep_info, corep_indices)
+    standard_by_operation = {
+        int(index): np.asarray(matrix, dtype=complex)
+        for index, matrix in zip(operation_indices, target_matrices, strict=False)
+    }
+    target_matrix = _target_antiunitary_matrix_for_operation(
         spgrep_info,
         corep_indices,
-        antiunitary_operation_index,
+        anti_linear_operation,
+        standard_by_operation,
     )
     if target_matrix is None:
         return []
@@ -2597,15 +3236,36 @@ def _time_reversal_constraint_analyses(
     for analysis in kp_form_solution_analyses:
         order = int(analysis.get("order", 0))
         parity = -1 if order % 2 else 1
+        monomial_labels = _monomial_labels_from_terms(
+            [
+                raw_term
+                for pair in analysis.get("irrep_pair_solutions", [])
+                for term in pair.get("terms", [])
+                for raw_term in term.get("linear_combination", [])
+            ]
+        )
+        if not monomial_labels:
+            continue
+        base_transform = _reciprocal_rotation_from_operation(
+            anti_linear_operation,
+            lattice=info.get("lattice_vectors"),
+        )
+        function_transform = _polynomial_transform_matrix_for_labels(
+            -base_transform,
+            monomial_labels,
+            variable_labels=("kx", "ky", "kz"),
+        )
+        function_transform = np.linalg.inv(np.real_if_close(function_transform, tol=1000).real)
         for pair in analysis.get("irrep_pair_solutions", []):
             for term in pair.get("terms", []):
                 coefficients = _kp_product_coefficient_matrix(
                     term.get("linear_combination", []),
                     hermitian_basis_count=len(hermitian_labels),
+                    k_basis_count=len(monomial_labels),
                 )
                 if coefficients.size == 0:
                     continue
-                transformed = parity * (tr_operator_matrix @ np.conj(coefficients))
+                transformed = tr_operator_matrix @ np.conj(coefficients) @ function_transform.T
                 diff = transformed - coefficients
                 max_abs_diff = float(np.max(np.abs(diff))) if diff.size else 0.0
                 term_checks.append(
@@ -2624,10 +3284,11 @@ def _time_reversal_constraint_analyses(
         {
             "target_label": str(operator_analysis.get("target_label", "")),
             "target_corep_indices": corep_indices,
+            "anti_linear_operator_index": _anti_linear_display_operation_index(anti_linear_operation),
             "antiunitary_operation_index": antiunitary_operation_index,
-            "spgrep_operation_index": int(time_reversal_operation.get("spgrep_operation_index", 0)),
-            "k_transform": "k -> -k",
-            "matrix_convention": "D_T^dagger H(-k)^* D_T = H(k)",
+            "spgrep_operation_index": int(anti_linear_operation.get("spgrep_operation_index", 0)),
+            "k_transform": "q -> -R_cart^{-1} q",
+            "matrix_convention": "A(a)^dagger H(aq)^* A(a) = H(q)",
             "tolerance": float(tol),
             "term_checks": term_checks,
         }
@@ -2688,6 +3349,8 @@ def _final_kp_model_analyses(
     kp_form_solution_analyses: Sequence[Mapping[str, Any]],
     *,
     term_prefix: str = "K",
+    variable_labels: Sequence[str] = ("kx", "ky", "kz"),
+    function_transform_kind: str = "polar",
     tol: float = 1.0e-8,
 ) -> list[dict[str, Any]]:
     if not operator_analyses or not kp_form_solution_analyses:
@@ -2706,21 +3369,30 @@ def _final_kp_model_analyses(
         return []
 
     spgrep_info = info.get("spgrep_operations", {})
-    time_reversal_operation = _pure_time_reversal_operation(spgrep_info)
-    tr_operator_matrix = None
+    anti_linear_operation = _anti_linear_constraint_operation(spgrep_info)
+    anti_operator_matrix = None
     antiunitary_operation_index = 0
     spgrep_operation_index = 0
-    if time_reversal_operation is not None:
-        antiunitary_operation_index = int(time_reversal_operation.get("antiunitary_operation_index", 0))
-        spgrep_operation_index = int(time_reversal_operation.get("spgrep_operation_index", 0))
-        target_matrix = _target_antiunitary_matrix_from_corep_indices(
+    anti_linear_operator_index = 0
+    if anti_linear_operation is not None:
+        antiunitary_operation_index = int(anti_linear_operation.get("antiunitary_operation_index", 0))
+        spgrep_operation_index = int(anti_linear_operation.get("spgrep_operation_index", 0))
+        anti_linear_operator_index = _anti_linear_display_operation_index(anti_linear_operation)
+        corep_indices = [int(index) for index in operator_analysis.get("target_corep_indices", [])]
+        operation_indices, target_matrices = _target_matrices_from_corep_indices(spgrep_info, corep_indices)
+        standard_by_operation = {
+            int(index): np.asarray(matrix, dtype=complex)
+            for index, matrix in zip(operation_indices, target_matrices, strict=False)
+        }
+        target_matrix = _target_antiunitary_matrix_for_operation(
             spgrep_info,
-            [int(index) for index in operator_analysis.get("target_corep_indices", [])],
-            antiunitary_operation_index,
+            corep_indices,
+            anti_linear_operation,
+            standard_by_operation,
         )
         if target_matrix is not None:
-            tr_operator_matrix = _antiunitary_operator_representation_matrix(target_matrix, hermitian_basis)
-            tr_operator_matrix = np.real_if_close(tr_operator_matrix, tol=1000).real
+            anti_operator_matrix = _antiunitary_operator_representation_matrix(target_matrix, hermitian_basis)
+            anti_operator_matrix = np.real_if_close(anti_operator_matrix, tol=1000).real
 
     analyses = []
     for analysis in kp_form_solution_analyses:
@@ -2754,15 +3426,27 @@ def _final_kp_model_analyses(
         if real_candidate_rank == 0:
             continue
 
-        time_reversal_applied = tr_operator_matrix is not None
+        anti_linear_operation_applied = anti_operator_matrix is not None
         tr_even_rank = real_candidate_rank
         tr_odd_rank = 0
         final_basis = real_basis
         tr_even_singular_values: list[float] = []
         tr_odd_singular_values: list[float] = []
-        if time_reversal_applied:
-            parity = -1 if order % 2 else 1
-            tr_full = float(parity) * np.kron(tr_operator_matrix, np.eye(len(monomial_labels)))
+        if anti_linear_operation_applied:
+            lattice = info.get("lattice_vectors")
+            if str(function_transform_kind) == "pseudovector":
+                base_transform = _zeeman_field_transform_from_operation(anti_linear_operation or {}, lattice=lattice)
+            else:
+                base_transform = _reciprocal_rotation_from_operation(anti_linear_operation or {}, lattice=lattice)
+            function_transform = _polynomial_transform_matrix_for_labels(
+                -base_transform,
+                monomial_labels,
+                variable_labels=variable_labels,
+            )
+            tr_full = np.kron(
+                anti_operator_matrix,
+                np.linalg.inv(np.real_if_close(function_transform, tol=1000).real),
+            )
             even_basis, tr_even_singular_values = _real_tr_subspace(
                 real_basis,
                 tr_full,
@@ -2802,7 +3486,9 @@ def _final_kp_model_analyses(
                 "real_candidate_rank": real_candidate_rank,
                 "tr_even_rank": tr_even_rank,
                 "tr_odd_rank": tr_odd_rank,
-                "time_reversal_applied": bool(time_reversal_applied),
+                "anti_linear_operation_applied": bool(anti_linear_operation_applied),
+                "anti_linear_operator_index": anti_linear_operator_index,
+                "time_reversal_applied": bool(anti_linear_operation_applied),
                 "antiunitary_operation_index": antiunitary_operation_index,
                 "spgrep_operation_index": spgrep_operation_index,
                 "singular_values": singular_values,
@@ -2829,12 +3515,30 @@ def _spgrep_operations_summary(
     except ModuleNotFoundError as exc:
         raise ImportError("spgrep is required for KP spgrep operation output.") from exc
 
+    def _operation_keeps_kpoint(rotation: np.ndarray, *, antiunitary: bool, tol: float = 1.0e-6) -> bool:
+        return _symmetry_operation_keeps_kpoint(
+            rotation,
+            kpoint_array,
+            antiunitary=antiunitary,
+            tol=tol,
+        )
+
+    def _is_pure_time_reversal_source(source_index: int, tol: float = 1.0e-8) -> bool:
+        operation = operation_by_source_index[source_index]
+        rotation = np.asarray(operation["rotation"], dtype=float)
+        translation = np.asarray(operation["translation"], dtype=float)
+        return (
+            bool(operation["time_reversal"])
+            and np.allclose(rotation, np.eye(3), atol=tol, rtol=0.0)
+            and np.allclose(translation - np.rint(translation), 0.0, atol=tol, rtol=0.0)
+        )
+
     lattice = np.asarray(lattice, dtype=float)
     rotations = np.asarray(rotations, dtype=int)
     translations = np.asarray(translations, dtype=float)
     time_reversal_array = None if time_reversals is None else np.asarray(time_reversals, dtype=int)
     kpoint_array = np.asarray(kpoint, dtype=float)
-    if time_reversal_array is not None:
+    if time_reversal_array is not None and bool(spin_orbit):
         call = "get_spacegroup_spinor_irreps_from_primitive_symmetry(time_reversals=magnetic)"
         output = spgrep.get_spacegroup_spinor_irreps_from_primitive_symmetry(
             lattice,
@@ -2859,12 +3563,21 @@ def _spgrep_operations_summary(
         mapping_little_group = np.asarray(output[-1], dtype=int)
     else:
         call = "get_spacegroup_irreps_from_primitive_symmetry"
+        source_indices_for_irreps = np.arange(len(rotations), dtype=int)
+        if time_reversal_array is not None:
+            source_indices_for_irreps = np.asarray(
+                [idx for idx, flag in enumerate(time_reversal_array) if not bool(flag)],
+                dtype=int,
+            )
+            call = "get_spacegroup_irreps_from_primitive_symmetry(unitary subgroup)"
+        irrep_rotations = rotations[source_indices_for_irreps]
+        irrep_translations = translations[source_indices_for_irreps]
         coreps, mapping_little_group = spgrep.get_spacegroup_irreps_from_primitive_symmetry(
-            rotations,
-            translations,
+            irrep_rotations,
+            irrep_translations,
             kpoint_array,
         )
-        mapping_little_group = np.asarray(mapping_little_group, dtype=int)
+        mapping_little_group = source_indices_for_irreps[np.asarray(mapping_little_group, dtype=int)]
         anti_linear = np.zeros(len(mapping_little_group), dtype=bool)
 
     little_group_indices = {int(index) for index in mapping_little_group}
@@ -2876,26 +3589,51 @@ def _spgrep_operations_summary(
     operation_by_source_index = {}
     for index, (rotation, translation) in enumerate(zip(rotations, translations), start=1):
         zero_based_index = index - 1
+        time_reversal_flag = bool(time_reversal_array[zero_based_index]) if time_reversal_array is not None else False
         operation_by_source_index[zero_based_index] = {
             "spgrep_operation_index": int(index),
             "rotation": np.asarray(rotation, dtype=int),
             "translation": np.asarray(translation, dtype=float),
-            "time_reversal": bool(time_reversal_array[zero_based_index]) if time_reversal_array is not None else False,
-            "anti_linear": bool(anti_linear_by_operation.get(zero_based_index, False)),
+            "time_reversal": time_reversal_flag,
+            "anti_linear": bool(anti_linear_by_operation.get(zero_based_index, False)) or time_reversal_flag,
             "in_little_group": bool(zero_based_index in little_group_indices),
         }
+    if time_reversal_array is not None:
+        for source_index, operation in operation_by_source_index.items():
+            if bool(operation["time_reversal"]):
+                operation["in_little_group"] = _operation_keeps_kpoint(
+                    np.asarray(operation["rotation"], dtype=float),
+                    antiunitary=True,
+                )
     unitary_source_indices = [
+        source_index
+        for source_index, operation in operation_by_source_index.items()
+        if not bool(operation["time_reversal"]) and bool(operation["in_little_group"])
+    ]
+    all_unitary_source_indices = [
         source_index
         for source_index, operation in operation_by_source_index.items()
         if not bool(operation["time_reversal"])
     ]
     antiunitary_source_indices = [
         int(source_index)
-        for source_index in mapping_little_group
-        if bool(operation_by_source_index[int(source_index)]["time_reversal"])
+        for source_index, operation in operation_by_source_index.items()
+        if bool(operation["time_reversal"])
+        and bool(operation["in_little_group"])
+        and _operation_keeps_kpoint(np.asarray(operation["rotation"], dtype=float), antiunitary=True)
+    ]
+    all_antiunitary_source_indices = [
+        source_index
+        for source_index, operation in operation_by_source_index.items()
+        if bool(operation["time_reversal"])
     ]
     sorted_source_indices = _sort_spgrep_unitary_operations_by_character_order(
         unitary_source_indices,
+        operation_by_source_index,
+        character_operations,
+    )
+    sorted_all_unitary_source_indices = _sort_spgrep_unitary_operations_by_character_order(
+        all_unitary_source_indices,
         operation_by_source_index,
         character_operations,
     )
@@ -2903,16 +3641,83 @@ def _spgrep_operations_summary(
         source_index: display_index
         for display_index, source_index in enumerate(sorted_source_indices, start=1)
     }
+    all_source_to_display_index = {
+        source_index: display_index
+        for display_index, source_index in enumerate(sorted_all_unitary_source_indices, start=1)
+    }
     antiunitary_source_to_display_index = {
         source_index: display_index
         for display_index, source_index in enumerate(antiunitary_source_indices, start=1)
     }
+    all_antiunitary_source_to_display_index = {
+        source_index: display_index
+        for display_index, source_index in enumerate(all_antiunitary_source_indices, start=1)
+    }
+    reference_antiunitary_source_index = antiunitary_source_indices[0] if antiunitary_source_indices else None
+
+    def _translations_match_mod_lattice(left: np.ndarray, right: np.ndarray, tol: float = 1.0e-6) -> bool:
+        diff = np.asarray(left, dtype=float) - np.asarray(right, dtype=float)
+        return bool(np.allclose(diff - np.rint(diff), 0.0, atol=tol, rtol=0.0))
+
+    def _left_unitary_source_for_antiunitary(source_index: int) -> int | None:
+        if reference_antiunitary_source_index is None:
+            return None
+        target = operation_by_source_index[int(source_index)]
+        reference = operation_by_source_index[int(reference_antiunitary_source_index)]
+        target_rotation = np.asarray(target["rotation"], dtype=int)
+        target_translation = np.asarray(target["translation"], dtype=float)
+        reference_rotation = np.asarray(reference["rotation"], dtype=int)
+        reference_translation = np.asarray(reference["translation"], dtype=float)
+        for left_source_index in sorted_source_indices:
+            left = operation_by_source_index[int(left_source_index)]
+            left_rotation = np.asarray(left["rotation"], dtype=int)
+            left_translation = np.asarray(left["translation"], dtype=float)
+            composed_rotation = left_rotation @ reference_rotation
+            composed_translation = left_rotation @ reference_translation + left_translation
+            if not np.array_equal(composed_rotation, target_rotation):
+                continue
+            if _translations_match_mod_lattice(composed_translation, target_translation):
+                return int(left_source_index)
+        return None
+
+    all_operations = []
+    for source_index in sorted_all_unitary_source_indices:
+        operation = operation_by_source_index[source_index]
+        all_operations.append(
+            {
+                "operation_index": int(all_source_to_display_index[source_index]),
+                "spgrep_operation_index": int(operation["spgrep_operation_index"]),
+                "rotation": np.asarray(operation["rotation"], dtype=int).tolist(),
+                "translation": np.asarray(operation["translation"], dtype=float).tolist(),
+                "time_reversal": bool(operation["time_reversal"]),
+                "anti_linear": bool(operation["anti_linear"]),
+                "in_little_group": bool(operation["in_little_group"]),
+            }
+        )
+    all_antiunitary_operations = []
+    all_unitary_count = len(all_operations)
+    for source_index in all_antiunitary_source_indices:
+        operation = operation_by_source_index[source_index]
+        anti_index = int(all_antiunitary_source_to_display_index[source_index])
+        all_antiunitary_operations.append(
+            {
+                "antiunitary_operation_index": anti_index,
+                "operation_index": int(all_unitary_count + anti_index),
+                "spgrep_operation_index": int(operation["spgrep_operation_index"]),
+                "rotation": np.asarray(operation["rotation"], dtype=int).tolist(),
+                "translation": np.asarray(operation["translation"], dtype=float).tolist(),
+                "time_reversal": bool(operation["time_reversal"]),
+                "anti_linear": bool(operation["anti_linear"]),
+                "in_little_group": bool(operation["in_little_group"]),
+            }
+        )
     operations = []
     for source_index in sorted_source_indices:
         operation = operation_by_source_index[source_index]
         operations.append(
             {
                 "operation_index": int(source_to_display_index[source_index]),
+                "display_operation_index": int(all_source_to_display_index.get(source_index, source_to_display_index[source_index])),
                 "spgrep_operation_index": int(operation["spgrep_operation_index"]),
                 "rotation": np.asarray(operation["rotation"], dtype=int).tolist(),
                 "translation": np.asarray(operation["translation"], dtype=float).tolist(),
@@ -2924,15 +3729,43 @@ def _spgrep_operations_summary(
     antiunitary_operations = []
     for source_index in antiunitary_source_indices:
         operation = operation_by_source_index[source_index]
+        left_unitary_source_index = _left_unitary_source_for_antiunitary(source_index)
+        relation: dict[str, Any] = {}
+        if reference_antiunitary_source_index is not None:
+            relation["reference_antiunitary_operation_index"] = int(
+                antiunitary_source_to_display_index[reference_antiunitary_source_index]
+            )
+        if left_unitary_source_index is not None:
+            relation.update(
+                {
+                    "left_unitary_operation_index": int(source_to_display_index[left_unitary_source_index]),
+                    "left_unitary_display_operation_index": int(
+                        all_source_to_display_index.get(
+                            left_unitary_source_index,
+                            source_to_display_index[left_unitary_source_index],
+                        )
+                    ),
+                    "left_unitary_spgrep_operation_index": int(
+                        operation_by_source_index[left_unitary_source_index]["spgrep_operation_index"]
+                    ),
+                }
+            )
         antiunitary_operations.append(
             {
                 "antiunitary_operation_index": int(antiunitary_source_to_display_index[source_index]),
+                "display_operation_index": int(
+                    all_unitary_count + all_antiunitary_source_to_display_index.get(
+                        source_index,
+                        antiunitary_source_to_display_index[source_index],
+                    )
+                ),
                 "spgrep_operation_index": int(operation["spgrep_operation_index"]),
                 "rotation": np.asarray(operation["rotation"], dtype=int).tolist(),
                 "translation": np.asarray(operation["translation"], dtype=float).tolist(),
                 "time_reversal": bool(operation["time_reversal"]),
                 "anti_linear": bool(operation["anti_linear"]),
                 "in_little_group": bool(operation["in_little_group"]),
+                **relation,
             }
         )
     corep_summaries = []
@@ -2958,6 +3791,27 @@ def _spgrep_operations_summary(
                         "matrix": _complex_matrix_to_pairs(corep_array[position]),
                     }
                 )
+        if time_reversal_array is not None and not bool(spin_orbit) and corep_array.size:
+            dimension = int(corep_array.shape[-1])
+            unitary_corep_matrices = [
+                np.asarray(corep_array[position], dtype=complex)
+                for position, source_index in enumerate(mapping_little_group)
+                if int(source_index) in source_to_display_index
+            ]
+            try:
+                time_reversal_matrix = _spinless_time_reversal_sewing_matrix(unitary_corep_matrices)
+            except ValueError:
+                time_reversal_matrix = np.eye(dimension, dtype=complex)
+            for source_index in antiunitary_source_indices:
+                if not _is_pure_time_reversal_source(source_index):
+                    continue
+                antiunitary_operation_matrices.append(
+                    {
+                        "antiunitary_operation_index": int(antiunitary_source_to_display_index[source_index]),
+                        "spgrep_operation_index": int(source_index) + 1,
+                        "matrix": _complex_matrix_to_pairs(time_reversal_matrix),
+                    }
+                )
         corep_summaries.append(
             {
                 "corep_index": int(corep_index),
@@ -2972,6 +3826,7 @@ def _spgrep_operations_summary(
 
     return {
         "call": call,
+        "spin_orbit": bool(spin_orbit),
         "coordinate_convention": "x' = R x + tau",
         "kpoint": kpoint_array.tolist(),
         "little_group_mapping_zero_based": sorted_source_indices,
@@ -2979,6 +3834,18 @@ def _spgrep_operations_summary(
         "spgrep_little_group_mapping_zero_based": mapping_little_group.tolist(),
         "spgrep_little_group_mapping_one_based": [int(index) + 1 for index in mapping_little_group],
         "corep_shapes": [list(np.asarray(corep).shape) for corep in coreps],
+        "all_operations": all_operations,
+        "all_antiunitary_operations": all_antiunitary_operations,
+        "little_group_linear_operation_indices": [
+            int(all_source_to_display_index[index])
+            for index in sorted_source_indices
+            if index in all_source_to_display_index
+        ],
+        "little_group_anti_linear_operation_indices": [
+            int(all_unitary_count + all_antiunitary_source_to_display_index[index])
+            for index in antiunitary_source_indices
+            if index in all_antiunitary_source_to_display_index
+        ],
         "operations": operations,
         "antiunitary_operations": antiunitary_operations,
         "coreps": corep_summaries,
@@ -3144,7 +4011,7 @@ def _collect_kp_symmetry_info(
         info["spin_group"] = {"enabled": False, "operation_count": 0, "operations": []}
     kpoint_records = list(analysis_result.get("kpoint_records") or [])
     if kpoint_records:
-        spgrep_kpoint = _vector3(kpoint_records[0].get("k_direct"), [0.0, 0.0, 0.0])
+        spgrep_kpoint = _spgrep_reference_kpoint_from_record(kpoint_records[0])
     else:
         spgrep_kpoint = [0.0, 0.0, 0.0]
     info["spgrep_operations"] = _spgrep_operations_summary(
@@ -3434,17 +4301,21 @@ def _format_spgrep_character_style_operations(
     if not spgrep_info:
         return []
 
+    unitary_records = list(spgrep_info.get("all_operations") or spgrep_info.get("operations") or [])
+    antiunitary_records = list(
+        spgrep_info.get("all_antiunitary_operations") or spgrep_info.get("antiunitary_operations") or []
+    )
     operation_records = [
         dict(operation, kind="unitary")
         for operation in sorted(
-            list(spgrep_info.get("operations") or []),
+            unitary_records,
             key=lambda item: int(item.get("operation_index", 0)),
         )
     ]
     operation_records.extend(
         dict(operation, kind="antiunitary")
         for operation in sorted(
-            list(spgrep_info.get("antiunitary_operations") or []),
+            antiunitary_records,
             key=lambda item: int(item.get("antiunitary_operation_index", 0)),
         )
     )
@@ -3456,6 +4327,8 @@ def _format_spgrep_character_style_operations(
     if star_line is not None:
         lines.append(star_line)
     lines.append("Symmetry operations Pi={Ri|taui+tm}   note: defined in Symmetrized Stru")
+    lines.append(f"Number of linear operations: {len(unitary_records)}")
+    lines.append(f"Number of  anti-linear operations: {len(antiunitary_records)}")
     lines.append(separator)
     for display_index, operation in enumerate(operation_records, start=1):
         rotation = np.asarray(operation.get("rotation", np.eye(3, dtype=int)), dtype=int)
@@ -3899,7 +4772,24 @@ def _format_kpoint_record_lines(
     records: Sequence[Mapping[str, Any]],
     *,
     star_line: str | None,
+    spgrep_info: Mapping[str, Any] | None = None,
 ) -> list[str]:
+    spgrep = spgrep_info or {}
+    little_linear_indices = [int(index) for index in spgrep.get("little_group_linear_operation_indices", []) or []]
+    little_anti_linear_indices = [
+        int(index) for index in spgrep.get("little_group_anti_linear_operation_indices", []) or []
+    ]
+    if little_linear_indices:
+        linear_indices = " ".join(str(index) for index in little_linear_indices)
+    else:
+        linear_count = len(spgrep.get("operations") or [])
+        linear_indices = " ".join(str(index) for index in range(1, linear_count + 1))
+    if little_anti_linear_indices:
+        anti_linear_indices = " ".join(str(index) for index in little_anti_linear_indices)
+    else:
+        linear_count = len(spgrep.get("operations") or [])
+        anti_linear_count = len(spgrep.get("antiunitary_operations") or [])
+        anti_linear_indices = " ".join(str(linear_count + index) for index in range(1, anti_linear_count + 1))
     lines: list[str] = []
     for record in records:
         kpoint = _vector3(record.get("k_direct"), [0.0, 0.0, 0.0])
@@ -3917,6 +4807,13 @@ def _format_kpoint_record_lines(
                 str(record.get("star_transform", "The k-point is transformed by Identity operation to k-star")),
                 f"Primitive    basis  {_display_float(primitive_basis[0]): .6f} {_display_float(primitive_basis[1]): .6f} {_display_float(primitive_basis[2]): .6f}",
                 f"Conventional basis  {_display_float(conventional_basis[0]): .6f} {_display_float(conventional_basis[1]): .6f} {_display_float(conventional_basis[2]): .6f}",
+            ]
+        )
+        if spgrep_info is not None:
+            lines.append(f"Existence of linear operations: {linear_indices} ")
+            lines.append(f"Existence of non-linear operations: {anti_linear_indices} ")
+        lines.extend(
+            [
                 f"Band range : {band_range[0]}-{band_range[1]}",
                 f"Band rep:    {record.get('band_rep', '')}",
             ]
@@ -3967,7 +4864,7 @@ def _format_block_matrix_rows(
         blocks = []
         for start, dimension, width in zip(starts, dims, widths, strict=True):
             if row >= dimension:
-                blocks.append("")
+                blocks.append(" " * width)
                 continue
             entries = " ".join(
                 _format_complex_pair_3(_complex_scalar_to_pair(matrix[start + row, start + column]))
@@ -4045,9 +4942,14 @@ def _format_schur_basis_transformation(
     antiunitary_indices = list(analysis.get("antiunitary_operation_indices", []) or [])
     numeric_antiunitary = list(analysis.get("numeric_antiunitary_representation_matrices", []) or [])
     standard_antiunitary = list(analysis.get("spgrep_antiunitary_representation_matrices", []) or [])
+    transformed_antiunitary = list(alignment.get("transformed_numeric_antiunitary_matrices", []) or [])
     if antiunitary_indices and numeric_antiunitary and standard_antiunitary:
-        operation_indices = [int(index) for index in analysis.get("operation_indices", []) or []]
-        display_index = (max(operation_indices) if operation_indices else 0) + int(antiunitary_indices[0])
+        display_indices = [int(index) for index in analysis.get("antiunitary_display_operation_indices", []) or []]
+        if display_indices:
+            display_index = display_indices[0]
+        else:
+            operation_indices = [int(index) for index in analysis.get("operation_indices", []) or []]
+            display_index = (max(operation_indices) if operation_indices else 0) + int(antiunitary_indices[0])
         lines.extend(
             [
                 "Anti-linear symmetry representation matrices",
@@ -4059,6 +4961,9 @@ def _format_schur_basis_transformation(
         lines.extend(_format_block_matrix_rows(standard_antiunitary[0], dimensions))
         lines.append("  Numerical basis:")
         lines.extend(_format_block_matrix_rows(numeric_antiunitary[0], dimensions))
+        if transformed_antiunitary:
+            lines.append("  Numerical basis after transform:")
+            lines.extend(_format_block_matrix_rows(transformed_antiunitary[0], dimensions))
     if phase_matrix is not None and phase_matrix.shape == unitary.shape:
         phases = list(phase_refinement.get("block_phases_rad", []) or []) if isinstance(phase_refinement, Mapping) else []
         for label, dimension, phase in zip(labels, dimensions, phases, strict=False):
@@ -4093,8 +4998,10 @@ def _format_linear_representation_matrix_comparison_analyses(
     for analysis in analyses:
         dimensions = [int(value) for value in analysis.get("target_corep_dimensions", []) or []]
         labels = _representation_block_labels(analysis)
+        alignment = analysis.get("schur_alignment", {})
         numeric_matrices = list(analysis.get("numeric_representation_matrices", []) or [])
         standard_matrices = list(analysis.get("spgrep_representation_matrices", []) or [])
+        transformed_matrices = list(alignment.get("transformed_numeric_matrices", []) or [])
         operation_indices = list(analysis.get("operation_indices", []) or [])
         if not dimensions or not labels or not operation_indices:
             continue
@@ -4107,6 +5014,9 @@ def _format_linear_representation_matrix_comparison_analyses(
             lines.extend(_format_block_matrix_rows(standard_matrices[pos], dimensions))
             lines.append("  Numerical basis:")
             lines.extend(_format_block_matrix_rows(numeric_matrices[pos], dimensions))
+            if pos < len(transformed_matrices):
+                lines.append("  Numerical basis after transform:")
+                lines.extend(_format_block_matrix_rows(transformed_matrices[pos], dimensions))
             lines.append(separator)
         lines.extend(
             _format_schur_basis_transformation(
@@ -4295,9 +5205,19 @@ def _format_kp_form_solution_analyses(
     if not analyses:
         return []
     final_terms_by_order: dict[int, list[Mapping[str, Any]]] = {}
+    final_anti_applied_by_order: dict[int, bool] = {}
+    final_anti_operator_by_order: dict[int, int] = {}
+    final_antiunitary_by_order: dict[int, int] = {}
+    final_spgrep_by_order: dict[int, int] = {}
     for analysis in final_kp_model_analyses or []:
-        final_terms_by_order[int(analysis.get("order", 0))] = list(analysis.get("terms", []))
-    time_reversal_applied = bool(time_reversal_analyses or final_kp_model_analyses)
+        order = int(analysis.get("order", 0))
+        final_terms_by_order[order] = list(analysis.get("terms", []))
+        final_anti_applied_by_order[order] = bool(
+            analysis.get("anti_linear_operation_applied", analysis.get("time_reversal_applied", False))
+        )
+        final_anti_operator_by_order[order] = int(analysis.get("anti_linear_operator_index", 0))
+        final_antiunitary_by_order[order] = int(analysis.get("antiunitary_operation_index", 0))
+        final_spgrep_by_order[order] = int(analysis.get("spgrep_operation_index", 0))
     tr_allowed_labels = {
         str(check.get("label", ""))
         for analysis in (time_reversal_analyses or [])
@@ -4328,8 +5248,11 @@ def _format_kp_form_solution_analyses(
                     f"{term.get('label', '')} = "
                     f"{_format_kp_product_combination(term.get('linear_combination', []))}"
                 )
-            lines.append(f"Time reversal applied: {'yes' if time_reversal_applied else 'no'}")
-            if time_reversal_applied:
+            order_anti_linear_applied = bool(time_reversal_analyses) or final_anti_applied_by_order.get(order, False)
+            lines.append(f"Anti-linear operation applied: {'yes' if order_anti_linear_applied else 'no'}")
+            if order_anti_linear_applied and final_anti_operator_by_order.get(order, 0):
+                lines.append(f"anti-linear operator index: {final_anti_operator_by_order[order]}")
+            if order_anti_linear_applied or final_terms_by_order:
                 printed_count = 0
                 if final_terms_by_order:
                     pair_support = _kp_pair_product_support(pair)
@@ -4374,9 +5297,19 @@ def _format_zeeman_form_solution_analyses(
     if not analyses:
         return []
     final_terms_by_order: dict[int, list[Mapping[str, Any]]] = {}
+    final_anti_applied_by_order: dict[int, bool] = {}
+    final_anti_operator_by_order: dict[int, int] = {}
+    final_antiunitary_by_order: dict[int, int] = {}
+    final_spgrep_by_order: dict[int, int] = {}
     for analysis in final_zeeman_analyses or []:
-        final_terms_by_order[int(analysis.get("order", 0))] = list(analysis.get("terms", []))
-    time_reversal_applied = bool(final_zeeman_analyses)
+        order = int(analysis.get("order", 0))
+        final_terms_by_order[order] = list(analysis.get("terms", []))
+        final_anti_applied_by_order[order] = bool(
+            analysis.get("anti_linear_operation_applied", analysis.get("time_reversal_applied", False))
+        )
+        final_anti_operator_by_order[order] = int(analysis.get("anti_linear_operator_index", 0))
+        final_antiunitary_by_order[order] = int(analysis.get("antiunitary_operation_index", 0))
+        final_spgrep_by_order[order] = int(analysis.get("spgrep_operation_index", 0))
     separator = "---------------------------------------------------------------------------------------"
     lines: list[str] = []
     if star_line is not None:
@@ -4403,8 +5336,11 @@ def _format_zeeman_form_solution_analyses(
                     f"{term.get('label', '')} = "
                     f"{term_text}"
                 )
-            lines.append(f"Time reversal applied: {'yes' if time_reversal_applied else 'no'}")
-            if time_reversal_applied:
+            order_anti_linear_applied = final_anti_applied_by_order.get(order, False)
+            lines.append(f"Anti-linear operation applied: {'yes' if order_anti_linear_applied else 'no'}")
+            if order_anti_linear_applied and final_anti_operator_by_order.get(order, 0):
+                lines.append(f"anti-linear operator index: {final_anti_operator_by_order[order]}")
+            if order_anti_linear_applied or final_terms_by_order:
                 for final_index, final_term in enumerate(final_terms_by_order.get(order, [])):
                     if final_index in used_final_indices:
                         continue
@@ -4427,13 +5363,14 @@ def _format_time_reversal_constraint_analyses(
     lines: list[str] = []
     if star_line is not None:
         lines.append(star_line)
-    lines.append("Time-reversal constraint check for k.p invariant terms")
+    lines.append("Anti-linear constraint check for k.p invariant terms")
     for analysis in analyses:
         lines.extend(
             [
                 f"target band representation: {analysis.get('target_label', '')}",
                 "target corep indices: "
                 + " ".join(str(int(index)) for index in analysis.get("target_corep_indices", [])),
+                f"anti-linear operator index: {int(analysis.get('anti_linear_operator_index', 0))}",
                 f"antiunitary operation index: {int(analysis.get('antiunitary_operation_index', 0))}",
                 f"spgrep operation index: {int(analysis.get('spgrep_operation_index', 0))}",
                 f"k transform: {analysis.get('k_transform', 'k -> -k')}",
@@ -4464,9 +5401,9 @@ def _format_final_kp_model_analyses(
         lines.append(star_line)
     lines.extend(
         [
-            "Final real Hermitian time-reversal-even k.p basis",
+            "Final real Hermitian anti-linear-even k.p basis",
             "basis convention: real coefficients multiplying Hermitian Xi and real k-polynomials",
-            "time reversal projection: keep +1 eigenspace within each order",
+            "anti-linear projection: keep +1 eigenspace within each order",
         ]
     )
     for analysis in analyses:
@@ -4479,12 +5416,14 @@ def _format_final_kp_model_analyses(
                 f"real_candidate_rank = {int(analysis.get('real_candidate_rank', 0))}",
                 f"tr_even_rank = {int(analysis.get('tr_even_rank', 0))}",
                 f"tr_odd_rank = {int(analysis.get('tr_odd_rank', 0))}",
-                f"time reversal applied: {'yes' if bool(analysis.get('time_reversal_applied', False)) else 'no'}",
+                "anti-linear operation applied: "
+                f"{'yes' if bool(analysis.get('anti_linear_operation_applied', analysis.get('time_reversal_applied', False))) else 'no'}",
             ]
         )
-        if bool(analysis.get("time_reversal_applied", False)):
+        if bool(analysis.get("anti_linear_operation_applied", analysis.get("time_reversal_applied", False))):
             lines.extend(
                 [
+                    f"anti-linear operator index: {int(analysis.get('anti_linear_operator_index', 0))}",
                     f"antiunitary operation index: {int(analysis.get('antiunitary_operation_index', 0))}",
                     f"spgrep operation index: {int(analysis.get('spgrep_operation_index', 0))}",
                 ]
@@ -4509,9 +5448,9 @@ def _format_final_zeeman_model_analyses(
         lines.append(star_line)
     lines.extend(
         [
-            "Final real Hermitian time-reversal-even Zeeman basis",
+            "Final real Hermitian anti-linear-even Zeeman basis",
             "basis convention: real coefficients multiplying Hermitian Xi and real B-field components",
-            "time reversal projection: B is odd under time reversal; keep +1 eigenspace",
+            "anti-linear projection: B is transformed by the selected anti-linear operation; keep +1 eigenspace",
         ]
     )
     for analysis in analyses:
@@ -4524,12 +5463,14 @@ def _format_final_zeeman_model_analyses(
                 f"real_candidate_rank = {int(analysis.get('real_candidate_rank', 0))}",
                 f"tr_even_rank = {int(analysis.get('tr_even_rank', 0))}",
                 f"tr_odd_rank = {int(analysis.get('tr_odd_rank', 0))}",
-                f"time reversal applied: {'yes' if bool(analysis.get('time_reversal_applied', False)) else 'no'}",
+                "anti-linear operation applied: "
+                f"{'yes' if bool(analysis.get('anti_linear_operation_applied', analysis.get('time_reversal_applied', False))) else 'no'}",
             ]
         )
-        if bool(analysis.get("time_reversal_applied", False)):
+        if bool(analysis.get("anti_linear_operation_applied", analysis.get("time_reversal_applied", False))):
             lines.extend(
                 [
+                    f"anti-linear operator index: {int(analysis.get('anti_linear_operator_index', 0))}",
                     f"antiunitary operation index: {int(analysis.get('antiunitary_operation_index', 0))}",
                     f"spgrep operation index: {int(analysis.get('spgrep_operation_index', 0))}",
                 ]
@@ -5145,7 +6086,42 @@ def _format_schur_kp_parameter_fit_analyses(
                 lines.extend(section_lines)
                 lines.append(separator)
         if lines and lines[-1] == separator:
-            lines.pop()
+                lines.pop()
+    return lines
+
+
+def _format_vector3(values: Sequence[float]) -> str:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    if array.size < 3:
+        array = np.pad(array, (0, 3 - array.size), constant_values=0.0)
+    return f"{array[0]: .6f} {array[1]: .6f} {array[2]: .6f}"
+
+
+def _format_kp_energy_error_analyses(
+    analyses: Sequence[Mapping[str, Any]],
+    *,
+    star_line: str | None,
+) -> list[str]:
+    if not analyses:
+        return []
+    lines: list[str] = []
+    if star_line is not None:
+        lines.append(star_line)
+    lines.append("kp band test:")
+    separator = "---------------------------------------------------------------------------------------"
+    for index, analysis in enumerate(analyses):
+        if index > 0:
+            lines.append(separator)
+            lines.append(f"selection = {int(analysis.get('selection_index', index + 1))}")
+        grid = int(analysis.get("grid_points_per_axis", 0))
+        lines.extend(
+            [
+                f"MP grid around k0: {grid} {grid} {grid}",
+                f"Radius: {float(analysis.get('radius_A^-1', 0.0)):.6f} A^-1",
+                f"Band max error:  {float(analysis.get('max_abs_error_eV', 0.0)):.12e} eV",
+                f"Band mean error: {float(analysis.get('mean_abs_error_eV', 0.0)):.12e} eV",
+            ]
+        )
     return lines
 
 
@@ -5573,6 +6549,7 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
         _format_kpoint_record_lines(
             info.get("kpoint_records") or [],
             star_line=star_line,
+            spgrep_info=spgrep_info,
         )
     )
     lines.extend(
@@ -5667,6 +6644,19 @@ def _write_kp_model_header(info: Mapping[str, Any], path: Path) -> None:
             star_line=star_line,
         )
     )
+    energy_error_lines = _format_kp_energy_error_analyses(
+        info.get("kp_energy_error_analyses", []),
+        star_line=star_line,
+    )
+    if energy_error_lines:
+        if lines and lines[-1] == "Finished":
+            lines.pop()
+            if lines and star_line is not None and lines[-1] == star_line:
+                lines.pop()
+        lines.extend(energy_error_lines)
+        if star_line is not None:
+            lines.append(star_line)
+        lines.append("Finished")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -5754,6 +6744,8 @@ def calculate_kp_irreps(
     mag: str | Sequence[float] = "auto",
     korder: int = 2,
     zeeman_term: str | bool | int = "yes",
+    kp_radius: float = 0.0,
+    kp_grid: int = 4,
     rR_route: str | Sequence[str] | None = None,
     rR_unit: str = "Angstrom",
     **character_kwargs,
@@ -5782,6 +6774,12 @@ def calculate_kp_irreps(
         raise ValueError("KP.korder must be zero or a positive integer.")
     k_orders = tuple(range(max_k_order + 1))
     include_zeeman = _kp_zeeman_enabled(zeeman_term)
+    kp_radius_value = float(kp_radius)
+    if kp_radius_value < 0.0:
+        raise ValueError("KP.kp_radius must be zero or a positive float.")
+    kp_grid_value = int(kp_grid)
+    if kp_grid_value <= 0:
+        raise ValueError("KP.kp_grid must be a positive integer.")
 
     selections = [
         KPointBandSelection(kpoint=kpoints[index], band=bands[index], label=labels[index])
@@ -5820,6 +6818,8 @@ def calculate_kp_irreps(
                 )
                 symmetry_info["korder"] = int(max_k_order)
                 symmetry_info["zeeman_term"] = "yes" if include_zeeman else "no"
+                symmetry_info["kp_radius"] = float(kp_radius_value)
+                symmetry_info["kp_grid"] = int(kp_grid_value)
                 symmetry_info["kpoint_records"] = _kp_model_kpoint_records(results)
                 operator_analyses = _operator_irrep_analyses_for_results(
                     symmetry_info,
@@ -5879,12 +6879,21 @@ def calculate_kp_irreps(
                             operator_analyses,
                             zeeman_form_solutions,
                             term_prefix="Z",
+                            variable_labels=ZEEMAN_FIELD_DIRECTIONS,
+                            function_transform_kind="pseudovector",
                         )
                         if final_zeeman_model:
                             symmetry_info["final_zeeman_model_analyses"] = final_zeeman_model
+                alignment_tb = _active_hs_tb_from_character_payload(
+                    tb,
+                    payload,
+                    HR_unit=character_kwargs.get("HR_unit"),
+                )
                 representation_alignments = _representation_alignment_analyses_for_results(
                     symmetry_info,
                     results,
+                    tb=alignment_tb,
+                    symm_prec=float(symm_prec),
                 )
                 if representation_alignments:
                     symmetry_info["representation_alignment_analyses"] = representation_alignments
@@ -5910,9 +6919,20 @@ def calculate_kp_irreps(
                     schur_fits = _schur_kp_parameter_fit_analyses(
                         symmetry_info,
                         representation_alignments,
+                        max_order=max_k_order,
                     )
                     if schur_fits:
                         symmetry_info["schur_kp_parameter_fit_analyses"] = schur_fits
+                        if kp_radius_value > 0.0:
+                            energy_errors = _kp_energy_error_analyses(
+                                lowdin_tb,
+                                schur_fits,
+                                symmetry_info.get("numeric_lowdin_kp_analyses", []),
+                                radius=kp_radius_value,
+                                grid=kp_grid_value,
+                            )
+                            if energy_errors:
+                                symmetry_info["kp_energy_error_analyses"] = energy_errors
                     if include_zeeman:
                         zeeman_fits = _schur_zeeman_parameter_fit_analyses(
                             symmetry_info,
