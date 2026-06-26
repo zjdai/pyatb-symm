@@ -1,2 +1,3 @@
 from pyatb.symmetry.character import Character
 from pyatb.symmetry.kp import KPointBandSelection, calculate_kp_irreps, calculate_kpoint_irreps
+from pyatb.symmetry.test_velocity import VelocityCovarianceTester, run_velocity_covariance_test
