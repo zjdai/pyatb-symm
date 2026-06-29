@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -243,7 +244,8 @@ class VelocityCovarianceTester:
 
     The convention follows ``build_dk_matrix``: a unitary operation maps a source
     k point to ``k @ inv(R)``.  A time-reversal operation maps it to
-    ``-k @ inv(R)`` and is represented as ``D(g, k) U_T K`` in the basis space.
+    ``-k @ inv(R)`` and is represented with the target-k phase ``D(g, k') U_T K``
+    in the basis space.
     Velocity is treated as a time-reversal-odd Cartesian vector operator.
     """
 
@@ -259,7 +261,7 @@ class VelocityCovarianceTester:
         soc: bool | None = None,
         kpoints: Sequence[Sequence[float]] | np.ndarray | None = None,
         hr_unit: str = "Ry",
-        rR_unit: str = "Angstrom",
+        rR_unit: str = "Bohr",
         is_sparse: bool = False,
         max_kpoint_num: int = 8000,
         pseudo_dir: str | Path = "./",
@@ -407,10 +409,10 @@ class VelocityCovarianceTester:
         self._k_cache[key] = data
         return data
 
-    def _operator_matrix(self, operation: Mapping[str, Any], source_k: np.ndarray) -> np.ndarray:
+    def _operator_matrix(self, operation: Mapping[str, Any], representation_k: np.ndarray) -> np.ndarray:
         dk = build_dk_matrix(
             self.tb,
-            np.asarray(source_k, dtype=float),
+            np.asarray(representation_k, dtype=float),
             operation,
             map_tol=self.map_tol,
         )
@@ -422,7 +424,7 @@ class VelocityCovarianceTester:
         self,
         source_velocity: np.ndarray,
         operation: Mapping[str, Any],
-        source_k: np.ndarray,
+        target_k: np.ndarray,
     ) -> np.ndarray:
         velocity = np.asarray(source_velocity, dtype=complex)
         cart_rotation = np.asarray(operation["cart_rotation"], dtype=float)
@@ -433,7 +435,7 @@ class VelocityCovarianceTester:
                 if abs(coeff) > 1.0e-14:
                     mixed[alpha] += coeff * velocity[beta]
 
-        op_matrix = self._operator_matrix(operation, source_k)
+        op_matrix = self._operator_matrix(operation, target_k)
         if bool(operation.get("time_reversal", False)):
             mixed = -np.conj(mixed)
         return np.asarray([op_matrix @ mixed[alpha] @ op_matrix.conj().T for alpha in range(3)], dtype=complex)
@@ -446,7 +448,7 @@ class VelocityCovarianceTester:
         )
         source = self._kpoint_data(source_k)
         target = self._kpoint_data(target_k)
-        predicted = self._predicted_velocity(source.velocity_basis, operation, source.k_direct)
+        predicted = self._predicted_velocity(source.velocity_basis, operation, target.k_direct)
         error = _matrix_error(target.velocity_basis, predicted)
         relation = "little_group" if _k_equivalent(target_k, source_k, self.k_tol) else "k_star"
         return {
@@ -544,10 +546,10 @@ class VelocityCovarianceTester:
             "convention": {
                 "k_mapping_unitary": "k' = k @ inv(R)",
                 "k_mapping_antiunitary": "k' = -k @ inv(R)",
-                "unitary_velocity": "V_alpha(k') = D(k,g) [sum_beta O_alpha_beta V_beta(k)] D(k,g)^dag",
+                "unitary_velocity": "V_alpha(k') = D(k',g) [sum_beta O_alpha_beta V_beta(k)] D(k',g)^dag",
                 "antiunitary_velocity": (
-                    "V_alpha(k') = D(k,g) U_T [-conj(sum_beta O_alpha_beta V_beta(k))] "
-                    "U_T^dag D(k,g)^dag"
+                    "V_alpha(k') = D(k',g) U_T [-conj(sum_beta O_alpha_beta V_beta(k))] "
+                    "U_T^dag D(k',g)^dag"
                 ),
                 "matrix_space": "basis representation returned by tb_solver.get_velocity_basis_k",
             },
@@ -594,3 +596,107 @@ def run_velocity_covariance_test(
     **kwargs,
 ) -> dict[str, Any]:
     return VelocityCovarianceTester(structure_path, hsr_path, **kwargs).run()
+
+
+def _read_json_array(path: str | Path | None) -> Any:
+    if path is None:
+        return None
+    return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Validate pyatb velocity matrices against magnetic symmetry covariance.",
+    )
+    parser.add_argument("--structure", required=True, help="ABACUS STRU path.")
+    parser.add_argument(
+        "--hsr-path",
+        help=(
+            "Directory containing data-HR-sparse_SPIN0.csr, data-SR-sparse_SPIN0.csr, "
+            "and data-rR-sparse.csr. Explicit --hr-path/--sr-path/--rR-path override this."
+        ),
+    )
+    parser.add_argument("--hr-path", help="Explicit HR csr path.")
+    parser.add_argument("--sr-path", help="Explicit SR csr path.")
+    parser.add_argument("--rR-path", help="Explicit rR csr path.")
+    parser.add_argument(
+        "--kpoint",
+        action="append",
+        nargs=3,
+        type=float,
+        metavar=("KX", "KY", "KZ"),
+        help="Direct-coordinate source k point. May be passed multiple times. Default: 0 0 0.",
+    )
+    parser.add_argument("--output", default="velocity_covariance_report.json", help="Output JSON report path.")
+    parser.add_argument("--nspin", type=int, default=4, choices=(1, 4), help="pyatb spin channel setting.")
+    parser.add_argument("--soc", action=argparse.BooleanOptionalAction, default=None, help="Override SOC mode.")
+    parser.add_argument("--hr-unit", default="Ry", help="HR energy unit passed to abacus_readHR.")
+    parser.add_argument("--rR-unit", default="Bohr", help="rR length unit passed to abacus_readrR.")
+    parser.add_argument("--is-sparse", action="store_true", help="Use sparse H/S/rR solver data.")
+    parser.add_argument("--max-kpoint-num", type=int, default=8000, help="TB model k-point allocation.")
+    parser.add_argument("--pseudo-dir", default="./", help="Pseudopotential directory used by TBModel.read_stru.")
+    parser.add_argument("--orbital-dir", default="./", help="Orbital directory used by TBModel.read_stru.")
+    parser.add_argument("--symprec", type=float, default=1.0e-5, help="spglib symmetry tolerance.")
+    parser.add_argument("--mag-symprec", type=float, default=None, help="spglib magnetic moment tolerance.")
+    parser.add_argument("--k-tol", type=float, default=1.0e-6, help="Tolerance for little-group k equivalence.")
+    parser.add_argument("--map-tol", type=float, default=1.0e-6, help="Tolerance passed to build_dk_matrix.")
+    parser.add_argument(
+        "--magnetic-moments-json",
+        help="Optional JSON file containing magnetic moments, shaped as spglib expects.",
+    )
+    parser.add_argument(
+        "--no-time-reversal",
+        action="store_true",
+        help="Disable time-reversal operations in spglib.get_magnetic_symmetry.",
+    )
+    parser.add_argument(
+        "--is-axial",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override spglib magnetic moment axial-vector mode.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    kpoints = args.kpoint if args.kpoint is not None else [[0.0, 0.0, 0.0]]
+    tester = VelocityCovarianceTester(
+        args.structure,
+        args.hsr_path,
+        hr_path=args.hr_path,
+        sr_path=args.sr_path,
+        rR_path=args.rR_path,
+        nspin=args.nspin,
+        soc=args.soc,
+        kpoints=kpoints,
+        hr_unit=args.hr_unit,
+        rR_unit=args.rR_unit,
+        is_sparse=args.is_sparse,
+        max_kpoint_num=args.max_kpoint_num,
+        pseudo_dir=args.pseudo_dir,
+        orbital_dir=args.orbital_dir,
+        symprec=args.symprec,
+        mag_symprec=args.mag_symprec,
+        k_tol=args.k_tol,
+        map_tol=args.map_tol,
+        magnetic_moments=_read_json_array(args.magnetic_moments_json),
+        with_time_reversal=not args.no_time_reversal,
+        is_axial=args.is_axial,
+    )
+    report = tester.write_report(args.output)
+    summary = report["summary"]["all"]
+    print(f"Wrote velocity covariance report: {args.output}")
+    print(
+        "All operations: "
+        f"count={summary['count']} "
+        f"max_abs={summary['global_max_abs']:.12e} "
+        f"mean_abs={summary['mean_abs_over_records']:.12e} "
+        f"rms_abs={summary['rms_abs_over_records']:.12e} "
+        f"max_rel_fro={summary['max_rel_fro_over_records']:.12e}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

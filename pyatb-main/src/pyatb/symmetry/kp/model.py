@@ -1883,6 +1883,7 @@ def _kp_energy_error_analyses(
             continue
         error = kp_energy_array - direct_energies
         abs_error = np.abs(error)
+        kp_band_range = np.max(kp_energy_array, axis=0) - np.min(kp_energy_array, axis=0)
         worst_flat_index = int(np.argmax(abs_error))
         worst_point_index, worst_band_index = np.unravel_index(worst_flat_index, abs_error.shape)
         analyses.append(
@@ -1901,6 +1902,7 @@ def _kp_energy_error_analyses(
                 "max_abs_error_eV": float(np.max(abs_error)),
                 "mean_abs_error_eV": float(np.mean(abs_error)),
                 "rms_error_eV": float(np.sqrt(np.mean(abs_error**2))),
+                "per_band_kp_energy_range_eV": [float(value) for value in kp_band_range],
                 "per_band_max_abs_error_eV": [float(value) for value in np.max(abs_error, axis=0)],
                 "per_band_mean_abs_error_eV": [float(value) for value in np.mean(abs_error, axis=0)],
                 "worst_point_index": int(worst_point_index + 1),
@@ -6203,6 +6205,13 @@ def _format_vector3(values: Sequence[float]) -> str:
     return f"{array[0]: .6f} {array[1]: .6f} {array[2]: .6f}"
 
 
+def _format_eV_list(values: Sequence[float]) -> str:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    if array.size == 0:
+        return "none"
+    return " ".join(f"{float(value):.12e}" for value in array)
+
+
 def _format_kp_energy_error_analyses(
     analyses: Sequence[Mapping[str, Any]],
     *,
@@ -6227,8 +6236,12 @@ def _format_kp_energy_error_analyses(
             [
                 f"MP grid around k0: {int(grid_shape[0])} {int(grid_shape[1])} {int(grid_shape[2])}",
                 f"Radius: {float(analysis.get('radius_A^-1', 0.0)):.6f} A^-1",
-                f"Band max error:  {float(analysis.get('max_abs_error_eV', 0.0)):.12e} eV",
-                f"Band mean error: {float(analysis.get('mean_abs_error_eV', 0.0)):.12e} eV",
+                "Band range:      "
+                f"{_format_eV_list(analysis.get('per_band_kp_energy_range_eV', []))} eV",
+                "Band mean error: "
+                f"{_format_eV_list(analysis.get('per_band_mean_abs_error_eV', []))} eV",
+                "Band max error:  "
+                f"{_format_eV_list(analysis.get('per_band_max_abs_error_eV', []))} eV",
             ]
         )
     return lines

@@ -1867,14 +1867,18 @@ def test_kp_energy_error_analysis_compares_fitted_kp_to_direct_bands(load_pyatb)
     assert analysis["max_abs_error_eV"] == pytest.approx(0.02)
     assert analysis["mean_abs_error_eV"] == pytest.approx(0.015)
     assert analysis["rms_error_eV"] == pytest.approx((0.5 * (0.01**2 + 0.02**2)) ** 0.5)
+    assert analysis["per_band_kp_energy_range_eV"] == pytest.approx([0.2, 0.6])
+    assert analysis["per_band_mean_abs_error_eV"] == pytest.approx([0.01, 0.02])
+    assert analysis["per_band_max_abs_error_eV"] == pytest.approx([0.01, 0.02])
     assert analysis["direct_diagonalization_band_range"] == [3, 4]
 
     text = "\n".join(module._format_kp_energy_error_analyses(analyses, star_line="***"))
     assert "kp band test:" in text
     assert "MP grid around k0: 2 2 2" in text
     assert "Radius: 0.100000 A^-1" in text
-    assert "Band max error:  2.000000000000e-02 eV" in text
-    assert "Band mean error: 1.500000000000e-02 eV" in text
+    assert "Band range:      2.000000000000e-01 6.000000000000e-01 eV" in text
+    assert "Band mean error: 1.000000000000e-02 2.000000000000e-02 eV" in text
+    assert "Band max error:  1.000000000000e-02 2.000000000000e-02 eV" in text
     assert "worst_q_cartesian" not in text
 
 
