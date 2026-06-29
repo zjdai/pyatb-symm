@@ -38,6 +38,8 @@ already includes it.
   `pyatb-6.27` results.
 - `batch_check_velocity_band_symmetry_627.py`: batch band-basis driver for
   `pyatb-6.27` results.
+- `kp_model.py`: snapshot of `src/pyatb/symmetry/kp/model.py` kept with the
+  velocity-covariance notes for cross-checking k.p symmetry-model conventions.
 - `velocity_matrix_covariance_formulas.md`: formula summary for wavefunction,
   orbital-basis velocity, and band-basis velocity covariance.
 - `band_basis_representation_matrix.md`: detailed note on band-basis
